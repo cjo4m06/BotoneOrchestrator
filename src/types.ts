@@ -1,0 +1,168 @@
+// 共用型別 — 對映 DESIGN.md §11/§12。此檔是契約來源，改行為前先改 DESIGN。
+
+// ── 領域狀態 ──
+export type TaskState =
+  | 'discovered' | 'queued' | 'blocked'
+  | 'in_progress' | 'verifying' | 'done';
+
+export type GroupState =
+  | 'forming' | 'ready' | 'pr_open' | 'in_review'
+  | 'changes_requested' | 'merge_guard' | 'merged' | 'failed';
+
+export type BlockReason = 'deps' | 'needs_clarification' | 'needs_human';
+
+// 開放字串聯集：常見類別給提示，仍允許 MCP 傳其他值
+export type TaskCategory = 'bug' | 'dev' | 'design' | 'improvement' | (string & {});
+
+export type DocType = 'prd' | 'spec' | 'issue';
+
+// ── 核心實體（ledger） ──
+export interface Task {
+  id: string;
+  payloadHash: string;          // 去重 key = id + payloadHash
+  repo: string;                 // "owner/name"
+  category: TaskCategory;
+  title: string;
+  description: string;
+  dependencies: string[];       // MCP 宣告 → 只當順序提示
+  docRefs: string[];            // "path#section"
+  state: TaskState;
+  block?: { reason: BlockReason; detail?: string };
+  groupId?: string;
+  slackThreadTs?: string;
+  attempts: number;
+  lastError?: string;
+  /**
+   * 任務在 MCP 端最後一次有動作的時間（createdAt/updatedAt 取大者，毫秒）。
+   * 靜置期（quiet period）用它判斷「這個專案的任務板還在被編輯嗎」；
+   * MCP 沒給時間戳就是 undefined，退回用 ledger 的發現時間 createdAt。
+   */
+  sourceUpdatedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface Group {
+  id: string;
+  repo: string;
+  branch: string;               // 一群 = 一分支 = 一 PR
+  taskIds: string[];            // 已依真實排序排好
+  footprint: string[];          // 檔案足跡（並行安全判斷）
+  /**
+   * 這個群要等哪些群結束才能開跑（規劃 agent 排出來的階段順序）。
+   * 與 footprint 互補：足跡擋的是「同時動到同一個檔案」，這個擋的是
+   * 「雖然檔案不同，但先後有意義」（依賴、或規劃者判斷很可能會撞）。
+   */
+  afterGroups: string[];
+  state: GroupState;
+  prUrl?: string;
+  prNumber?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskIteration {
+  taskId: string;
+  round: number;
+  signature: string;            // 結果簽章（無進展偵測）
+  green: boolean;
+  diffHash?: string;
+  createdAt: number;
+}
+
+// ── MCP 契約（handler__* 的型別化包裝） ──
+export interface RepoInfo { repo: string; owner: string; name: string; branch?: string; }
+export interface TaskBrief {
+  id: string;
+  title: string;
+  status: 'todo' | 'in_progress' | 'done';
+  repo: string;
+  assigneeId?: string;
+  /** MCP 端的建立時間（毫秒）。用於靜置期判斷，MCP 沒給就沒有。 */
+  createdAt?: number;
+  /** MCP 端的最後更新時間（毫秒）。 */
+  updatedAt?: number;
+}
+export interface TaskDetail extends TaskBrief {
+  description: string;
+  dependencies: string[];
+  docRefs: string[];
+  category: TaskCategory;
+}
+export interface DocHit { docType: DocType; fileName: string; section?: string; score: number; snippet: string; }
+export type McpOut<T> =
+  | { ok: true; value: T }
+  | { ok: false; kind: 'transient' | 'permanent' | 'signal'; detail: string };
+
+// ── Planner / Dispatcher ──
+export interface PlannedGroup {
+  repo: string;
+  taskIds: string[];
+  footprint: string[];
+  rationale: string;
+  /** 執行階段（0 起算）。同階段可並行，階段之間依序。未規劃時一律 0。 */
+  stageIndex: number;
+  /**
+   * 要等哪些**已經存在**的群組進 base（真實群組 id）。
+   * 跨批次依賴用：階段只排得了同一次規劃裡的群組，排不到上一批還沒合併的東西。
+   */
+  afterExisting?: string[];
+}
+export interface ScheduleEdge { fromGroup: string; toGroup: string; reason: 'dep' | 'file-overlap'; }
+export interface PlanResult { groups: PlannedGroup[]; schedule: ScheduleEdge[]; }
+
+// ── Worker / Verifier / Progress ──
+export interface WorkerCtx { worktree: string; branch: string; threadTs?: string; }
+export interface VerifyCtx { cwd: string; task: TaskDetail; }
+export interface CheckResult { name: string; ok: boolean; detail: string; failingIds?: string[]; }
+export interface GateReport { green: boolean; checks: CheckResult[]; signature: string; screenshots?: string[]; }
+export interface GroupOutcome { groupId: string; ok: boolean; prUrl?: string; error?: string; }
+
+// ── Clarification / Slack ──
+export interface ClarificationOption { id: string; label: string; recommended?: boolean; }
+export interface ClarificationRequest { question: string; options: ClarificationOption[]; recommendedDefault?: string; rationale: string; }
+export interface ClarificationAnswer { taskId: string; threadTs: string; optionId?: string; freeText?: string; }
+export type LifecycleEvent =
+  | { type: 'claimed' }
+  | { type: 'docs_read'; refs: string[] }
+  | { type: 'iterating'; round: number }
+  | { type: 'stalled'; gate: GateReport }
+  | { type: 'problem'; detail: string }
+  | { type: 'pr_open'; url: string }
+  | { type: 'in_review' }
+  | { type: 'changes_requested'; count: number }
+  | { type: 'merged' }
+  | { type: 'failed'; detail: string };
+export type ControlCommand =
+  | { type: 'pause'; taskId: string }
+  | { type: 'abort'; taskId: string }
+  | { type: 'retry'; taskId: string }
+  | { type: 'use_default'; taskId: string };
+
+// ── PR / Review / Merge ──
+export interface PullRequest { url: string; number: number; }
+export interface DiffStat { files: string[]; additions: number; deletions: number; }
+export type ReviewEvent =
+  | { type: 'changes_requested'; group: string; comments: string[] }
+  | { type: 'approved'; group: string };
+export type MergeVerdict =
+  | {
+      ok: true;
+      /**
+       * 守衛實際驗證時，base 停在哪一個 commit。
+       *
+       * 合併之前要再讀一次比對：不一樣就代表 base 在守衛跑完之後被動過，
+       * 那麼「rebase 到最新 base 重跑通過」這個保證對現在的 base 已經不成立。
+       * 同 repo 的合併有鎖序列化，所以我們自己不會製造這種情況——
+       * 這一項擋的是**鎖看不到的合併**：人在 GitHub 上自己按、或別的工具合併。
+       * 取不到時為 undefined（例如沒有 remote 的本地 repo），呼叫端就不做這個比對。
+       */
+      baseSha?: string;
+    }
+  | {
+      ok: false;
+      // precondition_failed：守衛的前置條件不成立（如分支不存在、checkout 失敗）。
+      // 必須與其他 reason 區分——它代表「這次根本沒驗到」，不可當成驗證通過。
+      reason: 'precondition_failed' | 'code_conflict' | 'semantic_drift' | 'tests_red' | 'post_merge_red';
+      detail: string;
+    };

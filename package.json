@@ -1,0 +1,51 @@
+{
+  "name": "botone-orchestrator",
+  "version": "0.0.1",
+  "private": true,
+  "description": "自主開發調度器 — 多專案 MCP 任務自動化編程/驗證/PR/合併",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && npm run build:assets",
+    "build:assets": "cp src/console/ui.html dist/console/ui.html",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js",
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "test:watch": "tsx --test --watch \"test/**/*.test.ts\"",
+    "test:types": "tsc -p test/tsconfig.json",
+    "ask": "tsx src/cli/ask.ts",
+    "test:e2e": "tsx scripts/live-e2e.ts",
+    "console": "tsx src/console/main.ts",
+    "console:test": "ORCH_PROFILE=test tsx src/console/main.ts",
+    "start:test": "ORCH_PROFILE=test tsx src/main.ts",
+    "e2e:cli": "ORCH_PROFILE=test tsx scripts/e2e-cli.ts",
+    "e2e:visual": "ORCH_PROFILE=test tsx scripts/e2e-visual.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@slack/bolt": "^5.0.0",
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^17.4.2",
+    "execa": "^9.5.2",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "yaml": "^2.7.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/mcp": "^0.0.78",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "playwright": "^1.62.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.28.1": true
+  }
+}

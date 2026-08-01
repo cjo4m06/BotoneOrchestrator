@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>開發調度器控制台</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  /* 淺色為主。深色只調到「柔和」而不是「全黑」——對比不足的深色介面在白天根本讀不了。 */
+  :root {
+    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef1f6; --line: #d7dce4;
+    --fg: #10151d; --muted: #4a5566; --dim: #6c7789;
+    --accent: #2563eb; --accent-soft: #dbe6ff;
+    --ok: #067a53; --ok-soft: #d7f3e6;
+    --warn: #9a5b00; --warn-soft: #fdeccd;
+    --bad: #c0322b; --bad-soft: #fbe0de;
+    --radius: 10px; --shadow: 0 1px 2px rgba(16,21,29,.06), 0 4px 12px rgba(16,21,29,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #232830; --panel: #2c323c; --panel-2: #363d49; --line: #454d5b;
+      --fg: #f2f4f8; --muted: #c2c9d6; --dim: #9aa4b4;
+      --accent: #7aa8ff; --accent-soft: #33405a;
+      --ok: #57d9a3; --ok-soft: #2a4239;
+      --warn: #f5b955; --warn-soft: #453722;
+      --bad: #ff8a80; --bad-soft: #4a2d2c;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", sans-serif;
+  }
+  svg.i { width: 1em; height: 1em; vertical-align: -.125em; flex: none; }
+
+  header { position: sticky; top: 0; z-index: 20; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .top { display: flex; align-items: center; gap: 14px; padding: 12px 24px 0; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .sub { color: var(--muted); font-size: 12.5px; }
+  nav { display: flex; gap: 2px; padding: 8px 24px 0; }
+  nav button {
+    background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+    padding: 8px 14px; font: inherit; font-size: 13.5px; cursor: pointer; border-radius: 6px 6px 0 0;
+    display: flex; align-items: center; gap: 6px;
+  }
+  nav button:hover { color: var(--fg); background: var(--panel-2); }
+  nav button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  main { padding: 22px 24px 80px; max-width: 1200px; }
+  section[hidden] { display: none; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow); }
+  .card .k { color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
+  .card .v { font-size: 25px; font-weight: 660; margin-top: 3px; letter-spacing: -.4px; }
+  .card .v small { font-size: 13px; font-weight: 450; color: var(--muted); margin-left: 7px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 18px; overflow: hidden; box-shadow: var(--shadow); }
+  .panel > h2 {
+    font-size: 13.5px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line);
+    color: var(--fg); font-weight: 620; display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  }
+  .panel > h2 .left { display: flex; align-items: center; gap: 8px; }
+  .panel > .body { padding: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .row .grow { flex: 1; min-width: 0; }
+  .row .title { font-weight: 560; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .row .meta { color: var(--muted); font-size: 12.5px; margin-top: 3px; word-break: break-word; }
+  .empty { padding: 26px 16px; color: var(--muted); text-align: center; font-size: 13px; }
+
+  .tag { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--panel-2); white-space: nowrap; }
+  .tag.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
+  .tag.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+  .tag.bad { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+  .tag.info { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+
+  button.btn {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer;
+    white-space: nowrap; display: inline-flex; align-items: center; gap: 6px;
+  }
+  button.btn:hover { border-color: var(--accent); color: var(--accent); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 560; }
+  button.btn.primary:hover { filter: brightness(1.08); color: #fff; }
+  button.btn.danger { color: var(--bad); }
+  button.btn.danger:hover { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
+  button.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  form.grid { display: grid; grid-template-columns: 168px 1fr; gap: 12px 16px; align-items: center; }
+  form.grid label { color: var(--fg); font-size: 13px; font-weight: 500; }
+  input[type=text], input[type=number], select {
+    width: 100%; background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; font: inherit; font-size: 13px;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  .hint { grid-column: 2; color: var(--muted); font-size: 12.5px; margin-top: -7px; }
+  .actions { grid-column: 1 / -1; display: flex; gap: 8px; padding-top: 8px; flex-wrap: wrap; border-top: 1px solid var(--line); margin-top: 4px; }
+  .withBtn { display: flex; gap: 8px; }
+  .withBtn input { flex: 1; }
+
+  /* 指令表格：固定的幾個關卡，逐格填，不要 JSON */
+  table.cmds { border-collapse: collapse; width: 100%; }
+  table.cmds th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 560; padding: 0 0 6px; }
+  table.cmds td { padding: 3px 8px 3px 0; vertical-align: middle; }
+  table.cmds td:first-child { width: 110px; font-size: 13px; }
+  table.cmds td .why { color: var(--muted); font-size: 11.5px; }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: 14px; padding: 0; background: var(--panel); color: var(--fg);
+    width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 64px); box-shadow: 0 20px 60px rgba(0,0,0,.35);
+  }
+  dialog::backdrop { background: rgba(10,14,20,.5); backdrop-filter: blur(2px); }
+  dialog .head { display: flex; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--line); font-weight: 620; }
+  dialog .content { padding: 20px; overflow: auto; max-height: calc(100vh - 210px); }
+  dialog .foot { padding: 14px 20px; border-top: 1px solid var(--line); display: flex; gap: 8px; background: var(--panel-2); }
+  .icon-btn { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 4px; border-radius: 6px; display: flex; }
+  .icon-btn:hover { background: var(--panel-2); color: var(--fg); }
+
+  /* 路徑選擇器 */
+  .fs { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .fs .cur { padding: 8px 12px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
+  .fs .cur .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fs ul { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+  .fs li { padding: 7px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; border-bottom: 1px solid var(--line); }
+  .fs li:last-child { border-bottom: 0; }
+  .fs li:hover { background: var(--panel-2); }
+
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; z-index: 100; background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 9px; padding: 12px 16px; max-width: 480px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.28); font-size: 13px; white-space: pre-wrap;
+  }
+  .toast.bad { border-left-color: var(--bad); }
+  .toast.ok { border-left-color: var(--ok); }
+  .scroll { overflow-x: auto; }
+  table.data { border-collapse: collapse; width: 100%; font-size: 13px; }
+  table.data th, table.data td { text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.data th { color: var(--muted); font-weight: 560; font-size: 12px; }
+  table.data td.wrap { white-space: normal; }
+</style>
+</head>
+<body>
+<svg style="display:none">
+  <symbol id="i-dash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-block" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4"/></symbol>
+  <symbol id="i-coin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15 9.5a3 3 0 0 0-3-1.5c-1.7 0-3 .9-3 2s1.3 2 3 2 3 .9 3 2-1.3 2-3 2a3 3 0 0 1-3-1.5"/><line x1="12" y1="6" x2="12" y2="18"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-help" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7"/><path d="M8.5 6h3a4 4 0 0 1 4 4v.5"/></symbol>
+  <symbol id="i-equal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="5" y1="9" x2="19" y2="9"/><line x1="5" y1="15" x2="19" y2="15"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><polyline points="21 3 21 9 15 9"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><polyline points="5 12 12 5 19 12"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="4" x2="6" y2="20"/><circle cx="6" cy="20" r="1.6"/><circle cx="6" cy="4" r="1.6"/><circle cx="18" cy="8" r="1.6"/><path d="M18 9.6c0 4-6 3.4-6 7.4"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6"/><path d="M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6Z"/><path d="M12 17v5"/></symbol>
+  <symbol id="i-robot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="12" rx="2.5"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.4"/><circle cx="8.5" cy="14" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="14" r="1.2" fill="currentColor" stroke="none"/></symbol>
+</svg>
+
+<header>
+  <div class="top">
+    <h1><svg class="i" style="width:19px;height:19px"><use href="#i-robot"/></svg>開發調度器</h1>
+    <span class="sub" id="status">載入中…</span>
+  </div>
+  <nav role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true"><svg class="i"><use href="#i-dash"/></svg>總覽</button>
+    <button role="tab" data-tab="projects" aria-selected="false"><svg class="i"><use href="#i-folder"/></svg>專案</button>
+    <button role="tab" data-tab="settings" aria-selected="false"><svg class="i"><use href="#i-gear"/></svg>設定</button>
+    <button role="tab" data-tab="events" aria-selected="false"><svg class="i"><use href="#i-list"/></svg>事件</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-overview">
+    <div class="cards" id="cards"></div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-help"/></svg>等你處理</span><span id="pendingCount" class="tag">0</span></h2>
+      <div id="pending"></div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-play"/></svg>執行中</span></h2>
+      <div id="running"></div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-merge"/></svg>群組</span></h2>
+      <div class="scroll"><table class="data" id="groups"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-projects" hidden>
+    <div class="panel">
+      <h2>
+        <span class="left"><svg class="i"><use href="#i-folder"/></svg>已設定的專案</span>
+        <button class="btn primary" id="newProject"><svg class="i"><use href="#i-plus"/></svg>新增專案</button>
+      </h2>
+      <div id="projects"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-gear"/></svg>調度器</span></h2>
+      <div class="body">
+        <form class="grid" id="settingsForm" onsubmit="return false">
+          <label for="s-poll">輪詢間隔（秒）</label>
+          <input type="number" id="s-poll" min="1">
+          <label for="s-workers">同時併發群組數</label>
+          <input type="number" id="s-workers" min="1">
+          <label for="s-timeout">指令逾時（秒）</label>
+          <input type="number" id="s-timeout" min="1">
+          <div class="hint">單一驗收指令跑多久算逾時。大型專案的 build/test 常超過預設 10 分鐘</div>
+          <label for="s-rounds">無進展判定輪數</label>
+          <input type="number" id="s-rounds" min="1">
+          <div class="hint">連續幾輪結果一模一樣就視為卡住，交人處理</div>
+          <label for="s-merge">自動合併</label>
+          <select id="s-merge"><option value="false">關閉</option><option value="true">開啟</option></select>
+          <div class="hint">關閉＝照常開 PR 與跑 Merge Guard，最後那一步等你自己按</div>
+          <div class="hint">兩個都開啟才會真的推分支、開 PR 並在核准後合併</div>
+          <div class="actions"><button class="btn primary" id="saveSettings"><svg class="i"><use href="#i-check"/></svg>儲存</button></div>
+        </form>
+      </div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-merge"/></svg>GitHub</span></h2>
+      <div class="body">
+        <form class="grid" id="ghForm" onsubmit="return false">
+          <label for="g-token">Token</label>
+          <input type="text" id="g-token" placeholder="github_pat_… 或 ghp_…" autocomplete="off">
+          <div class="hint">
+            開 PR、讀審查、合併時用。**agent 拿不到它** —— 執行環境會主動剝掉 GitHub 認證，
+            所以這個 token 的範圍要涵蓋你打算納管的所有專案，不必為了安全而綁死單一 repo。
+            <br>權限只需要 <strong>Contents (讀寫)</strong>、<strong>Pull requests (讀寫)</strong>、<strong>Metadata (讀)</strong>。
+            <br>真正控制「會不會動到你的正式專案」的是每個專案的 <strong>PR 目標 repo</strong> 與下面的兩個開關。
+          </div>
+          <div class="actions"><button class="btn primary" id="saveGh"><svg class="i"><use href="#i-check"/></svg>儲存</button></div>
+        </form>
+      </div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-coin"/></svg>花費上限</span></h2>
+      <div class="body">
+        <form class="grid" id="budgetForm" onsubmit="return false">
+          <label for="b-day">每日上限（USD）</label>
+          <input type="number" id="b-day" min="0" step="0.01" placeholder="留空 = 不限制">
+          <label for="b-week">每週上限（USD）</label>
+          <input type="number" id="b-week" min="0" step="0.01" placeholder="留空 = 不限制">
+          <label for="b-month">每月上限（USD）</label>
+          <input type="number" id="b-month" min="0" step="0.01" placeholder="留空 = 不限制">
+          <label for="b-warn">警戒線（%）</label>
+          <input type="number" id="b-warn" min="1" max="99" placeholder="80">
+          <div class="hint">
+            達到上限就<strong>暫停派出新群組</strong>，進行中的不受影響（那些錢已經花了，
+            砍掉只是丟錢還留下半成品），下個週期自動恢復。越過警戒線會發通知，同一週期只發一次。
+          </div>
+          <div id="budgetNow"></div>
+          <div class="actions"><button class="btn primary" id="saveBudget"><svg class="i"><use href="#i-check"/></svg>儲存</button></div>
+        </form>
+      </div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-robot"/></svg>Claude 認證</span></h2>
+      <div class="body">
+        <form class="grid" id="agentForm" onsubmit="return false">
+          <label for="a-base">API 端點</label>
+          <input type="text" id="a-base" placeholder="留空 = 官方端點" autocomplete="off">
+          <label for="a-token">Auth Token</label>
+          <input type="text" id="a-token" placeholder="ANTHROPIC_AUTH_TOKEN" autocomplete="off">
+          <label for="a-key">API Key</label>
+          <input type="text" id="a-key" placeholder="ANTHROPIC_API_KEY（用 Auth Token 就不必填）" autocomplete="off">
+          <div class="hint">
+            agent 每次執行都會現拿，所以換 token 或端點<strong>不必重啟</strong>。
+            全部留空則沿用啟動時的環境變數。
+          </div>
+          <div class="actions"><button class="btn primary" id="saveAgent"><svg class="i"><use href="#i-check"/></svg>儲存</button></div>
+        </form>
+      </div>
+    </div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-plug"/></svg>Slack</span></h2>
+      <div class="body">
+        <form class="grid" id="slackForm" onsubmit="return false">
+          <label for="k-enabled">啟用</label>
+          <select id="k-enabled"><option value="false">關閉</option><option value="true">開啟</option></select>
+          <label for="k-channel">頻道</label>
+          <input type="text" id="k-channel" placeholder="#dev-orchestrator" autocomplete="off">
+          <label for="k-bot">Bot Token</label>
+          <input type="text" id="k-bot" placeholder="xoxb-…" autocomplete="off">
+          <label for="k-app">App Token</label>
+          <input type="text" id="k-app" placeholder="xapp-…" autocomplete="off">
+          <div class="hint">改 Slack token 需要重啟 daemon 才會重新連線（其他設定都是即時生效）</div>
+          <div class="actions"><button class="btn primary" id="saveSlack"><svg class="i"><use href="#i-check"/></svg>儲存</button></div>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-events" hidden>
+    <div class="panel">
+      <h2>
+        <span class="left"><svg class="i"><use href="#i-list"/></svg>最近事件</span>
+        <button class="btn" id="reloadEvents"><svg class="i"><use href="#i-refresh"/></svg>重新整理</button>
+      </h2>
+      <div class="scroll"><table class="data" id="events"></table></div>
+    </div>
+  </section>
+</main>
+
+<!-- 專案編輯 modal -->
+<dialog id="projectDialog">
+  <div class="head">
+    <span id="editorTitle">編輯專案</span>
+    <button class="icon-btn" id="closeDialog" aria-label="關閉"><svg class="i"><use href="#i-close"/></svg></button>
+  </div>
+  <div class="content">
+    <form class="grid" id="projectForm" onsubmit="return false">
+      <label for="p-id">專案 ID</label>
+      <input type="text" id="p-id" placeholder="baolu" autocomplete="off">
+      <div class="hint">內部識別用。建立後不要改（改了等於新增一個專案）</div>
+
+      <label for="p-repo">任務板 repo</label>
+      <input type="text" id="p-repo" placeholder="owner/name" autocomplete="off">
+      <div class="hint">必須與 MCP 任務上的 <code>repo</code> 完全一致，否則認領不到任務</div>
+
+      <label for="p-path">本機 clone 路徑</label>
+      <div class="withBtn">
+        <input type="text" id="p-path" placeholder="/Users/you/code/project" autocomplete="off">
+        <button class="btn" id="pickPath" type="button"><svg class="i"><use href="#i-folder"/></svg>瀏覽</button>
+      </div>
+      <div class="hint" id="pathHint"></div>
+
+      <label for="p-base">基準分支</label>
+      <div class="withBtn">
+        <select id="p-base"></select>
+        <button class="btn" id="reloadBranches" type="button"><svg class="i"><use href="#i-refresh"/></svg></button>
+      </div>
+      <div class="hint">分支會從你上面選的 clone 讀出來。<strong>main 是正式站、dev 才是開發</strong>的話，這裡要選 dev —— 群組分支會從它長出來，PR 也發往它</div>
+
+      <div class="hint">
+        <strong>這是「會不會動到正式專案」的實際控制點。</strong>留空 = PR 直接開到任務板 repo。
+        試營運時填一個複本 repo，確認品質後再改回正式的。
+      </div>
+
+      <label for="p-quiet">靜置期（分鐘）</label>
+      <input type="number" id="p-quiet" min="0" placeholder="15">
+      <div class="hint">任務板要多久沒有新增／編輯任務才開工。建同系列任務有時間差，太短會抓到一半就做出半成品。0 = 關閉</div>
+
+      <label for="p-transport">MCP 傳輸</label>
+      <select id="p-transport"><option value="http">HTTP</option><option value="stdio">stdio</option></select>
+
+      <label for="p-url">MCP URL</label>
+      <input type="text" id="p-url" placeholder="https://…/mcp" autocomplete="off">
+
+      <label for="p-token">MCP Token</label>
+      <input type="text" id="p-token" placeholder="貼上 token" autocomplete="off">
+      <div class="hint" id="tokenHint">存在本機資料庫（<code>data/</code> 已排除於 git 之外）。改了下一輪就重新連線，不必重啟</div>
+
+      <label style="align-self:start;padding-top:6px">驗收指令</label>
+      <div>
+        <table class="cmds">
+          <tr><th>關卡</th><th>指令</th></tr>
+          <tr><td>typecheck<div class="why">型別檢查</div></td><td><input type="text" id="c-typecheck" placeholder="npx tsc --noEmit" autocomplete="off"></td></tr>
+          <tr><td>lint<div class="why">程式碼規範</div></td><td><input type="text" id="c-lint" placeholder="npm run lint" autocomplete="off"></td></tr>
+          <tr><td>build<div class="why">建置</div></td><td><input type="text" id="c-build" placeholder="npm run build" autocomplete="off"></td></tr>
+          <tr><td>test<div class="why">測試</div></td><td><input type="text" id="c-test" placeholder="npm test" autocomplete="off"></td></tr>
+          <tr><td>devServer<div class="why">視覺驗證用</div></td><td><input type="text" id="c-devServer" placeholder="npm run dev" autocomplete="off"></td></tr>
+          <tr><td>devPort<div class="why">dev server 的埠</div></td><td><input type="number" id="c-devPort" placeholder="5173"></td></tr>
+        </table>
+        <div class="hint" style="grid-column:auto;margin-top:8px">
+          留空的關卡會被跳過。agent 每一輪跑完後，調度器會**實跑**這些指令，
+          全綠才算完成——這是它唯一無法自己宣稱通過的關卡。
+          填了 devServer 才會啟動瀏覽器做視覺驗證與截圖。
+        </div>
+      </div>
+    </form>
+  </div>
+  <div class="foot">
+    <button class="btn" id="testMcp"><svg class="i"><use href="#i-plug"/></svg>測試連線</button>
+    <button class="btn primary" id="saveProject"><svg class="i"><use href="#i-check"/></svg>儲存</button>
+    <span style="flex:1"></span>
+    <button class="btn danger" id="deleteProject">刪除</button>
+  </div>
+</dialog>
+
+<!-- 路徑選擇 modal -->
+<dialog id="fsDialog">
+  <div class="head">
+    <span>選擇本機 clone 路徑</span>
+    <button class="icon-btn" id="closeFs" aria-label="關閉"><svg class="i"><use href="#i-close"/></svg></button>
+  </div>
+  <div class="content">
+    <div class="fs">
+      <div class="cur">
+        <button class="icon-btn" id="fsUp" title="上一層"><svg class="i"><use href="#i-up"/></svg></button>
+        <span class="p mono" id="fsPath"></span>
+      </div>
+      <ul id="fsList"></ul>
+    </div>
+  </div>
+  <div class="foot">
+    <button class="btn primary" id="fsPick"><svg class="i"><use href="#i-check"/></svg>選這個資料夾</button>
+    <button class="btn" id="fsCancel">取消</button>
+  </div>
+</dialog>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const money = (n) => n === 0 ? '$0' : n < 0.01 ? '$' + n.toFixed(4) : n < 1 ? '$' + n.toFixed(3) : '$' + n.toFixed(2);
+const shortRepo = (r) => String(r ?? '').split('/').pop();
+const icon = (name, style = '') => `<svg class="i" style="${style}"><use href="#i-${name}"/></svg>`;
+
+let toastTimer;
+function toast(msg, kind = '') {
+  document.querySelector('.toast')?.remove();
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), kind === 'bad' ? 10000 : 4000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: opts.body ? { 'content-type': 'application/json' } : {} });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  return data;
+}
+
+for (const b of document.querySelectorAll('nav button')) {
+  b.onclick = () => {
+    for (const x of document.querySelectorAll('nav button')) x.setAttribute('aria-selected', String(x === b));
+    for (const s of document.querySelectorAll('main > section')) s.hidden = s.id !== 'tab-' + b.dataset.tab;
+    if (b.dataset.tab === 'projects') loadProjects();
+    if (b.dataset.tab === 'settings') loadSettings();
+    if (b.dataset.tab === 'events') loadEvents();
+  };
+}
+
+// ── 總覽 ──
+const KIND = {
+  clarification: { label: '待澄清', icon: 'help' },
+  no_change: { label: '待確認「不用做」', icon: 'equal' },
+  needs_human: { label: '待人工處理', icon: 'alert' },
+  merge_approval: { label: '待核准合併', icon: 'merge' },
+  stuck_group: { label: '群組卡住', icon: 'alert' },
+};
+
+async function loadState() {
+  let s;
+  try { s = await api('/api/state'); }
+  catch (e) { $('status').textContent = '連不上：' + e.message; return; }
+
+  const t = s.taskCounts;
+  const active = s.projects.filter((p) => p.enabled).length;
+  $('status').textContent =
+    `${active}/${s.projects.length} 個專案啟用　·　更新於 ${new Date(s.now).toLocaleTimeString('zh-TW')}`
+    + (s.canDecide ? '' : '　·　唯讀（daemon 未在同一行程）');
+
+  $('cards').innerHTML = [
+    card('play', '執行中', t.in_progress + t.verifying, `排隊 ${t.queued + t.discovered}`),
+    card('block', '受阻', t.blocked, t.blocked > 0 ? '需要你處理' : '無'),
+    card('coin', '今日花費', money(s.cost.today.costUsd), `${s.cost.today.rounds} 輪`),
+    card('coin', '累計花費', money(s.cost.total.costUsd), `${s.cost.total.sessions} 個 session`),
+  ].join('');
+
+  $('pendingCount').textContent = s.pending.length;
+  $('pendingCount').className = 'tag' + (s.pending.length > 0 ? ' warn' : ' ok');
+  $('pending').innerHTML = s.pending.length === 0
+    ? `<div class="empty">${icon('check')} 目前沒有需要你決定的事</div>`
+    : s.pending.map((p) => pendingRow(p, s.canDecide)).join('');
+
+  const running = s.running;
+  const waits = s.quietWaits.map((w) =>
+    `<div class="row"><div class="grow"><div class="meta">${icon('clock')} ${esc(shortRepo(w.repo))} 等靜置期：${w.count} 個任務，約 ${Math.ceil(w.waitMs / 60000)} 分後自動開工</div></div></div>`).join('');
+  $('running').innerHTML = (running.length === 0 && !waits)
+    ? '<div class="empty">目前沒有任務在執行</div>'
+    : running.map((r) => `<div class="row"><div class="grow"><div class="title">${esc(r.title)}</div>
+        <div class="meta"><code>${esc(r.id)}</code> ${esc(shortRepo(r.repo))}</div></div></div>`).join('') + waits;
+
+  const gs = s.groups.filter((x) => x.state !== 'merged');
+  $('groups').innerHTML = gs.length === 0
+    ? '<tr><td class="empty">沒有進行中的群組</td></tr>'
+    : '<tr><th>群組</th><th>專案</th><th>狀態</th><th>PR</th></tr>'
+      + gs.map((x) => `<tr><td><code>${esc(x.id)}</code></td><td>${esc(shortRepo(x.repo))}</td>
+        <td><span class="tag info">${esc(x.state)}</span></td>
+        <td>${x.prUrl ? `<a href="${esc(x.prUrl)}" target="_blank" rel="noreferrer">開啟</a>` : '—'}</td></tr>`).join('');
+}
+
+const card = (ic, k, v, sub) =>
+  `<div class="card"><div class="k">${icon(ic)}${esc(k)}</div><div class="v">${esc(v)}<small>${esc(sub)}</small></div></div>`;
+
+function pendingRow(p, canDecide) {
+  const k = KIND[p.kind] ?? { label: p.kind, icon: 'help' };
+  const buttons = [];
+  if (canDecide) {
+    if (p.kind === 'clarification') buttons.push(btn('回答', `answer:${p.id}`, 'primary'));
+    if (p.kind === 'no_change') { buttons.push(btn('確實不用做', `confirm_no_change:${p.id}`, 'danger')); buttons.push(btn('請去做', `reject_no_change:${p.id}`)); }
+    if (p.kind === 'needs_human' || p.kind === 'stuck_group') buttons.push(btn('重試', `retry:${p.id}`));
+    if (p.kind === 'merge_approval') { buttons.push(btn('核准合併', `approve:${p.id}`, 'primary')); buttons.push(btn('退回', `deny:${p.id}`)); }
+  }
+  return `<div class="row"><div class="grow">
+    <div class="title">${icon(k.icon)}${esc(k.label)}<code>${esc(p.id)}</code>${esc(p.title)}</div>
+    <div class="meta">${esc(shortRepo(p.repo))} · ${esc(p.detail)}</div>
+  </div>${buttons.join('')}</div>`;
+}
+const btn = (label, act, cls = '') => `<button class="btn ${cls}" data-act="${esc(act)}">${esc(label)}</button>`;
+
+document.addEventListener('click', async (ev) => {
+  const el = ev.target.closest('button[data-act]');
+  if (!el) return;
+  const [action, id] = el.dataset.act.split(':');
+  let text;
+  if (action === 'answer') { text = prompt('你的答覆：'); if (text === null) return; }
+  if (action === 'confirm_no_change' && !confirm(`確定把 ${id} 標記完成嗎？這會呼叫 complete_task，之後無法反悔。`)) return;
+  el.disabled = true;
+  try {
+    const r = await api('/api/decide', { method: 'POST', body: JSON.stringify({ action, id, text }) });
+    if (r.ok) { toast('已送出', 'ok'); await loadState(); } else toast(r.error, 'bad');
+  } catch (e) { toast(e.message, 'bad'); } finally { el.disabled = false; }
+});
+
+// ── 專案 ──
+let editingId = null;
+
+async function loadProjects() {
+  const { projects } = await api('/api/projects');
+  window.__projects = projects;
+  $('projects').innerHTML = projects.length === 0
+    ? '<div class="empty">還沒有任何專案。按右上角「新增專案」開始。</div>'
+    : projects.map((p) => {
+        const c = p.effective;
+        return `<div class="row"><div class="grow">
+          <div class="title">${esc(c.id)}<span class="tag ${p.enabled ? 'ok' : ''}">${p.enabled ? '啟用中' : '已停用'}</span></div>
+          <div class="meta">${esc(c.repo)} · 基準分支 ${esc(c.baseBranch ?? '(自動偵測)')} · 靜置 ${c.quietPeriodMinutes ?? 15} 分<br><span class="mono">${esc(c.repoPath)}</span></div>
+        </div>
+        <button class="btn" data-proj="edit:${esc(c.id)}">編輯</button>
+        <button class="btn" data-proj="toggle:${esc(c.id)}:${p.enabled}">${p.enabled ? '停用' : '啟用'}</button>
+        </div>`;
+      }).join('');
+}
+
+document.addEventListener('click', async (ev) => {
+  const el = ev.target.closest('button[data-proj]');
+  if (!el) return;
+  const [what, id, enabled] = el.dataset.proj.split(':');
+  if (what === 'toggle') {
+    await api(`/api/projects/${encodeURIComponent(id)}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: enabled !== 'true' }) });
+    toast(enabled === 'true' ? '已停用（下一輪起停止輪詢）' : '已啟用（下一輪起開始輪詢）', 'ok');
+    await loadProjects();
+    return;
+  }
+  if (what === 'edit') openEditor(window.__projects.find((p) => p.effective.id === id));
+});
+
+$('newProject').onclick = () => openEditor(null);
+$('closeDialog').onclick = () => $('projectDialog').close();
+
+const CMD_KEYS = ['typecheck', 'lint', 'build', 'test', 'devServer', 'devPort'];
+
+async function openEditor(p) {
+  editingId = p ? p.effective.id : null;
+  const raw = p?.raw ?? {};
+  $('editorTitle').textContent = p ? `編輯專案：${p.effective.id}` : '新增專案';
+  $('p-id').value = raw.id ?? '';
+  $('p-id').disabled = !!p;
+  $('p-repo').value = raw.repo ?? '';
+  $('p-path').value = raw.repoPath ?? '';
+  $('p-quiet').value = raw.quietPeriodMinutes ?? '';
+  $('p-transport').value = raw.mcp?.transport ?? 'http';
+  $('p-url').value = raw.mcp?.url ?? '';
+  $('p-token').value = raw.mcp?.token ?? '';
+  for (const k of CMD_KEYS) $('c-' + k).value = raw.commands?.[k] ?? '';
+  $('deleteProject').hidden = !p;
+  await loadBranches(raw.baseBranch ?? '');
+  $('projectDialog').showModal();
+}
+
+async function loadBranches(selected) {
+  const sel = $('p-base');
+  const repoPath = $('p-path').value.trim();
+  sel.innerHTML = '<option value="">（自動偵測 origin/HEAD）</option>';
+  $('pathHint').textContent = '';
+  if (!repoPath) return;
+  try {
+    const b = await api('/api/branches?repoPath=' + encodeURIComponent(repoPath));
+    if (b.error) { $('pathHint').textContent = '讀不到分支：' + b.error; return; }
+    const all = [...new Set([...b.local, ...b.remote])].sort();
+    for (const name of all) {
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = name + (b.local.includes(name) ? '' : '（僅遠端）') + (name === b.current ? '　← 目前' : '');
+      sel.appendChild(o);
+    }
+    if (selected && !all.includes(selected)) {
+      const o = document.createElement('option');
+      o.value = selected; o.textContent = selected + '（不存在於這個 clone）';
+      sel.appendChild(o);
+    }
+    sel.value = selected ?? '';
+    $('pathHint').textContent = `讀到 ${all.length} 個分支`;
+  } catch (e) { $('pathHint').textContent = '讀不到分支：' + e.message; }
+}
+$('reloadBranches').onclick = () => loadBranches($('p-base').value);
+$('p-path').onchange = () => loadBranches($('p-base').value);
+
+function formProject() {
+  const commands = {};
+  for (const k of CMD_KEYS) {
+    const v = $('c-' + k).value.trim();
+    if (v === '') continue;
+    commands[k] = k === 'devPort' ? Number(v) : v;
+  }
+  const out = {
+    id: $('p-id').value.trim(),
+    repo: $('p-repo').value.trim(),
+    repoPath: $('p-path').value.trim(),
+    mcp: { transport: $('p-transport').value, url: $('p-url').value.trim(), token: $('p-token').value.trim() },
+    commands,
+  };
+  if ($('p-base').value) out.baseBranch = $('p-base').value;
+  if ($('p-quiet').value !== '') out.quietPeriodMinutes = Number($('p-quiet').value);
+  return out;
+}
+
+$('saveProject').onclick = async () => {
+  try {
+    await api('/api/projects', { method: 'PUT', body: JSON.stringify(formProject()) });
+    toast('已儲存（下一輪輪詢生效，不必重啟）', 'ok');
+    $('projectDialog').close();
+    await loadProjects();
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+$('testMcp').onclick = async (ev) => {
+  const b = ev.currentTarget; b.disabled = true;
+  try {
+    const r = await api('/api/projects/test', { method: 'POST', body: JSON.stringify(formProject()) });
+    toast(r.ok
+      ? `連線成功：抓到 ${r.todoCount} 個待辦任務` + (r.sample?.length ? '\n' + r.sample.map((t) => '· ' + t.title).join('\n') : '')
+      : '連線失敗：' + r.error, r.ok ? 'ok' : 'bad');
+  } catch (e) { toast(e.message, 'bad'); } finally { b.disabled = false; }
+};
+
+$('deleteProject').onclick = async () => {
+  if (!editingId || !confirm(`確定刪除專案 ${editingId}？已完成的任務紀錄會留著。`)) return;
+  await api(`/api/projects/${encodeURIComponent(editingId)}`, { method: 'DELETE' });
+  toast('已刪除', 'ok');
+  $('projectDialog').close();
+  await loadProjects();
+};
+
+// ── 路徑選擇器（瀏覽器拿不到真實路徑，所以由伺服器端列目錄） ──
+let fsCurrent = '';
+
+$('pickPath').onclick = () => { $('fsDialog').showModal(); browse($('p-path').value.trim() || ''); };
+$('closeFs').onclick = $('fsCancel').onclick = () => $('fsDialog').close();
+$('fsUp').onclick = () => browse(window.__fsParent ?? '');
+$('fsPick').onclick = () => {
+  $('p-path').value = fsCurrent;
+  $('fsDialog').close();
+  loadBranches($('p-base').value);
+};
+
+async function browse(path) {
+  const d = await api('/api/fs' + (path ? '?path=' + encodeURIComponent(path) : ''));
+  fsCurrent = d.path;
+  window.__fsParent = d.parent;
+  $('fsPath').textContent = d.path + (d.isRepo ? '　（是 git repo）' : '');
+  $('fsUp').disabled = !d.parent;
+  $('fsList').innerHTML = d.error
+    ? `<li style="color:var(--bad)">${esc(d.error)}</li>`
+    : d.entries.length === 0
+      ? '<li style="color:var(--muted)">（沒有子資料夾）</li>'
+      : d.entries.map((e) =>
+          `<li data-dir="${esc(e.name)}">${icon('folder', e.isRepo ? 'color:var(--accent)' : '')}${esc(e.name)}${e.isRepo ? '<span class="tag info">git</span>' : ''}</li>`).join('');
+}
+
+$('fsList').addEventListener('click', (ev) => {
+  const li = ev.target.closest('li[data-dir]');
+  if (li) browse(fsCurrent.replace(/\/$/, '') + '/' + li.dataset.dir);
+});
+
+// ── 設定 ──
+async function loadSettings() {
+  const { raw, effective } = await api('/api/settings');
+  $('s-poll').value = effective.pollIntervalSec;
+  $('s-workers').value = effective.maxConcurrentWorkers;
+  $('s-timeout').value = effective.commandTimeoutSec;
+  $('s-rounds').value = effective.noProgress.rounds;
+  $('s-merge').value = String(effective.allowLocalMerge);
+  $('k-enabled').value = String(effective.slack.enabled);
+  $('k-channel').value = raw.slack?.channel ?? effective.slack.channel;
+  $('k-bot').value = raw.slack?.botToken ?? '';
+  $('k-app').value = raw.slack?.appToken ?? '';
+  $('a-base').value = raw.agent?.baseUrl ?? '';
+  $('a-token').value = raw.agent?.authToken ?? '';
+  $('a-key').value = raw.agent?.apiKey ?? '';
+  $('b-day').value = effective.budget.dailyUsd ?? '';
+  $('b-week').value = effective.budget.weeklyUsd ?? '';
+  $('b-month').value = effective.budget.monthlyUsd ?? '';
+  $('b-warn').value = effective.budget.warnAtPercent;
+  $('g-token').value = raw.github?.token ?? '';
+  renderBudgetNow();
+  markEnvRefs();
+}
+
+/**
+ * 標出哪些欄位的值其實還在 .env（`${VAR}` 參照）。
+ * 這種欄位改了要重啟才生效，跟其他設定的行為不一樣——不標出來的話，
+ * 使用者會以為存了就生效，然後花很久才發現沒有。
+ */
+function markEnvRefs() {
+  for (const id of ['k-bot', 'k-app', 'a-base', 'a-token', 'a-key', 'g-token']) {
+    const el = $(id);
+    const isRef = /^\$\{[A-Z0-9_]+\}$/.test(el.value.trim());
+    el.style.borderColor = isRef ? 'var(--warn)' : '';
+    el.title = isRef ? '這個值來自環境變數，改了需要重啟；填入實際值即可即時生效' : '';
+  }
+}
+
+$('saveSettings').onclick = async () => {
+  try {
+    await api('/api/settings', { method: 'PUT', body: JSON.stringify({
+      pollIntervalSec: Number($('s-poll').value),
+      maxConcurrentWorkers: Number($('s-workers').value),
+      commandTimeoutSec: Number($('s-timeout').value),
+      noProgress: { rounds: Number($('s-rounds').value) },
+      allowLocalMerge: $('s-merge').value === 'true',
+    }) });
+    toast('已儲存（下一輪生效）', 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+/** 目前用量：把「還剩多少」直接放在設定旁邊，才不用切到別的頁去對照。 */
+async function renderBudgetNow() {
+  try {
+    const s = await api('/api/state');
+    const b = s.budget;
+    $('budgetNow').innerHTML = !b || b.all.length === 0
+      ? '<span class="tag">目前未設任何上限</span>'
+      : b.all.map((u) => {
+          const cls = u.ratio >= 1 ? 'bad' : u.ratio >= 0.8 ? 'warn' : 'ok';
+          return `<span class="tag ${cls}" style="margin-right:6px">${esc(u.label)} ${money(u.spentUsd)} / ${money(u.limitUsd)}（${Math.round(u.ratio * 100)}%）</span>`;
+        }).join('');
+  } catch { $('budgetNow').innerHTML = ''; }
+}
+
+$('saveGh').onclick = async () => {
+  try {
+    await api('/api/settings', { method: 'PUT', body: JSON.stringify({ github: { token: $('g-token').value.trim() } }) });
+    toast('已儲存。GitHub token 在開 PR／合併時現拿，不必重啟。', 'ok');
+    markEnvRefs();
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+$('saveBudget').onclick = async () => {
+  const num = (id) => ($(id).value === '' ? undefined : Number($(id).value));
+  try {
+    await api('/api/settings', { method: 'PUT', body: JSON.stringify({ budget: {
+      dailyUsd: num('b-day'), weeklyUsd: num('b-week'), monthlyUsd: num('b-month'),
+      warnAtPercent: num('b-warn') ?? 80,
+    } }) });
+    toast('已儲存（下一輪生效）', 'ok');
+    renderBudgetNow();
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+$('saveAgent').onclick = async () => {
+  try {
+    await api('/api/settings', { method: 'PUT', body: JSON.stringify({ agent: {
+      baseUrl: $('a-base').value.trim(),
+      authToken: $('a-token').value.trim(),
+      apiKey: $('a-key').value.trim(),
+    } }) });
+    toast('已儲存（下一輪 agent 執行就套用，不必重啟）', 'ok');
+    markEnvRefs();
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+$('saveSlack').onclick = async () => {
+  try {
+    await api('/api/settings', { method: 'PUT', body: JSON.stringify({ slack: {
+      enabled: $('k-enabled').value === 'true',
+      channel: $('k-channel').value.trim(),
+      botToken: $('k-bot').value.trim(),
+      appToken: $('k-app').value.trim(),
+    } }) });
+    toast('已儲存。Slack 連線需要重啟 daemon 才會套用。', 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+};
+
+// ── 事件 ──
+async function loadEvents() {
+  const { events } = await api('/api/events?limit=120');
+  $('events').innerHTML = events.length === 0
+    ? '<tr><td class="empty">還沒有事件</td></tr>'
+    : '<tr><th>時間</th><th>範圍</th><th>對象</th><th>種類</th><th>細節</th></tr>'
+      + events.map((e) => `<tr>
+          <td>${new Date(e.createdAt).toLocaleString('zh-TW')}</td>
+          <td>${esc(e.scope)}</td><td><code>${esc(e.refId ?? '—')}</code></td>
+          <td>${esc(e.kind)}</td><td class="wrap">${esc((e.detail ?? '').slice(0, 300))}</td>
+        </tr>`).join('');
+}
+$('reloadEvents').onclick = loadEvents;
+
+loadState();
+setInterval(() => { if (!document.hidden && !$('tab-overview').hidden) loadState(); }, 5000);
+</script>
+</body>
+</html>

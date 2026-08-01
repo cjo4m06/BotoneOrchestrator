@@ -1,0 +1,57 @@
+# Slack App 設定清單（App Manifest）
+#
+# 用途：在 https://api.slack.com/apps 建立 app 時選「From an app manifest」，
+# 把這份內容貼上去，一次把權限、事件、Home Tab、slash command 全部設好——
+# 比在四個不同頁面手動勾選可靠得多（漏勾一項的症狀通常是「某個功能靜靜地不會動」）。
+#
+# 這份清單**不會**產生 token。建立完 app 之後還要做兩件事：
+#   1. Install to Workspace → 取得 Bot User OAuth Token（xoxb-…）
+#   2. Basic Information → App-Level Tokens → 產生一個帶 connections:write 的 token（xapp-…）
+# 詳細步驟見 README 的「Slack 設定」一節。
+
+display_information:
+  name: 開發調度器
+  description: 本機自主開發調度器的人機介面（任務進度、澄清、合併核准）
+  background_color: "#2c2d30"
+
+features:
+  bot_user:
+    # **必須是 ASCII**：Slack 會把這個名字轉成 bot 的 @username，
+    # 中文轉不出來會直接被拒（the display_name cannot be converted to a username）。
+    # 上面 display_information.name 才是頻道裡看到的顯示名稱，那個可以用中文。
+    display_name: Orchestrator
+    always_online: false
+
+  # App Home：常駐面板（待辦／進度／成本）。沒開這個，views.publish 會被 Slack 拒絕。
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
+
+  slash_commands:
+    - command: /orch
+      description: 查看調度器狀態
+      usage_hint: status | cost | pending
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write # 貼任務卡與事件
+      - files:write # 上傳截圖（視覺驗證）
+      - commands # /orch
+      - channels:history # 讀 thread 裡的人類回覆（公開頻道）
+      - groups:history # 同上，私人頻道才需要；頻道是公開的可以刪掉這行
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_home_opened # 開啟 Home 分頁 → 重新發佈面板
+      - message.channels # thread 內的文字回覆（公開頻道）
+      - message.groups # 同上，私人頻道才需要
+  interactivity:
+    is_enabled: true # 按鈕（澄清選項、合併核准、重新整理）
+  # Socket Mode：不需要公開網址，daemon 主動連出去。
+  # 本專案跑在你的 Mac 上，沒有對外 URL，所以這個必須是 true。
+  socket_mode_enabled: true
+  token_rotation_enabled: false

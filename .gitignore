@@ -1,0 +1,21 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+.env.*
+!.env.example
+
+# 實際設定（含路徑/密鑰）不入庫；範例檔 *.example.yaml 才入庫
+
+.DS_Store
+
+# Playwright MCP 的暫存輸出（截圖、快照、log）。它寫在「當下工作目錄」，
+# 沒有這條就會被 git add -A 吃進 commit——本 repo 已經發生過三次。
+.playwright-mcp/
+
+# 瀏覽器工具的暫存輸出（截圖／快照／log），一律不進版控
+data/browser-tmp/
+# 控制台截圖會拍到設定頁的 token 明文——絕不可進 repo
+console-*.png
+*-settings.png
