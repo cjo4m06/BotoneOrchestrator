@@ -1077,6 +1077,22 @@ export interface ToolPolicyOptions {
   protectedPaths?: string[];
   /** 追加例外（永遠疊在內建例外之上——移除內建例外只會製造誤擋）。 */
   allowPaths?: string[];
+  /**
+   * `'readonly'` ＝ 只判斷、不動手的角色（規劃者、reviewer、各判斷者）。
+   *
+   * 為什麼需要：這些角色的 cwd 是**使用者真正的 checkout**，不是 worktree
+   * （規劃 agent 要看 repo 實際結構才判斷得出誰會撞誰）。而 SDK 的 allowedTools
+   * 對工具**不具強制力**——實跑證實規劃 agent 用了 9 次 Bash，儘管 allowedTools
+   * 只列了 Read/Glob/Grep。唯一可靠的邊界是這個 PreToolUse hook。
+   *
+   * 未給 → `'write'`，行為與加這個欄位之前一位元不變。
+   */
+  mode?: 'write' | 'readonly';
+  /**
+   * 工具名白名單。給定時，不在清單內的工具一律擋。
+   * 這是 allowedTools 的**強制版**——SDK 那份只是建議。
+   */
+  allowTools?: string[];
 }
 
 interface ProtectedRule {
@@ -1087,6 +1103,8 @@ interface ProtectedRule {
 export interface ResolvedToolPolicy {
   protectedRules: ProtectedRule[];
   allowPaths: string[];
+  mode: 'write' | 'readonly';
+  allowTools?: Set<string>;
 }
 
 /**
@@ -1121,7 +1139,116 @@ export function resolveToolPolicy(options?: ToolPolicyOptions): ResolvedToolPoli
     seen.add(r.pattern);
     return true;
   });
-  return { protectedRules, allowPaths: [...DEFAULT_ALLOW_PATHS, ...(options?.allowPaths ?? [])] };
+  return {
+    protectedRules,
+    allowPaths: [...DEFAULT_ALLOW_PATHS, ...(options?.allowPaths ?? [])],
+    mode: options?.mode ?? 'write',
+    ...(options?.allowTools ? { allowTools: new Set(options.allowTools) } : {}),
+  };
+}
+
+/**
+ * 唯讀角色可以執行的指令。
+ *
+ * 白名單而非黑名單：黑名單永遠列不完（`node -e`、`python -c`、`perl -pi`、
+ * `tee`、`dd`、`install`…每一個都能寫檔），而唯讀角色實際需要的東西很少。
+ *
+ * 刻意**不放行** npm／node／python：`npm run <任意 script>`、`node -e` 都能寫檔，
+ * 要靠子指令白名單擋的複雜度遠高於它們帶來的價值——查 repo 結構用不到它們。
+ */
+const READONLY_COMMANDS = new Set([
+  'grep', 'rg', 'egrep', 'fgrep', 'find', 'ls', 'cat', 'head', 'tail', 'wc',
+  'sort', 'uniq', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'file', 'stat', 'echo', 'true',
+]);
+
+/** shell 語法關鍵字：不是指令，剝掉之後才看得到真正要跑的東西。 */
+const SHELL_KEYWORDS = new Set([
+  'for', 'do', 'done', 'while', 'until', 'if', 'then', 'else', 'elif', 'fi',
+  'case', 'esac', 'in', 'select', 'time', 'command', 'builtin',
+]);
+
+/** 剝掉開頭的語法關鍵字與 `for x in …` 的變數／清單部分。 */
+function stripShellKeywords(tokens: string[]): string[] {
+  let i = 0;
+  while (i < tokens.length && SHELL_KEYWORDS.has(tokens[i]!)) {
+    // `for f in a b c` → 跳過 for、變數名，以及 in 之後到段尾的清單
+    if (tokens[i] === 'for' || tokens[i] === 'select') {
+      const inAt = tokens.indexOf('in', i);
+      return inAt >= 0 ? [] : tokens.slice(i + 2); // in 之後整段都是資料，沒有指令
+    }
+    i += 1;
+  }
+  return tokens.slice(i);
+}
+
+/** git 的唯讀子指令。git 本身既能讀也能寫，所以要看第一個子指令。 */
+const READONLY_GIT_SUBCOMMANDS = new Set([
+  'log', 'diff', 'show', 'status', 'ls-files', 'ls-tree', 'cat-file', 'rev-parse',
+  'rev-list', 'blame', 'grep', 'branch', 'describe', 'shortlog', 'config',
+]);
+
+/**
+ * 唯讀模式下這條 Bash 指令能不能跑。
+ *
+ * 逐段判定（decomposeShellCommand 已處理 `&&`／`;`／`|`／`$(...)`／巢狀 `-c`），
+ * **每一段都要在白名單內**——一段不合格就整條擋掉。
+ */
+export function evaluateReadonlyCommand(cmd: string, depth = 0): PolicyVerdict {
+  const { commands, sources } = decomposeShellCommand(cmd);
+  if (commands.length === 0) return { deny: false };
+
+  // 重導向會寫檔，而它不是「指令」——要在字串層擋
+  for (const src of sources) {
+    if (/(^|[^0-9<>&])>{1,2}(?![&|])/.test(src)) {
+      return { deny: true, reason: '紅線：唯讀角色不可以用重導向寫檔（> 或 >>）。你的職責是判斷，不是動手改東西。' };
+    }
+  }
+
+  // 命令替換：`echo $(rm -rf x)` 的第一個 token 是 echo，逐段掃描看不到裡面。
+  // 巢狀深度設限，避免病態輸入。
+  if (depth < 3) {
+    for (const src of sources) {
+      for (const m of src.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)) {
+        const inner = (m[1] ?? m[2] ?? '').trim();
+        if (!inner) continue;
+        const v = evaluateReadonlyCommand(inner, depth + 1);
+        if (v.deny) return v;
+      }
+    }
+  }
+
+  for (const raw of commands) {
+    // for/do/if/then… 是語法關鍵字不是指令。整條擋掉的話，
+    // `for f in a b; do grep x "$f"; done` 這種批次查詢就不能用了，
+    // 而那正是保留 Bash 的理由。剝掉關鍵字之後看真正的指令。
+    const tokens = stripShellKeywords(raw);
+    if (tokens.length === 0) continue;
+    const bin = (tokens[0] ?? '').split('/').pop() ?? '';
+    if (bin === 'git') {
+      // 跳過 -C <path> 這類全域選項，找出真正的子指令
+      let i = 1;
+      while (i < tokens.length && tokens[i]!.startsWith('-')) i += tokens[i] === '-C' || tokens[i] === '-c' ? 2 : 1;
+      const sub = tokens[i] ?? '';
+      if (!READONLY_GIT_SUBCOMMANDS.has(sub)) {
+        return { deny: true, reason: `紅線：唯讀角色只能用 git 的查詢子指令，不能用 \`git ${sub || '(未知)'}\`。` };
+      }
+      // git config 只能讀：帶值就是在寫
+      if (sub === 'config' && tokens.slice(i + 1).filter((t) => !t.startsWith('-')).length > 1) {
+        return { deny: true, reason: '紅線：唯讀角色不可以寫 git 設定。' };
+      }
+      continue;
+    }
+    if (!READONLY_COMMANDS.has(bin)) {
+      return {
+        deny: true,
+        reason:
+          `紅線：唯讀角色不可以執行 \`${bin || cmd.slice(0, 40)}\`。`
+          + `可用的是查詢類指令（grep/rg/find/ls/cat/head/tail/wc、git 的查詢子指令）。`
+          + `你的職責是判斷，不是動手改東西。`,
+      };
+    }
+  }
+  return { deny: false };
 }
 
 /** 路徑是否落在保護路徑內（回命中的規則；例外白名單優先）。 */
@@ -1655,6 +1782,26 @@ export function evaluateToolPolicy(
   cwd?: string,
 ): PolicyVerdict {
   const policy = resolveToolPolicy(options);
+
+  // 工具白名單。SDK 的 allowedTools 對工具不具強制力（實跑證實規劃 agent
+  // 用了 9 次 Bash，儘管 allowedTools 只列 Read/Glob/Grep），所以要在這裡強制。
+  if (policy.allowTools && !policy.allowTools.has(toolName)) {
+    return { deny: true, reason: `紅線：這個工具不在允許清單內：${toolName}。` };
+  }
+
+  // 唯讀角色：判斷者不該有改東西的能力。它們的 cwd 是使用者真正的 checkout。
+  if (policy.mode === 'readonly') {
+    if (WRITE_TOOLS.has(toolName)) {
+      return { deny: true, reason: `紅線：唯讀角色不可以修改檔案（${toolName}）。你的職責是判斷，不是動手改東西。` };
+    }
+    if (toolName === 'Bash') {
+      const cmd = typeof toolInput.command === 'string' ? toolInput.command : '';
+      const ro = evaluateReadonlyCommand(cmd);
+      if (ro.deny) return ro;
+      // 通過唯讀白名單之後，仍要走既有的紅線（部署、強推 main…）——那些是硬邊界
+      return evaluateCommandRedline(cmd, policy, cwd);
+    }
+  }
 
   if (WRITE_TOOLS.has(toolName)) {
     const target = writeTargetPath(toolInput);

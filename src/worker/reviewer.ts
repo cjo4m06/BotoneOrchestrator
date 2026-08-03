@@ -5,6 +5,7 @@ import type { Logger } from '../observability/logger.js';
 import type { CheckResult, GateReport, TaskDetail } from '../types.js';
 import type { LoadedDoc } from './agent-runtime.js';
 import { collectDiffSince } from '../git/status.js';
+import { createPreToolUseGuard } from './agent-runtime.js';
 
 /**
  * 獨立 reviewer agent（DESIGN.md §5）。DoD 綠燈只證明「build/test 過」，證明不了
@@ -159,6 +160,10 @@ export class Reviewer {
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
             allowedTools: REVIEWER_TOOLS,
             systemPrompt: REVIEWER_SYSTEM_PROMPT,
+            // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
+            // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。reviewer只判斷、不動手，
+            // 而它的 cwd 是實際的工作區——沒有這道 hook，唯一擋著它的只有提示詞。
+            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: REVIEWER_TOOLS })] }] },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

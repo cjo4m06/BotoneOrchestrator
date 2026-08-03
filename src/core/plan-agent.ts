@@ -2,6 +2,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Task } from '../types.js';
 import type { Logger } from '../observability/logger.js';
+import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 
 /**
  * 規劃 agent：讀任務內容 + 實際的 repo，決定**分成哪幾群**與**群的執行順序**。
@@ -78,7 +79,23 @@ export interface PlanAgentDeps {
 }
 
 /** 規劃 agent 只讀不寫：它的職責是判斷，不是動手改東西。 */
-const PLAN_TOOLS = ['Read', 'Glob', 'Grep'];
+const PLAN_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
+
+/**
+ * 規劃 agent 的工具邊界。
+ *
+ * **Bash 是刻意留的**：`find -iname`、批次檢查一串檔案存不存在，比 Glob 有效率得多，
+ * 而規劃就是在做這種查詢。但它只能跑查詢類指令——由 `mode: 'readonly'` 強制
+ * （見 agent-runtime 的 evaluateReadonlyCommand）。
+ *
+ * 為什麼特別重要：規劃 agent 的 cwd 是**使用者真正的 checkout**（要看 repo 實際結構
+ * 才判斷得出誰會撞誰），不是拋棄式的 worktree。在那裡跑一次 `git checkout .` 或 `rm`
+ * 就是直接動到本體。先前這裡完全沒有 hook，唯一擋著它的是提示詞——那不算邊界。
+ *
+ * **allowTools 也要交給 hook**：SDK 的 allowedTools 對工具不具強制力——實跑證實
+ * 它只列了 Read/Glob/Grep，規劃 agent 照樣用了 9 次 Bash。
+ */
+export const PLAN_TOOL_POLICY = { mode: 'readonly' as const, allowTools: PLAN_TOOLS };
 
 const SYSTEM_PROMPT =
   '你是開發工作的排程規劃者。你的職責是決定「哪些任務該分在同一群」與「群之間的執行順序」，' +
@@ -134,9 +151,11 @@ export class PlanAgent {
           options: {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
-            permissionMode: 'acceptEdits', // 工具已限制唯讀，此處只為避免非互動環境卡在權限詢問
+            permissionMode: 'acceptEdits', // 邊界由下面的 hook 守，這裡只為避免非互動環境卡在權限詢問
             allowedTools: PLAN_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
+            // **真正的邊界在這裡。** allowedTools 對工具不具強制力（見 PLAN_TOOLS 的說明）
+            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, PLAN_TOOL_POLICY)] }] },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

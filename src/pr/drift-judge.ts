@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
+import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 
 /**
  * 語意飄移判斷（需求 7 的第二層）。
@@ -123,6 +124,10 @@ export class DriftJudge {
             permissionMode: 'acceptEdits', // 工具已限制唯讀
             allowedTools: JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
+            // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
+            // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。飄移判斷者只判斷、不動手，
+            // 而它的 cwd 是實際的工作區——沒有這道 hook，唯一擋著它的只有提示詞。
+            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: JUDGE_TOOLS })] }] },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

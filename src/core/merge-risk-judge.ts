@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Logger } from '../observability/logger.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
+import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 
 /**
  * 合併風險判斷者：「這個改動要不要先讓人看一眼？」
@@ -125,6 +126,9 @@ export class MergeRiskJudge {
             allowedTools: RISK_JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             mcpServers: { git: gitServer } as never,
+            // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
+            // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。判斷者只看不動。
+            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: RISK_JUDGE_TOOLS })] }] },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 
