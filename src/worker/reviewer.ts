@@ -62,6 +62,8 @@ export type ReviewQueryFn = (args: { prompt: string; cwd: string }) => AsyncIter
 
 export interface ReviewerDeps {
   log: Logger;
+  /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
+  model?: string;
   queryFn?: ReviewQueryFn;
   collectDiff?: (cwd: string, baseRef: string) => Promise<string>;
   /** 是否具備 Claude 認證。預設看環境變數。 */
@@ -137,6 +139,7 @@ export class Reviewer {
         query({
           prompt: args.prompt,
           options: {
+            ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
             allowedTools: REVIEWER_TOOLS,

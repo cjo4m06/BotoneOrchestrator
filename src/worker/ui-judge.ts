@@ -114,6 +114,8 @@ export type UiQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable
 
 export interface UiJudgeDeps {
   log: Logger;
+  /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
+  model?: string;
   queryFn?: UiQueryFn;
   hasAuth?: () => boolean;
   /**
@@ -291,6 +293,7 @@ export class UiJudge {
         query({
           prompt: args.prompt,
           options: {
+            ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制唯讀
             allowedTools: JUDGE_TOOLS,

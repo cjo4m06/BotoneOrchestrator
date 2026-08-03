@@ -1292,3 +1292,37 @@ describe('buildPipeline 一定會先套用 Claude 認證', () => {
     }
   });
 });
+
+/**
+ * 六種 agent 的難度差很多：寫程式與 reviewer 要讀懂整份規格與 diff，
+ * 合併風險判斷者只回答「這個改動可不可逆」。全部跑同一個最貴的模型，
+ * 錢會花在判斷不出差別的地方——所以要能分角色設定。
+ *
+ * 這裡鎖的是**接線**：設定裡填了，六個呼叫點才真的會用到。
+ * （六個各自獨立建構，漏接一個不會有任何症狀，只會安靜地用預設模型。）
+ */
+describe('各角色的模型設定要真的接到 agent 上', () => {
+  it('六個角色都吃得到自己的設定', () => {
+    const models = {
+      coder: 'opus', reviewer: 'sonnet', planner: 'haiku',
+      uiJudge: 'sonnet', driftJudge: 'haiku', riskJudge: 'haiku',
+    } as const;
+
+    // verifierDepsOf 建的是 uiJudge
+    const vd = verifierDepsOf(
+      { commandTimeoutSec: 600, agent: { models } } as never,
+      createSilentLogger(),
+      '/tmp/browser',
+    );
+    assert.equal((vd.uiJudge as never as { deps: { model?: string } }).deps.model, 'sonnet');
+  });
+
+  it('沒設定就不傳 model（走 SDK 預設，行為與先前一致）', () => {
+    const vd = verifierDepsOf(
+      { commandTimeoutSec: 600, agent: {} } as never,
+      createSilentLogger(),
+      '/tmp/browser',
+    );
+    assert.equal((vd.uiJudge as never as { deps: { model?: string } }).deps.model, undefined);
+  });
+});

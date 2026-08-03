@@ -61,6 +61,8 @@ export type DriftQueryFn = (args: { prompt: string; cwd: string }) => AsyncItera
 
 export interface DriftJudgeDeps {
   log: Logger;
+  /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
+  model?: string;
   queryFn?: DriftQueryFn;
   hasAuth?: () => boolean;
 }
@@ -116,6 +118,7 @@ export class DriftJudge {
         query({
           prompt: args.prompt,
           options: {
+            ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制唯讀
             allowedTools: JUDGE_TOOLS,

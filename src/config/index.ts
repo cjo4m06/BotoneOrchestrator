@@ -139,6 +139,14 @@ export const ProjectSchema = z.object({
 const NoChangeDisposition = z.enum(['ask', 'auto_complete']);
 
 /**
+ * 模型別名。**刻意不接受版本號**：寫 opus 就永遠是最新的 opus，
+ * 寫 claude-opus-5 的話出了新版還會停在舊的，而且沒有任何地方會提醒你。
+ */
+export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku'] as const;
+export type ModelAliasName = (typeof MODEL_ALIASES)[number];
+const ModelAlias = z.enum(MODEL_ALIASES);
+
+/**
  * 調度器設定。**ledgerPath 與 lockPath 不在這裡**——它們必須在開 DB 之前就知道，
  * 而這份設定就住在那個 DB 裡（見 config/bootstrap.ts）。其餘全部由控制台管理。
  */
@@ -248,6 +256,25 @@ export const OrchestratorSchema = z.object({
       authToken: z.string().optional(),
       apiKey: z.string().optional(),
       baseUrl: z.string().optional(),
+        /**
+         * 各角色用哪個模型。**只寫別名、不帶版本號**（opus / sonnet / haiku）——
+         * 帶版本的話每次出新版都要回來改設定，而且會靜靜地停在舊模型上。
+         * 留空＝用 SDK 預設。
+         *
+         * 為什麼分角色：六種 agent 的工作難度差很多。寫程式與 reviewer 要讀懂整份規格
+         * 與 diff；合併風險判斷者只回答「這個改動可不可逆」。全部跑同一個最貴的模型，
+         * 成本會花在判斷不出差別的地方。
+         */
+        models: z
+          .object({
+            coder: ModelAlias.optional(),
+            reviewer: ModelAlias.optional(),
+            planner: ModelAlias.optional(),
+            uiJudge: ModelAlias.optional(),
+            driftJudge: ModelAlias.optional(),
+            riskJudge: ModelAlias.optional(),
+          })
+          .prefault({}),
     })
     .prefault({}),
   // 啟動時灌進 GH_TOKEN/GITHUB_TOKEN，供 gh 子行程（開 PR / 讀審查）使用；

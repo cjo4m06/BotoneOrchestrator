@@ -358,3 +358,28 @@ test('型別不符（字串放到數字欄位）會丟錯', (t) => {
   const dir = setup(t, { orchestrator: 'pollIntervalSec: "很快"\n' });
   assert.throws(() => loadConfig(dir.path));
 });
+
+/**
+ * 模型別名**刻意不接受版本號**：寫 opus 就永遠是最新的 opus。
+ * 寫 claude-opus-5 的話出了新版還會停在舊的，而且沒有任何地方會提醒你——
+ * 那正是這個系統一直在修的那種「靜默地停在錯的狀態」。
+ */
+test('各角色的模型：只收別名，不收版本號', (t) => {
+  const dir = setup(t, {
+    orchestrator: 'agent:\n  models:\n    coder: opus\n    riskJudge: haiku\n',
+  });
+  const cfg = loadConfig(dir.path);
+  assert.equal(cfg.orchestrator.agent.models.coder, 'opus');
+  assert.equal(cfg.orchestrator.agent.models.riskJudge, 'haiku');
+  assert.equal(cfg.orchestrator.agent.models.reviewer, undefined, '沒設的角色維持 SDK 預設');
+});
+
+test('帶版本號的模型名被拒絕（否則會靜靜停在舊模型上）', (t) => {
+  const dir = setup(t, { orchestrator: 'agent:\n  models:\n    coder: claude-opus-5\n' });
+  assert.throws(() => loadConfig(dir.path), /coder|models|invalid|Invalid/i);
+});
+
+test('沒設 models → 全部 undefined（走 SDK 預設，行為與先前一致）', (t) => {
+  const cfg = loadConfig(setup(t, {}).path);
+  assert.deepEqual(cfg.orchestrator.agent.models, {});
+});

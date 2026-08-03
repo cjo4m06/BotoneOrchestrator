@@ -241,6 +241,8 @@ export function agentAuthEnv(cfg: {
 }
 
 export interface AgentRuntimeDeps {
+  /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
+  model?: string;
   /**
    * 依 repo 解析任務板的文件來源（MCP 是每個專案各自的）。
    * 給了才會把 list_docs／search_docs／read_doc 掛給 agent，
@@ -310,6 +312,8 @@ export class AgentRuntime {
     const stream = query({
       prompt: buildAgentPrompt(input),
       options: {
+        // 模型別名（opus / sonnet / haiku）。未設 → SDK 預設。
+        ...(this.deps.model ? { model: this.deps.model } : {}),
         cwd: input.cwd,
         resume: input.resumeSessionId,
         permissionMode: 'acceptEdits',

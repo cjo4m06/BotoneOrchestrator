@@ -70,6 +70,8 @@ export type PlanQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterab
 
 export interface PlanAgentDeps {
   log: Logger;
+  /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
+  model?: string;
   queryFn?: PlanQueryFn;
   /** 規劃 agent 回應不合格時最多重問幾次（預設 1 次重問）。 */
   retries?: number;
@@ -117,6 +119,7 @@ export class PlanAgent {
         query({
           prompt: args.prompt,
           options: {
+            ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制唯讀，此處只為避免非互動環境卡在權限詢問
             allowedTools: PLAN_TOOLS,

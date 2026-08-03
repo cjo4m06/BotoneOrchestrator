@@ -99,7 +99,7 @@ export function verifierConfigOf(p: ProjectConfig): VerifierConfig {
 export const browserOutputRootOf = (dataRoot: string): string => join(dataRoot, 'browser-tmp');
 
 export function verifierDepsOf(
-  orch: Pick<OrchestratorConfig, 'commandTimeoutSec'>,
+  orch: Pick<OrchestratorConfig, 'commandTimeoutSec' | 'agent'>,
   log?: Logger,
   browserOutputRoot?: string,
   frictionSink?: { logEvent(scope: 'task', refId: string, kind: string, detail?: string): void },
@@ -114,6 +114,7 @@ export function verifierDepsOf(
       ? {
           uiJudge: new UiJudge({
             log,
+            ...(orch.agent?.models?.uiJudge ? { model: orch.agent.models.uiJudge } : {}),
             ...(browser ? { browser } : {}),
             // 判斷者最常撞到「我看到問題但查不下去」——給它一個說出口的地方
             ...(frictionSink ? { frictionSink } : {}),
@@ -1242,6 +1243,9 @@ export function buildPipeline(input: PipelineInput): Pipeline {
   // main() 也呼叫一次是無害的（applyClaudeAuth 不覆寫既有環境變數）；
   // 但真正的保證在這裡：**要建 pipeline 就一定先套過認證**，不會有人忘了接。
   applyClaudeAuth(config.orchestrator.agent, process.env);
+  // 各角色的模型（別名，不帶版本號 → 永遠是最新版）。未設就用 SDK 預設。
+  // `?? {}`：schema 的 prefault 保證正式路徑一定有，但呼叫端手動組 config 時可能沒有
+  const models = config.orchestrator.agent.models ?? {};
   if (!hasClaudeAuth()) {
     log.error(
       'Claude 認證不可用：reviewer 與分群／介面／飄移／風險判斷者**全部不會接線**，'
@@ -1267,6 +1271,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     worktreeBase: input.worktreeBase ?? worktreeBaseOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
     resolveProject: (repo) => registry.runtimeOf(repo),
     agent: new AgentRuntime(log, {
+      ...(models.coder ? { model: models.coder } : {}),
       // 現拿：控制台換 Claude token／端點，下一輪 agent 執行就套用（不必重啟）
       ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}),
       // 給 agent 一個瀏覽器：做 UI 卻看不到畫面，等於閉著眼睛做。
@@ -1298,16 +1303,16 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     allowLocalMerge: input.allowLocalMerge,
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
-    reviewer: new Reviewer({ log }),
+    reviewer: new Reviewer({ log, ...(models.reviewer ? { model: models.reviewer } : {}) }),
     // agent 宣告「無需改動」時的處置（預設全 ask：交人確認，不自動結案）
     noChangePolicy: config.orchestrator.noChange,
     // 審查意見回灌：與 Orchestrator／ReviewWatcher 共用同一個實例
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log }),
+    driftJudge: new DriftJudge({ log, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1344,7 +1349,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 分群與排序交給 agent：判準是「這幾個任務會不會動到同一批程式碼」，
         // 那要看懂任務在講什麼再對應到 repo。沒有 Claude 認證時才退回啟發式，
         // 並且明講——不然它會安靜地用一套已知會出錯的規則在跑。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。
