@@ -4,6 +4,7 @@ import { createFrictionServer, type FrictionSink } from './friction-server.js';
 import { z } from 'zod';
 import type { CheckResult } from '../types.js';
 import type { Logger } from '../observability/logger.js';
+import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
 
 /**
  * 介面判斷：讓 agent **自己開瀏覽器看**，判斷畫面行不行。
@@ -113,6 +114,11 @@ const VerdictSchema = z.union([
 export type UiQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface UiJudgeDeps {
+  /**
+   * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
+   * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
+   */
+  usage?: UsageSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -317,6 +323,7 @@ export class UiJudge {
       for await (const raw of q({ prompt, cwd })) {
         const m = raw as { type?: string; subtype?: string; result?: string };
         if (m.type === 'result') {
+          recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'ui_judge' }, raw);
           if (m.subtype === 'success') out = m.result ?? '';
           else throw new Error(`介面判斷回傳錯誤結果：${m.subtype ?? 'unknown'}`);
         }

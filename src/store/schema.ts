@@ -74,9 +74,20 @@ CREATE INDEX IF NOT EXISTS idx_clar_task   ON clarifications(task_id);
 --      session（而不是整個任務重跑），就得靠這張表找回 session_id；事後查 log 也要靠它對照。
 --   2. **成本歸屬**：SDK 每輪 result 會給 total_cost_usd 與各模型的 token 用量，
 --      累加在這裡才答得出「這個任務／這個群組花了多少錢」。
+-- 一列 = 一個 agent 的一次執行（同 session 多輪會累加）。
+--
+-- **不是只有寫程式的 agent**。先前只有 Worker 會寫這張表，於是規劃、reviewer、
+-- 三個判斷者的花費一毛都沒被記——一次跑 13 分鐘、輸出 139k token 的規劃，帳面 $0。
+-- 更糟的是預算閘門（orchestrator 的 withinBudget）用的是同一份數字，
+-- 使用者設的花費上限因此只擋到一部分的支出。
 CREATE TABLE IF NOT EXISTS agent_sessions (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 判斷者／規劃者不屬於任何單一任務時是 ''（哨兵值）。
+  -- 不改成 nullable 是因為 UNIQUE(task_id, session_id) 在 SQLite 裡對 NULL 不生效，
+  -- 那會讓同一個 session 重複寫入時長出多列而不是累加。
   task_id       TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'worker', -- worker | plan | reviewer | ui_judge | drift_judge | merge_risk_judge
+  repo          TEXT,
   group_id      TEXT,
   session_id    TEXT NOT NULL,
   rounds        INTEGER NOT NULL DEFAULT 0,
@@ -165,6 +176,9 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
   { table: 'tasks', column: 'source_updated_at', ddl: 'ALTER TABLE tasks ADD COLUMN source_updated_at INTEGER' },
   // 執行階段：這個群要等哪些群結束才能開跑（規劃 agent 排出來的順序）
   { table: 'groups', column: 'after_groups', ddl: "ALTER TABLE groups ADD COLUMN after_groups TEXT NOT NULL DEFAULT '[]'" },
+  // 記帳從「只有寫程式的 agent」擴到全部角色（規劃／reviewer／三個判斷者）
+  { table: 'agent_sessions', column: 'kind', ddl: "ALTER TABLE agent_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'" },
+  { table: 'agent_sessions', column: 'repo', ddl: 'ALTER TABLE agent_sessions ADD COLUMN repo TEXT' },
 ];
 
 export interface MigratableDb {

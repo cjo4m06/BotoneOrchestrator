@@ -6,6 +6,7 @@ import type { CheckResult, GateReport, TaskDetail } from '../types.js';
 import type { LoadedDoc } from './agent-runtime.js';
 import { collectDiffSince } from '../git/status.js';
 import { createPreToolUseGuard } from './agent-runtime.js';
+import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
 
 /**
  * 獨立 reviewer agent（DESIGN.md §5）。DoD 綠燈只證明「build/test 過」，證明不了
@@ -72,6 +73,11 @@ export interface ReviewOptions {
 export type ReviewQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface ReviewerDeps {
+  /**
+   * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
+   * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
+   */
+  usage?: UsageSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -129,7 +135,7 @@ export class Reviewer {
     );
     let text: string;
     try {
-      text = await this.runQuery(prompt, cwd);
+      text = await this.runQuery(prompt, cwd, { taskId: task.id, repo: task.repo });
     } catch (e) {
       this.deps.log.warn({ taskId: task.id, err: msg(e) }, 'reviewer 呼叫失敗，略過（不阻斷流程）');
       return toReviewOutcome({ status: 'skipped', reason: `reviewer 呼叫失敗：${msg(e)}` });
@@ -148,7 +154,7 @@ export class Reviewer {
     return toReviewOutcome(verdict);
   }
 
-  private async runQuery(prompt: string, cwd: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, ctx?: { taskId?: string; repo?: string }): Promise<string> {
     const q: ReviewQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -171,6 +177,7 @@ export class Reviewer {
     for await (const raw of q({ prompt, cwd })) {
       const m = raw as { type?: string; subtype?: string; result?: string };
       if (m.type === 'result') {
+        recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'reviewer', ...(ctx ?? {}) }, raw);
         if (m.subtype === 'success') out = m.result ?? '';
         else throw new Error(`reviewer 回傳錯誤結果：${m.subtype ?? 'unknown'}`);
       }

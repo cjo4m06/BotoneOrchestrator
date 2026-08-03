@@ -3,6 +3,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Logger } from '../observability/logger.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
+import { recordAgentUsage, type UsageSink } from './agent-usage.js';
 
 /**
  * 合併風險判斷者：「這個改動要不要先讓人看一眼？」
@@ -75,6 +76,11 @@ const SYSTEM_PROMPT =
 export type RiskQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface MergeRiskJudgeDeps {
+  /**
+   * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
+   * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
+   */
+  usage?: UsageSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -136,6 +142,7 @@ export class MergeRiskJudge {
     for await (const raw of q({ prompt, cwd })) {
       const m = raw as { type?: string; subtype?: string; result?: string };
       if (m.type === 'result') {
+        recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'merge_risk_judge' }, raw);
         if (m.subtype === 'success') out = m.result ?? '';
         else throw new Error(`判斷回傳錯誤結果：${m.subtype ?? 'unknown'}`);
       }

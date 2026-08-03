@@ -50,6 +50,7 @@ import type { TaskBrief } from './types.js';
 import type { VerifierConfig, VerifierDeps } from './worker/verifier.js';
 import { projectPurgerOf } from './core/project-purge.js';
 import { STALE_AFTER_MS } from './observability/activity.js';
+import type { UsageSink } from './core/agent-usage.js';
 
 /**
  * 執行期產出的目錄，**全部掛在該 profile 的 dataRoot 底下**。
@@ -105,6 +106,8 @@ export function verifierDepsOf(
   log?: Logger,
   browserOutputRoot?: string,
   frictionSink?: { logEvent(scope: 'task', refId: string, kind: string, detail?: string): void },
+  /** 記帳出口。介面判斷者會開瀏覽器跑很多輪，先前它的花費完全沒被記。 */
+  usage?: UsageSink,
 ): VerifierDeps {
   const sec = orch.commandTimeoutSec;
   // 判斷者自己開瀏覽器去看、去操作。輸出目錄必須在 worktree 之外，
@@ -120,6 +123,8 @@ export function verifierDepsOf(
             ...(browser ? { browser } : {}),
             // 判斷者最常撞到「我看到問題但查不下去」——給它一個說出口的地方
             ...(frictionSink ? { frictionSink } : {}),
+            // 它會開瀏覽器跑很多輪，是判斷者裡最貴的一個。先前完全沒記帳
+            ...(usage ? { usage } : {}),
           }),
         }
       : {}),
@@ -1298,23 +1303,23 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       },
     }),
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
-    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger)),
+    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger)),
     progressRounds: config.orchestrator.noProgress.rounds,
     notifier: gateway,
     // 合併會動到 base 分支，安全優先：必須明確開啟
     allowLocalMerge: input.allowLocalMerge,
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
-    reviewer: new Reviewer({ log, ...(models.reviewer ? { model: models.reviewer } : {}) }),
+    reviewer: new Reviewer({ log, usage: ledger, ...(models.reviewer ? { model: models.reviewer } : {}) }),
     // agent 宣告「無需改動」時的處置（預設全 ask：交人確認，不自動結案）
     noChangePolicy: config.orchestrator.noChange,
     // 審查意見回灌：與 Orchestrator／ReviewWatcher 共用同一個實例
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
+    driftJudge: new DriftJudge({ log, usage: ledger, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1351,7 +1356,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 分群與排序交給 agent：判準是「這幾個任務會不會動到同一批程式碼」，
         // 那要看懂任務在講什麼再對應到 repo。沒有 Claude 認證時才退回啟發式，
         // 並且明講——不然它會安靜地用一套已知會出錯的規則在跑。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。
@@ -1708,7 +1713,7 @@ export async function main(): Promise<void> {
     actions,
     log,
     dataRoot: boot.dataRoot,
-    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(boot.dataRoot), ledger)),
+    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(boot.dataRoot), ledger, ledger)),
   });
 
   const { dispatcher, orchestrator } = buildPipeline({

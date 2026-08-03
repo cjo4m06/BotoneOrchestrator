@@ -2,6 +2,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
+import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
 
 /**
  * 語意飄移判斷（需求 7 的第二層）。
@@ -61,6 +62,11 @@ const VerdictSchema = z.union([
 export type DriftQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface DriftJudgeDeps {
+  /**
+   * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
+   * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
+   */
+  usage?: UsageSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -135,6 +141,7 @@ export class DriftJudge {
     for await (const raw of q({ prompt, cwd })) {
       const m = raw as { type?: string; subtype?: string; result?: string };
       if (m.type === 'result') {
+        recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'drift_judge' }, raw);
         if (m.subtype === 'success') out = m.result ?? '';
         else throw new Error(`語意飄移判斷回傳錯誤結果：${m.subtype ?? 'unknown'}`);
       }

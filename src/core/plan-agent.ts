@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { Task } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
+import { recordAgentUsage, type UsageSink } from './agent-usage.js';
 
 /**
  * 規劃 agent：讀任務內容 + 實際的 repo，決定**分成哪幾群**與**群的執行順序**。
@@ -70,6 +71,11 @@ const ResultSchema = z.object({
 export type PlanQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface PlanAgentDeps {
+  /**
+   * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
+   * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
+   */
+  usage?: UsageSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -133,7 +139,7 @@ export class PlanAgent {
       // 一輪規劃跑十幾分鐘會被當成當機
       onProgress?.(attempts > 1 && i > 1 ? `第 ${i}/${attempts} 次嘗試（上一次回應不合格）` : '讀 repo 判斷誰會動到同一批檔案');
       const prompt = buildPlanPrompt(tasks, inFlight, lastErr);
-      const text = await this.runQuery(prompt, repoPath);
+      const text = await this.runQuery(prompt, repoPath, tasks[0]?.repo);
       const parsed = parsePlanResponse(text, tasks.map((t) => t.id), inFlight.map((g) => g.id));
       if (parsed.ok) {
         this.deps.log.info(
@@ -153,7 +159,7 @@ export class PlanAgent {
     throw new Error(`規劃 agent 無法產出可用的計畫（試了 ${attempts} 次）：${lastErr}`);
   }
 
-  private async runQuery(prompt: string, cwd: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, repo?: string): Promise<string> {
     const q: PlanQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -174,6 +180,8 @@ export class PlanAgent {
     for await (const raw of q({ prompt, cwd })) {
       const m = raw as { type?: string; subtype?: string; result?: string };
       if (m.type === 'result') {
+        // 先記帳再判成敗：失敗的那一次一樣花了錢（規劃單次十幾分鐘）
+        recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'plan', ...(repo ? { repo } : {}) }, raw);
         if (m.subtype === 'success') out = m.result ?? '';
         else throw new Error(`規劃 agent 回傳錯誤結果：${m.subtype ?? 'unknown'}`);
       }

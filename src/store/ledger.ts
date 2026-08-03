@@ -55,8 +55,19 @@ export interface Activity {
 export type ActivityInput = Omit<Activity, 'startedAt' | 'heartbeatAt'>;
 
 /** 一次 agent 執行的紀錄（同一 session 多輪會累加）。 */
+/** agent 角色。記帳要分得出「寫程式的錢」與「判斷者的錢」。 */
+export type AgentKind = 'worker' | 'plan' | 'reviewer' | 'ui_judge' | 'drift_judge' | 'merge_risk_judge';
+
 export interface AgentSessionInput {
+  /**
+   * 角色。**必填**——src 裡的寫入者只有兩個（worker 與 recordAgentUsage），
+   * 設成必填就讓 typecheck 替接線把關：漏了哪個角色，編譯當場失敗。
+   */
+  kind: AgentKind;
+  /** 不屬於任何單一任務時給 ''（見 schema 的說明，不用 null）。 */
   taskId: string;
+  /** 哪個專案燒的。判斷者不屬於任務，只有這個欄位看得出錢花在誰身上。 */
+  repo?: string;
   sessionId: string;
   groupId?: string;
   costUsd?: number;
@@ -362,6 +373,8 @@ export class Ledger {
       )
       .run({
         taskId: input.taskId,
+        kind: input.kind,
+        repo: input.repo ?? null,
         groupId: input.groupId ?? null,
         sessionId: input.sessionId,
         costUsd: input.costUsd ?? 0,

@@ -650,7 +650,9 @@ export class Worker {
     if (!sessionId) return; // SDK 沒回 session（極少見）→ 沒有可對照的鍵，記了也沒用
     try {
       this.deps.ledger.recordAgentSession({
+        kind: 'worker',
         taskId: detail.id,
+        repo: detail.repo,
         sessionId,
         ...(groupId ? { groupId } : {}),
         ...(r.usage
