@@ -4,10 +4,11 @@
 # node 的位置因安裝方式而異（Homebrew / nvm / 官方安裝檔），寫死一份遲早會對不上，
 # 而對不上的症狀是「服務標成已載入但其實沒在跑」，很難查。
 #
-#   ./scripts/launchd.sh install     安裝並啟動（正式庫）
-#   ./scripts/launchd.sh uninstall   停止並移除（開機不再自動啟動）
+#   ./scripts/launchd.sh install     安裝並啟動（第一次用這個）
+#   ./scripts/launchd.sh start       啟動（已安裝、之前 stop 過）
 #   ./scripts/launchd.sh stop        只停止，保留設定（下次登入仍會自動啟動）
-#   ./scripts/launchd.sh restart     重新啟動（改完程式碼 build 後用）
+#   ./scripts/launchd.sh restart     重新 build 並啟動（git pull 之後用這個）
+#   ./scripts/launchd.sh uninstall   停止並移除（開機不再自動啟動）
 #   ./scripts/launchd.sh status      目前狀態
 #   ./scripts/launchd.sh logs        跟看 log
 #   ./scripts/launchd.sh plist       只印出將產生的 plist，不做任何事
@@ -194,6 +195,16 @@ case "$CMD" in
     echo "✓ 已停止（設定保留，下次登入仍會自動啟動；要徹底移除用 uninstall）"
     ;;
 
+  # 有 stop 卻沒有 start 是不對稱的——實際被這個絆到過：stop 之後想再開，
+  # 打 start 得到的是用法說明，看起來像腳本壞了。
+  start)
+    [ -f "$PLIST" ] || die "尚未安裝，請先 install"
+    is_loaded && { echo "已經在跑了（要套用新程式碼用 restart）"; exit 0; }
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    sleep 2
+    is_loaded && echo "✓ 已啟動" || die "啟動後服務不在，請看 $REPO/$DATA_DIR/stderr.log"
+    ;;
+
   restart)
     [ -f "$PLIST" ] || die "尚未安裝，請先 install"
     (cd "$REPO" && npm run build)
@@ -218,11 +229,14 @@ case "$CMD" in
     ;;
 
   logs)
-    tail -n 40 -f "$REPO/data/stderr.log"
+    # 跟著 profile 走：測試的日誌在 data/test/，不然會看到另一個 profile 的檔案
+    tail -n 40 -f "$REPO/$DATA_DIR/stderr.log"
     ;;
 
   *)
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # 印到第一個非註解行為止。寫死行數的話，每次改用法說明都要記得跟著調——
+    # 忘了就會把 `set -euo pipefail` 之類的程式碼一起印給使用者看（踩過）。
+    awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
     exit 2
     ;;
 esac
