@@ -116,10 +116,44 @@ describe('buildPlanPrompt', () => {
     assert.match(p, /前置任務：T-1/);
   });
 
-  it('明講「不要只看標題猜」與「判斷不準就排到不同階段」', () => {
+  it('明講「不要只看標題猜」，且不確定時要保守', () => {
     const p = buildPlanPrompt([task('T-1')]);
     assert.match(p, /不要只看標題猜/);
-    assert.match(p, /判斷不準時一律排到不同階段/);
+    // 舊版寫「判斷不準時一律排到不同階段」——那句話正是矛盾的來源：
+    // 它與「動到同一批檔案就同一群」牴觸，而分階段其實是**最貴**的手段
+    // （要等人審完、合併進 main 才開工）。改成「當成有交集」，
+    // 由判準 1 收斂到同一群——同一個工作區依序做，比分階段既安全又便宜。
+    assert.match(p, /一律\*\*當成有交集\*\*處理/);
+  });
+
+  /** 判準必須有優先順序，否則兩條都成立時規劃者可以合理選任何一邊（實跑就是這樣切出 16 群）。 */
+  it('判準有明確的優先順序，且同檔案預設同群', () => {
+    const p = buildPlanPrompt([task('T-1')]);
+    assert.match(p, /\*\*有優先順序\*\*/);
+    assert.match(p, /會動到同一個檔案的任務 → 放同一群/);
+    assert.match(p, /最高優先/);
+  });
+
+  /** 舊版從沒說過「多切一群要付什麼代價」，規劃者當然以為多切是保守做法。 */
+  it('講清楚多一群、多一階段的真實成本', () => {
+    const p = buildPlanPrompt([task('T-1')]);
+    assert.match(p, /多一個群/);
+    assert.match(p, /多一次人工審查/);
+    assert.match(p, /分階段是最貴的手段/);
+  });
+
+  it('給出規模上限（群太大審不動，群太小每個都要付一輪驗證）', () => {
+    const p = buildPlanPrompt([task('T-1')]);
+    assert.match(p, /一群最多 \d+ 個任務/);
+    assert.match(p, /files 合計最多 \d+ 個/);
+  });
+
+  /** 範例本身就是指示。只示範單任務群，等於默默鼓勵一群一個任務。 */
+  it('輸出範例示範多任務群與同階段並行', () => {
+    const p = buildPlanPrompt([task('T-1')]);
+    const example = p.slice(p.indexOf('## 輸出格式'));
+    assert.match(example, /"taskIds": \["T-1", "T-3", "T-7"\]/, '要示範一群多個任務');
+    assert.match(example, /"stages": \[\["A", "B"\]\]/, '要示範同階段並行');
   });
 
   it('重問時把上次的錯誤原因帶進去', () => {
