@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS groups (
   branch      TEXT NOT NULL,
   task_ids    TEXT NOT NULL DEFAULT '[]',
   footprint   TEXT NOT NULL DEFAULT '[]',
+  rationale  TEXT NOT NULL DEFAULT '',  -- 規劃 agent 說明「為什麼這幾個一組」；給下游 agent 當起手線索
   after_groups TEXT NOT NULL DEFAULT '[]',
   state       TEXT NOT NULL,
   pr_url      TEXT,
@@ -179,6 +180,8 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
   // 記帳從「只有寫程式的 agent」擴到全部角色（規劃／reviewer／三個判斷者）
   { table: 'agent_sessions', column: 'kind', ddl: "ALTER TABLE agent_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'" },
   { table: 'agent_sessions', column: 'repo', ddl: 'ALTER TABLE agent_sessions ADD COLUMN repo TEXT' },
+  // 規劃 agent 判斷「這幾個任務為什麼是一組」的理由——先前只寫 log 就丟掉了
+  { table: 'groups', column: 'rationale', ddl: "ALTER TABLE groups ADD COLUMN rationale TEXT NOT NULL DEFAULT ''" },
 ];
 
 export interface MigratableDb {

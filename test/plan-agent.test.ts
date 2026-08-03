@@ -4,6 +4,9 @@ import assert from 'node:assert/strict';
 import { PlanAgent, buildPlanPrompt, parsePlanResponse } from '../src/core/plan-agent.js';
 import { createSilentLogger } from './helpers/index.js';
 import type { Task } from '../src/types.js';
+import { createTmpLedger } from './helpers/index.js';
+import { buildAgentPrompt } from '../src/worker/agent-runtime.js';
+import { readFileSync } from 'node:fs';
 
 /**
  * 這批測試對應的是一次實跑事故：
@@ -385,5 +388,86 @@ describe('PlanAgent', () => {
         })(),
     });
     await assert.rejects(() => agent.plan(tasks, '/repo'), /error_max_turns/);
+  });
+});
+
+describe('規劃成果傳給下游（B3）', () => {
+  /**
+   * 規劃 agent 讀完整個 repo 才得出 rationale 與 footprint（實測 13 分鐘），
+   * 先前 rationale 只寫 log 就丟掉、footprint 只用來判斷兩群能不能並行，
+   * 而寫程式的 agent 在新 worktree 從零把同一批檔案再讀一次——同一件調查付兩次錢。
+   */
+  it('rationale 存得進 ledger、讀得回來', () => {
+    const h = createTmpLedger();
+    try {
+      const g = h.ledger.createGroup({
+        repo: 'acme/web', branch: 'b', taskIds: ['T-1'], footprint: ['a.ts'],
+        rationale: '三個任務都改 Foo.vue 的同一段',
+      });
+      assert.equal(h.ledger.getGroup(g.id)?.rationale, '三個任務都改 Foo.vue 的同一段');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  /** 重派時 upsertGroup 會帶著空 rationale 進來——不能把當初的判斷洗掉。 */
+  it('重派不會把 rationale 洗成空字串', () => {
+    const h = createTmpLedger();
+    try {
+      const g = h.ledger.createGroup({
+        repo: 'acme/web', branch: 'b', taskIds: ['T-1'], footprint: [], rationale: '原本的理由',
+      });
+      h.ledger.upsertGroup({ ...g, rationale: '', state: 'forming' });
+      assert.equal(h.ledger.getGroup(g.id)?.rationale, '原本的理由');
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('線索有進到 agent 的提示詞裡', () => {
+    const p = buildAgentPrompt({
+      task: { id: 'T-1', title: 't', repo: 'a/b', category: 'dev', description: 'd', dependencies: [], docRefs: [], status: 'todo' },
+      docs: [],
+      cwd: '/wt',
+      planHint: { rationale: '都改 Foo.vue 的同一段', files: ['src/Foo.vue', 'src/useFoo.ts'] },
+    } as never);
+    assert.match(p, /都改 Foo\.vue 的同一段/);
+    assert.match(p, /src\/Foo\.vue/);
+  });
+
+  /**
+   * **措辭是關鍵。** 讓 agent 把線索當成事實的話，它會只改那幾個檔案就收工——
+   * 那比沒有這段更糟（規劃沒看過要寫的程式碼，本來就可能漏）。
+   */
+  it('明講線索不是事實、該改哪些由 agent 自己決定', () => {
+    const p = buildAgentPrompt({
+      task: { id: 'T-1', title: 't', repo: 'a/b', category: 'dev', description: 'd', dependencies: [], docRefs: [], status: 'todo' },
+      docs: [],
+      cwd: '/wt',
+      planHint: { rationale: 'r', files: ['a.ts'] },
+    } as never);
+    assert.match(p, /參考用，不是事實/);
+    assert.match(p, /由你自己查證決定/);
+    assert.match(p, /不要因為某個檔案不在下面就不去改它/, '要明擋「只改清單內」這個偷懶路徑');
+  });
+
+  it('沒有線索時整段不出現（不要塞空標題讓 agent 去猜）', () => {
+    const p = buildAgentPrompt({
+      task: { id: 'T-1', title: 't', repo: 'a/b', category: 'dev', description: 'd', dependencies: [], docRefs: [], status: 'todo' },
+      docs: [],
+      cwd: '/wt',
+    } as never);
+    assert.doesNotMatch(p, /規劃階段的線索/);
+  });
+
+  /** 接線：GroupRunner 有沒有真的把 group 的東西帶下去。 */
+  it('GroupRunner 把 rationale 與 footprint 交給 Worker', () => {
+    const src = readFileSync('src/core/group-runner.ts', 'utf8');
+    assert.match(src, /planHint:\s*\{\s*rationale:\s*group\.rationale,\s*files:\s*group\.footprint\s*\}/);
+  });
+
+  it('Worker 把線索轉給 agent', () => {
+    const src = readFileSync('src/worker/worker.ts', 'utf8');
+    assert.match(src, /planHint:\s*input\.planHint/);
   });
 });

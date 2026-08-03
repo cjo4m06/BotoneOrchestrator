@@ -649,6 +649,8 @@ export class Orchestrator {
             branch: '',
             taskIds: pg.taskIds,
             footprint: pg.footprint,
+            // 規劃 agent 讀完整個 repo 才得出的判斷，存下來給下游 agent 當起手線索
+            rationale: pg.rationale,
             // 同專案的前一階段 ＋ 跨批次要等的既有群組
             afterGroups: [...new Set([...previousStage, ...(pg.afterExisting ?? [])])],
           });

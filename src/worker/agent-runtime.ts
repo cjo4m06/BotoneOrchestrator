@@ -39,6 +39,13 @@ export interface IterateInput {
   signal?: AbortSignal;
   answer?: { question: string; answer: string }; // 澄清答覆注入
   /**
+   * 規劃階段查出來的線索（群層級，不是任務層級）。
+   *
+   * 規劃 agent 讀完整個 repo 才得出這些判斷（實測 13 分鐘），先前全部丟掉——
+   * 寫程式的 agent 在新 worktree 從零把同一批檔案再讀一次。同一件調查付兩次錢。
+   */
+  planHint?: { rationale: string; files: string[] };
+  /**
    * 本任務起點 sha（＝DoD diff 關卡與 reviewer 同一枚）。
    * Stop hook 用它判「這一輪到底做了沒」；未給 → 退回 porcelain，
    * 那只看得到未 commit 的東西，agent 自行 commit 後會被誤判成什麼都沒做。
@@ -871,6 +878,22 @@ export function buildAgentPrompt(input: IterateInput): string {
   if (input.docs.length > 0) {
     p.push(`\n## 規格文件（docRefs，務必逐段遵循）`);
     for (const d of input.docs) p.push(`\n### ${d.ref}\n${d.content}`);
+  }
+
+  // 規劃階段的線索。**措辭是關鍵**：它是讀完整個 repo 後的判斷（實測 13 分鐘），
+  // 很有參考價值，但如果讓 agent 當成事實，它會只改那幾個檔案就收工——
+  // 那比沒有這段更糟。所以明講「不完整、要自己確認」。
+  if (input.planHint && (input.planHint.rationale || input.planHint.files.length > 0)) {
+    p.push(`\n## 規劃階段的線索（**參考用，不是事實**）`);
+    p.push(
+      '這是分群時的判斷，它沒有看過你要寫的程式碼，也可能漏掉或看錯。'
+      + '拿它當起點省去重新摸索，但**該改哪些檔案由你自己查證決定**——'
+      + '不要因為某個檔案不在下面就不去改它。',
+    );
+    if (input.planHint.rationale) p.push(`\n為什麼這幾個任務分在同一組：${input.planHint.rationale}`);
+    if (input.planHint.files.length > 0) {
+      p.push(`\n規劃時預期會動到（整組共用，不是只有這個任務）：\n${input.planHint.files.map((f) => `- ${f}`).join('\n')}`);
+    }
   }
 
   if (input.answer) {

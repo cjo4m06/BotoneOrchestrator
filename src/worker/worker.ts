@@ -167,6 +167,8 @@ export interface RunTaskInput {
    * 「這次改了什麼」——沒有它，畫面上所有毛病都會被當成這次弄的。
    */
   baseRef?: string;
+  /** 規劃階段的線索（群層級）。由 GroupRunner 從 group 帶下來。 */
+  planHint?: { rationale: string; files: string[] };
   /**
    * 回報現在在做哪一步（寫程式／跑驗收／審查中）給控制台。
    *
@@ -278,7 +280,7 @@ export class Worker {
       this.say(threadTs, { type: 'iterating', round }, detail);
 
       input.onPhase?.(`第 ${round} 輪：agent 寫程式中`);
-      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
+      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.planHint ? { planHint: input.planHint } : {}), ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
         // 只注入一次：不標消費的話，之後每一輪都會再貼一次同樣的答覆，

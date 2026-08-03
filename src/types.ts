@@ -54,6 +54,13 @@ export interface Group {
    * 「雖然檔案不同，但先後有意義」（依賴、或規劃者判斷很可能會撞）。
    */
   afterGroups: string[];
+  /**
+   * 規劃 agent 說明「為什麼這幾個任務是一組」。
+   *
+   * 先前只寫進 log 就丟掉了——而規劃是靠讀完整個 repo 得出這個判斷的（實測 13 分鐘）。
+   * 存起來之後可以當寫程式 agent 的起手線索，讓那次調查被用兩次而不是一次。
+   */
+  rationale: string;
   state: GroupState;
   prUrl?: string;
   prNumber?: number;

@@ -807,6 +807,9 @@ export class GroupRunner {
             // 給介面判斷者的比較基準：它要靠這個查出「這次改了什麼」，
             // 才不會把整個頁面的既有毛病都算到這次頭上
             baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,
+            // 規劃階段查出來的線索。它讀完整個 repo 才得出這個判斷（實測 13 分鐘），
+            // 先前只寫 log 就丟掉，agent 在新 worktree 從零再讀一次同一批檔案
+            planHint: { rationale: group.rationale, files: group.footprint },
             onPhase: update,
           }),
       );

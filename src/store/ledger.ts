@@ -478,10 +478,12 @@ export class Ledger {
     const ts = this.now();
     this.db
       .prepare(
-        `INSERT INTO groups (id, repo, branch, task_ids, footprint, after_groups, state, pr_url, pr_number, created_at, updated_at)
-           VALUES (@id, @repo, @branch, @taskIds, @footprint, @afterGroups, @state, @prUrl, @prNumber, @ts, @ts)
+        `INSERT INTO groups (id, repo, branch, task_ids, footprint, after_groups, rationale, state, pr_url, pr_number, created_at, updated_at)
+           VALUES (@id, @repo, @branch, @taskIds, @footprint, @afterGroups, @rationale, @state, @prUrl, @prNumber, @ts, @ts)
          ON CONFLICT(id) DO UPDATE SET
-           branch=@branch, task_ids=@taskIds, footprint=@footprint, after_groups=@afterGroups, state=@state,
+           branch=@branch, task_ids=@taskIds, footprint=@footprint, after_groups=@afterGroups,
+             -- rationale 只在建群時寫；重派時不該被空字串蓋掉
+             rationale=CASE WHEN @rationale <> '' THEN @rationale ELSE rationale END, state=@state,
            pr_url=@prUrl, pr_number=@prNumber, updated_at=@ts`,
       )
       .run({
@@ -491,6 +493,7 @@ export class Ledger {
         taskIds: JSON.stringify(g.taskIds),
         footprint: JSON.stringify(g.footprint),
         afterGroups: JSON.stringify(g.afterGroups ?? []),
+        rationale: g.rationale ?? '',
         state: g.state,
         prUrl: g.prUrl ?? null,
         prNumber: g.prNumber ?? null,
@@ -504,13 +507,14 @@ export class Ledger {
   }
 
   /** 建立群組（id 由 repo+taskIds 決定，冪等：同組任務再規劃回同一群）。 */
-  createGroup(input: { repo: string; branch: string; taskIds: string[]; footprint: string[]; afterGroups?: string[] }): Group {
+  createGroup(input: { repo: string; branch: string; taskIds: string[]; footprint: string[]; afterGroups?: string[]; rationale?: string }): Group {
     const id = 'g_' + createHash('sha1').update(`${input.repo}|${[...input.taskIds].sort().join(',')}`).digest('hex').slice(0, 12);
     const existing = this.getGroup(id);
     if (existing) return existing;
     this.upsertGroup({
       id, repo: input.repo, branch: input.branch, taskIds: input.taskIds,
-      footprint: input.footprint, afterGroups: input.afterGroups ?? [], state: 'ready',
+      footprint: input.footprint, afterGroups: input.afterGroups ?? [],
+      rationale: input.rationale ?? '', state: 'ready',
     });
     return this.getGroup(id)!;
   }
@@ -799,6 +803,7 @@ export class Ledger {
       branch: r.branch as string,
       taskIds: JSON.parse((r.task_ids as string) ?? '[]'),
       footprint: JSON.parse((r.footprint as string) ?? '[]'),
+      rationale: (r.rationale as string) ?? '',
       afterGroups: JSON.parse((r.after_groups as string) ?? '[]'),
       state: r.state as GroupState,
       prUrl: (r.pr_url as string) ?? undefined,
