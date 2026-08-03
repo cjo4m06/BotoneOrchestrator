@@ -225,6 +225,93 @@ export function resolveFlag(env: NodeJS.ProcessEnv, key: string, fromConfig: boo
  * 回傳只描述動作，永遠不回傳 token 本身，避免被記進 log。
  */
 /**
+ * 檢查目前的 gh 認證能不能存取這些 repo；不能、而 gh 自己的認證可以的話，
+ * **把設定裡的 token 收回去**。
+ *
+ * ── 為什麼要收回去，而不是只警告 ──
+ *
+ * `GH_TOKEN` 一旦被設定，gh 就**完全不看自己的認證**（keyring／`gh auth login`）。
+ * 所以一顆權限不足的 token 不只是「沒幫上忙」——它會把原本可用的認證蓋掉，
+ * 讓一個本來會動的系統壞掉。
+ *
+ * 實跑撞到（21:28）：控制台設了一顆 fine-grained PAT，resource owner 是個人帳號，
+ * 而專案的 repo 屬於某個 organization——**resource owner 選個人帳號的 fine-grained
+ * PAT 看不到任何 organization 的 repo**，那是 GitHub 的規則，不是設定漏了什麼。
+ * 於是每一次 gh 呼叫都失敗，而 GitHub 對「有效 token 但無權限的私有 repo」
+ * 回的是 `Not Found` 不是 403（避免洩漏私有 repo 是否存在），錯誤長這樣：
+ *
+ *   GraphQL: Could not resolve to a Repository with the name 'org/repo'
+ *
+ * 看起來像 repo 打錯或不存在，實際上是權限。而使用者的 keyring 裡本來就有一顆
+ * 看得到那個 repo 的 token——只是被設定裡那顆蓋掉了。
+ *
+ * 這個檢查放在啟動時，問題就在啟動時講清楚，而不是等某一群跑了一小時、
+ * 要開 PR 時才炸，還留下一句看不懂的錯誤訊息。
+ */
+export async function verifyGhAccess(
+  repos: string[],
+  log: Logger,
+  deps: { run?: (args: string[]) => Promise<{ exitCode: number }>; env?: NodeJS.ProcessEnv } = {},
+): Promise<{ ok: string[]; denied: string[]; revoked: boolean }> {
+  const env = deps.env ?? process.env;
+  // **env 一定要明確傳給子行程。** 不傳的話 execa 用 process.env，而我們動的是
+  // deps.env——正式環境兩者剛好是同一個物件所以會動，但那是巧合，不是設計。
+  // 而且「收回 token 之後再試一次」這件事若沒真的作用在子行程上，
+  // 整個判斷就是假的（測試會綠、實際沒生效）。
+  const run =
+    deps.run ??
+    (async (args: string[]) => ({
+      exitCode: (await execa('gh', args, { reject: false, env, extendEnv: false })).exitCode ?? -1,
+    }));
+  const canSee = async (repo: string): Promise<boolean> =>
+    (await run(['api', `repos/${repo}`, '--jq', '.full_name'])).exitCode === 0;
+
+  const ok: string[] = [];
+  const denied: string[] = [];
+  for (const repo of [...new Set(repos)]) ((await canSee(repo)) ? ok : denied).push(repo);
+  if (denied.length === 0) return { ok, denied, revoked: false };
+
+  const settingsToken = (env.GH_TOKEN ?? '').trim();
+  if (settingsToken === '') {
+    log.error(
+      { denied },
+      'gh 存取不到這些 repo。私有 repo 沒權限時 GitHub 回的是 Not Found（不是 403），'
+        + '所以錯誤訊息會長得像「repo 不存在」。請確認 gh 的認證涵蓋這些 repo。',
+    );
+    return { ok, denied, revoked: false };
+  }
+
+  // 把設定裡的 token 收掉，讓 gh 退回用自己的認證再試一次
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
+  const rescued: string[] = [];
+  for (const repo of denied) if (await canSee(repo)) rescued.push(repo);
+
+  if (rescued.length > 0) {
+    log.error(
+      { 設定的token看不到: denied, 收回後可存取: rescued },
+      '⚠️ 控制台設定的 GitHub token 看不到這些 repo，但 gh 自己的認證看得到 → '
+        + '**已忽略設定裡的 token**，改用 gh 自己的（gh auth login／keyring）。'
+        + '最常見原因：fine-grained PAT 的 resource owner 選了個人帳號，而 repo 屬於 organization——'
+        + '那種 token 看不到任何 organization 的 repo。要用設定裡那顆的話，'
+        + 'resource owner 必須選該 organization（可能還需要組織核准）。',
+    );
+    return { ok: [...ok, ...rescued], denied: denied.filter((d) => !rescued.includes(d)), revoked: true };
+  }
+
+  // 兩邊都不行：token 放回去（維持原本行為），但要吵得夠大聲
+  env.GH_TOKEN = settingsToken;
+  env.GITHUB_TOKEN = settingsToken;
+  log.error(
+    { denied },
+    '⚠️ gh 存取不到這些 repo（設定裡的 token 與 gh 自己的認證都不行）。'
+      + '開 PR、讀審查、合併全部會失敗。私有 repo 沒權限時 GitHub 回 Not Found 不是 403，'
+      + '所以錯誤會長得像「repo 不存在」。',
+  );
+  return { ok, denied, revoked: false };
+}
+
+/**
  * 把 DB 裡的 Claude 認證套進**本行程的** process.env。
  *
  * ── 為什麼需要，以及少了它會發生什麼 ──
@@ -1492,6 +1579,9 @@ export async function main(): Promise<void> {
   const config = store.appConfig();
   const applyGh = createGithubTokenApplier(process.env, log);
   applyGh(config.orchestrator.github.token);
+  // 在這裡驗，不要等某一群跑了一小時、要開 PR 時才炸。
+  // 設定裡的 token 若看不到專案的 repo，會把 gh 自己的認證蓋掉（見 verifyGhAccess）。
+  await verifyGhAccess(config.projects.map((p) => p.repo), log);
   log.info(
     { profile: boot.profile, ledger: boot.ledgerPath, projects: config.projects.length },
     boot.profile === 'test'

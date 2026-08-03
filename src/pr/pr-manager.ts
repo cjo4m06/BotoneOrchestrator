@@ -163,7 +163,16 @@ export class PrManager {
       cwd,
     );
     if (r.exitCode !== 0) {
-      this.log.warn({ repo, branch, detail: tail(r.stderr || r.stdout) }, '查詢既有 PR 失敗（視為沒有）');
+      // 回 undefined 是刻意的：兩個呼叫端都安全（openPr 接著建立時會拿到真正的錯誤；
+      // 刪分支那條在 !ancestor && !mergedPr 時擲錯拒絕動作）。
+      // 但**等級要是 error 不是 warn**，而且要把 GitHub 那句誤導的訊息翻譯出來——
+      // 實跑撞到：這裡連兩次靜靜 warn，真正的原因（token 沒權限）延後一小時
+      // 才在 openPr 那裡浮現，而浮現時的訊息看起來像「repo 不存在」。
+      const detail = tail(r.stderr || r.stdout);
+      this.log.error(
+        { repo, branch, state, detail, 可能原因: interpretGhError(detail, repo) },
+        '查詢既有 PR 失敗（本次視為沒有，但這通常是認證或權限問題）',
+      );
       return undefined;
     }
     const parsed = PrListSchema.safeParse(safeJson(r.stdout));
@@ -392,4 +401,32 @@ function safeJson(s: string): unknown {
 
 function tail(s: string, n = 20): string {
   return s.split('\n').slice(-n).join('\n').trim();
+}
+
+
+/**
+ * 把 GitHub 那句誤導的錯誤翻譯成人看得懂的原因。
+ *
+ * 私有 repo 沒權限時 GitHub **回 Not Found 而不是 403**（避免洩漏私有 repo 是否存在），
+ * 於是 gh 吐出來的是：
+ *
+ *   GraphQL: Could not resolve to a Repository with the name 'org/repo'
+ *
+ * 那看起來像「repo 名稱打錯了」或「repo 被刪了」，實際上幾乎都是**權限**。
+ * 實跑撞到：使用者的 fine-grained PAT resource owner 選了個人帳號，
+ * 而 repo 屬於 organization——那種 token 看不到任何 organization 的 repo。
+ */
+export function interpretGhError(detail: string, repo: string): string | undefined {
+  if (/Could not resolve to a Repository|HTTP 404|Not Found/i.test(detail)) {
+    const org = repo.includes('/') ? repo.split('/')[0] : repo;
+    return (
+      `多半是 token 看不到 ${repo}（GitHub 對無權限的私有 repo 回 Not Found 不是 403）。`
+      + `若 ${org} 是 organization，fine-grained PAT 的 resource owner 必須選 ${org} 而不是個人帳號，`
+      + '且可能需要組織核准；或改用有 repo scope 的 classic token／gh auth login。'
+    );
+  }
+  if (/gh auth login|not logged|authentication|Bad credentials|HTTP 401/i.test(detail)) {
+    return 'gh 沒有有效認證（token 過期或未登入）。';
+  }
+  return undefined;
 }
