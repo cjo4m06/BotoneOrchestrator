@@ -616,8 +616,24 @@ document.addEventListener('click', async (ev) => {
   if (!el) return;
   const [what, id, enabled] = el.dataset.proj.split(':');
   if (what === 'toggle') {
-    await api(`/api/projects/${encodeURIComponent(id)}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: enabled !== 'true' }) });
-    toast(enabled === 'true' ? '已停用（下一輪起停止輪詢）' : '已啟用（下一輪起開始輪詢）', 'ok');
+    const turningOff = enabled === 'true';
+    if (turningOff && !confirm('停用會清掉這個專案在本機的任務、群組、worktree 與分支。\n下次啟用時會重新從任務板撈一次（拿到的是最新狀態）。\n\n要停用嗎？')) return;
+    const r = await api(`/api/projects/${encodeURIComponent(id)}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: !turningOff }) });
+    if (!turningOff) toast('已啟用（下一輪起開始輪詢）', 'ok');
+    else {
+      const p = r.purged || { tasks: 0, groups: 0, claimed: [] };
+      toast(`已停用，清除 ${p.tasks} 個任務、${p.groups} 個群組`, 'ok');
+      // 已認領過的卡片：MCP 沒有取消認領的工具，本機清掉之後那張卡在任務板上會一直是
+      // in_progress，下次 list_tasks(todo) 撈不到它 —— 沒人講的話它就永遠沒人碰。
+      // 這件事不能只用會消失的 toast 帶過。
+      if (p.claimed?.length) {
+        alert(
+          `以下 ${p.claimed.length} 個任務已經在任務板上認領過，本機狀態已清除，\n`
+          + `但任務板上那幾張卡還是 in_progress。請到任務板把它們改回 todo，否則不會再被撿到：\n\n`
+          + p.claimed.map((c) => `• ${c.id}　${c.title}`).join('\n'),
+        );
+      }
+    }
     await loadProjects();
     return;
   }

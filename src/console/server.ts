@@ -17,6 +17,7 @@ import { InboundRouter, type CompleteTaskFn } from '../notify/notifier.js';
 import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { ProjectConfig } from '../config/index.js';
+import type { PurgeResult } from '../core/project-purge.js';
 
 /**
  * 本機控制台。
@@ -43,6 +44,14 @@ export interface ConsoleDeps {
   router?: InboundRouter;
   /** daemon 是否在同一個行程裡（顯示用）。 */
   inProcess?: boolean;
+  /**
+   * 停用專案時清掉它的本地狀態（見 core/project-purge.ts）。
+   *
+   * **必填。** 少接的話「停用」就只是改個旗標，下次啟用會拿舊快照在跑；
+   * 而且停用期間每一輪 tick 都會在規劃那一步擲錯，整個 tick 的後半段全部跳過。
+   * 列為必填，就是要讓漏接在 typecheck 當場失敗，而不是等實跑才發現。
+   */
+  purgeProject: (repo: string) => Promise<PurgeResult>;
 }
 
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
@@ -196,8 +205,26 @@ export class ConsoleServer {
     if (enabledMatch && m === 'POST') {
       const id = decodeURIComponent(enabledMatch[1]!);
       const { enabled } = (await this.body(req)) as { enabled?: boolean };
-      const ok = store.setProjectEnabled(id, enabled === true);
-      return this.json(res, ok ? 200 : 404, { ok });
+      const on = enabled === true;
+      // 先取 repo：旗標改完之後 projects() 就查不到它了
+      const repo = store.allProjects().find((p) => p.config.id === id)?.config.repo;
+      const ok = store.setProjectEnabled(id, on);
+      if (!ok) return this.json(res, 404, { ok });
+
+      // **停用＝清乾淨。** 留著的話下次啟用是拿舊快照在跑，而且停用期間每一輪 tick
+      // 都會因為「查不到專案」在規劃那一步擲錯，連帶讓輪詢、審查監看、合併佇列、
+      // 待辦提醒全部跳過（實跑撞到）。
+      let purged;
+      if (!on && repo) {
+        try {
+          purged = await this.deps.purgeProject(repo);
+          this.deps.log.info({ id, repo, ...purged }, '停用專案並清除本地狀態');
+        } catch (e) {
+          // 清理失敗不該讓「停用」失敗——旗標已經關了，那才是重點
+          this.deps.log.warn({ id, err: e instanceof Error ? e.message : String(e) }, '停用後清理失敗（專案已停用）');
+        }
+      }
+      return this.json(res, 200, { ok, ...(purged ? { purged } : {}) });
     }
 
     // 路徑選擇器：瀏覽器拿不到真實檔案路徑（安全限制），所以由伺服器端列目錄。

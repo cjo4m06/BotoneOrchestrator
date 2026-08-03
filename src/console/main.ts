@@ -14,6 +14,8 @@ import { promoteSecrets } from '../config/promote-secrets.js';
 import { Ledger } from '../store/ledger.js';
 import { createLogger } from '../observability/logger.js';
 import { ConsoleServer } from './server.js';
+import { projectPurgerOf } from '../core/project-purge.js';
+import { worktreeBaseOf } from '../main.js';
 
 export async function main(): Promise<void> {
   loadEnv();
@@ -26,7 +28,11 @@ export async function main(): Promise<void> {
   ledger.init();
 
   const port = boot.consolePort;
-  const server = new ConsoleServer({ store, ledger, log, port });
+  const server = new ConsoleServer({
+    store, ledger, log, port,
+    // 停用＝清乾淨。跟 daemon 內建的控制台用同一個，從哪一邊按結果都一樣。
+    purgeProject: projectPurgerOf({ store, ledger, worktreeBase: worktreeBaseOf(boot.dataRoot), log }),
+  });
   const { url } = await server.start();
   console.log(`\n  控制台：${url}\n`);
 

@@ -48,6 +48,7 @@ import type { Logger } from './observability/logger.js';
 import type { McpTaskClient, VerifierLike } from './contracts.js';
 import type { TaskBrief } from './types.js';
 import type { VerifierConfig, VerifierDeps } from './worker/verifier.js';
+import { projectPurgerOf } from './core/project-purge.js';
 
 /**
  * 執行期產出的目錄，**全部掛在該 profile 的 dataRoot 底下**。
@@ -1614,6 +1615,9 @@ export async function main(): Promise<void> {
   const consoleServer = new ConsoleServer({
     store, ledger, log, router, inProcess: true,
     port: boot.consolePort,
+    // 停用專案＝清乾淨。留著的話下次啟用是拿舊快照在跑，而且停用期間每一輪 tick
+    // 都會在規劃那一步擲錯，連帶讓整個 tick 的後半段全部跳過。
+    purgeProject: projectPurgerOf({ store, ledger, worktreeBase: worktreeBaseOf(boot.dataRoot), log }),
   });
   try {
     await consoleServer.start();

@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import { ConsoleServer } from '../src/console/server.js';
+import type { ConsoleDeps } from '../src/console/server.js';
+import { projectPurgerOf } from '../src/core/project-purge.js';
 import { ConfigStore } from '../src/config/store.js';
 import { Ledger } from '../src/store/ledger.js';
 import { InboundRouter } from '../src/notify/notifier.js';
-import { createTmpDir, createSilentLogger, createRecordingLogger } from './helpers/index.js';
+import { createTmpDir, createSilentLogger, createRecordingLogger, makeDiscoveredTask } from './helpers/index.js';
 
 interface Harness {
   base: string;
@@ -17,7 +19,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function start(opts: { router?: InboundRouter } = {}): Promise<Harness> {
+async function start(opts: { router?: InboundRouter; purgeProject?: ConsoleDeps['purgeProject'] } = {}): Promise<Harness> {
   const dir = createTmpDir('botone-console-');
   const dbPath = join(dir.path, 'daemon.db');
   const store = new ConfigStore(dbPath);
@@ -25,6 +27,10 @@ async function start(opts: { router?: InboundRouter } = {}): Promise<Harness> {
   ledger.init();
   const server = new ConsoleServer({
     store, ledger, log: createSilentLogger(), port: 0, // 0 = 讓 OS 挑埠，測試才能平行跑
+    // 預設接真的：控制台測試要走到實際那條路，不是走一個什麼都不做的替身
+    purgeProject:
+      opts.purgeProject
+      ?? projectPurgerOf({ store, ledger, worktreeBase: join(dir.path, 'wt'), log: createSilentLogger() }),
     ...(opts.router ? { router: opts.router } : {}),
   });
   await server.start();
@@ -115,6 +121,54 @@ describe('控制台 API', () => {
 
     assert.equal((await send(h, 'DELETE', '/api/projects/p1')).status, 200);
     assert.deepEqual((await get(h, '/api/projects')).body.projects, []);
+  });
+
+  /**
+   * 停用＝清乾淨。實跑撞到的災情：停用只改了旗標，ledger 裡 18 張 discovered 還在，
+   * 於是每一輪 tick 都想規劃它們、每一輪都因為查不到專案擲錯，
+   * 連帶讓後面的輪詢、審查監看、合併佇列全部跳過——一個停用的專案讓整個 daemon 空轉。
+   */
+  it('停用專案 → 該專案的任務與群組一起清掉', async () => {
+    await send(h, 'PUT', '/api/projects', project());
+    await send(h, 'POST', '/api/projects/p1/enabled', { enabled: true });
+    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1', repo: 'acme/web' }));
+    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-2', repo: 'acme/web' }));
+    h.ledger.createGroup({ repo: 'acme/web', branch: 'auto/g-1', taskIds: ['T-1'], footprint: [] });
+
+    const res = await send(h, 'POST', '/api/projects/p1/enabled', { enabled: false });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(h.ledger.listTasksByState('discovered'), [], '停用後 daemon 不該再看到這些任務');
+    assert.deepEqual(h.ledger.listGroupsByState('ready'), []);
+    const purged = res.body.purged as { tasks: number; groups: number; claimed: unknown[] };
+    assert.equal(purged.tasks, 2, '要回報清了什麼，人才知道發生過什麼事');
+    assert.equal(purged.groups, 1);
+    assert.deepEqual(purged.claimed, [], '沒認領過的任務不該被列成待處理');
+  });
+
+  it('啟用專案不會清東西', async () => {
+    await send(h, 'PUT', '/api/projects', project());
+    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1', repo: 'acme/web' }));
+
+    const res = await send(h, 'POST', '/api/projects/p1/enabled', { enabled: true });
+
+    assert.equal(res.body.purged, undefined);
+    assert.equal(h.ledger.getTask('T-1')?.id, 'T-1');
+  });
+
+  /** 清理失敗不該讓停用失敗——旗標已經關了，那才是重點；卡在「還是啟用中」更糟。 */
+  it('清理擲錯時，專案仍然停用', async () => {
+    const broken = await start({ purgeProject: () => Promise.reject(new Error('磁碟壞了')) });
+    try {
+      await send(broken, 'PUT', '/api/projects', project());
+      await send(broken, 'POST', '/api/projects/p1/enabled', { enabled: true });
+      const res = await send(broken, 'POST', '/api/projects/p1/enabled', { enabled: false });
+      assert.equal(res.status, 200);
+      const rows = (await get(broken, '/api/projects')).body.projects as { enabled: boolean }[];
+      assert.equal(rows[0]?.enabled, false);
+    } finally {
+      await broken.close();
+    }
   });
 
   it('刪除不存在的專案 → 404（而不是假裝成功）', async () => {

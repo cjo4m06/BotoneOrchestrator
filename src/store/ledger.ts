@@ -489,6 +489,26 @@ export class Ledger {
     return this.getGroup(id)!;
   }
 
+  /**
+   * 刪掉一個任務與它的附屬紀錄（停用專案時用，見 core/project-purge.ts）。
+   *
+   * 為什麼要真的刪而不是標記：留著的話下次啟用是拿舊快照在跑——
+   * 任務板那邊可能已經改過描述、刪掉、或加了新的前置條件。
+   */
+  deleteTask(id: string): void {
+    this.db.prepare('DELETE FROM task_iterations WHERE task_id = ?').run(id);
+    this.db.prepare('DELETE FROM agent_sessions WHERE task_id = ?').run(id);
+    this.db.prepare('DELETE FROM clarifications WHERE task_id = ?').run(id);
+    this.db.prepare("DELETE FROM events WHERE scope = 'task' AND ref_id = ?").run(id);
+    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+  }
+
+  /** 刪掉一個群組與它的事件（停用專案時用）。 */
+  deleteGroup(id: string): void {
+    this.db.prepare("DELETE FROM events WHERE scope = 'group' AND ref_id = ?").run(id);
+    this.db.prepare('DELETE FROM groups WHERE id = ?').run(id);
+  }
+
   listGroupsByState(state: GroupState): Group[] {
     const rows = this.db.prepare('SELECT * FROM groups WHERE state = ? ORDER BY created_at').all(state) as Row[];
     return rows.map((r) => this.toGroup(r));
