@@ -22,7 +22,7 @@ import { DEFAULT_QUIET_MINUTES } from './core/quiet-period.js';
 import { evaluateBudget, type BudgetVerdict } from './core/budget.js';
 import { Planner } from './core/planner.js';
 import { Dispatcher } from './core/dispatcher.js';
-import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergeProject, type PrMergeLike } from './core/orchestrator.js';
+import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergeProject, type PrMergeLike, TICK_FAILED_EVENT } from './core/orchestrator.js';
 import { GroupRunner, prepareLocalFiles, prepareNodeModules, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
 import { Reconciler, createFsProbe, createGitProbe, type ReconcilerDeps, type ReconcilerMcp } from './core/reconciler.js';
 import { AgentRuntime, agentAuthEnv } from './worker/agent-runtime.js';
@@ -49,6 +49,7 @@ import type { McpTaskClient, VerifierLike } from './contracts.js';
 import type { TaskBrief } from './types.js';
 import type { VerifierConfig, VerifierDeps } from './worker/verifier.js';
 import { projectPurgerOf } from './core/project-purge.js';
+import { STALE_AFTER_MS } from './observability/activity.js';
 
 /**
  * 執行期產出的目錄，**全部掛在該 profile 的 dataRoot 底下**。
@@ -1391,7 +1392,13 @@ export function buildPipeline(input: PipelineInput): Pipeline {
  * 快照每次都重新查 ledger（不快取）：面板存在的意義就是「現在」，
  * 顯示一份幾分鐘前的舊資料比不顯示更糟——人會照著它做決定。
  */
-function attachAppHome(gateway: HumanGateway, ledger: Ledger, config: AppConfig, log: Logger): void {
+function attachAppHome(
+  gateway: HumanGateway,
+  ledger: Ledger,
+  config: AppConfig,
+  log: Logger,
+  quick?: NonNullable<ConstructorParameters<typeof AppHome>[0]['actions']>,
+): void {
   const { views, socket } = slackHandlesOf(gateway);
   if (!views || !socket) return; // console 降級或沒有 app token → 沒有 App Home 可言
 
@@ -1404,8 +1411,17 @@ function attachAppHome(gateway: HumanGateway, ledger: Ledger, config: AppConfig,
       groupsByState: st.groupsByState,
       cost: { today: ledger.costSummary(startOfToday(now)), total: ledger.costSummary() },
       costToday: ledger.costByRepo(startOfToday(now)),
-      projects: config.projects.map((p) => ({ repo: p.repo, label: p.id })),
+      projects: config.projects.map((p) => ({ repo: p.repo, label: p.id, id: p.id, enabled: true })),
       quietWaits: quietWaits(st),
+      // 「現在在做什麼」與「上一輪失敗了嗎」——控制台上有的，Slack 也要有。
+      // 兩邊給不一樣的東西，人就得兩邊都開才敢下判斷
+      activities: ledger.listActivities().map((a) => ({
+        kind: a.kind, title: a.title, startedAt: a.startedAt,
+        stale: now - a.heartbeatAt > STALE_AFTER_MS,
+        ...(a.repo ? { repo: a.repo } : {}),
+        ...(a.detail ? { detail: a.detail } : {}),
+      })),
+      ...(tickFailure(ledger, now) ? { lastFailure: tickFailure(ledger, now)! } : {}),
       now,
     };
   };
@@ -1420,7 +1436,15 @@ function attachAppHome(gateway: HumanGateway, ledger: Ledger, config: AppConfig,
       cost: () => formatCost(costInput(ledger, Date.now())),
       pending: () => formatPending(collectPending(ledger)),
     },
+    ...(quick ? { actions: quick } : {}),
   }).attach();
+}
+
+/** 最近一小時內的整輪失敗（超過就不再顯示——舊的紅字只會讓人麻痺）。 */
+function tickFailure(ledger: Ledger, now: number): { at: number; detail: string } | undefined {
+  const e = ledger.latestEvent('system', null, TICK_FAILED_EVENT);
+  if (!e || now - e.createdAt > 60 * 60_000) return undefined;
+  return { at: e.createdAt, detail: e.detail ?? '（沒有細節）' };
 }
 
 /**
@@ -1634,7 +1658,28 @@ export async function main(): Promise<void> {
 
   // App Home（常駐面板）與 /orch slash command：純唯讀，與 CLI 共用同一批 formatter。
   // Slack 未啟用、沒有 app token、或 Slack app 沒開 Home Tab，都只是不生效，不影響任何任務。
-  attachAppHome(gateway, ledger, config, log);
+  // App Home 的快捷操作。**與控制台走同一條路**：停用一樣會清乾淨、
+  // 重新派工一樣走 reviveGroup——兩個介面給不一樣的行為是最難查的那種問題。
+  attachAppHome(gateway, ledger, config, log, {
+    async setProjectEnabled(projectId, enabled) {
+      const proj = store.allProjects().find((p) => p.config.id === projectId);
+      if (!proj) return `找不到專案 ${projectId}`;
+      if (!store.setProjectEnabled(projectId, enabled)) return `專案 ${projectId} 狀態沒改到`;
+      if (enabled) return `已啟用 ${projectId}（下一輪起開始輪詢）`;
+
+      const purge = projectPurgerOf({ store, ledger, worktreeBase: worktreeBaseOf(boot.dataRoot), log });
+      const r = await purge(proj.config.repo);
+      const claimed = r.claimed.length
+        // 任務板那一側清不掉（MCP 沒有取消認領的工具），不講的話那幾張卡永遠沒人碰
+        ? `　注意：${r.claimed.map((c) => c.id).join('、')} 已在任務板上認領過，請去改回 todo`
+        : '';
+      return `已停用 ${projectId}，清除 ${r.tasks} 個任務、${r.groups} 個群組${claimed}`;
+    },
+    async retryGroup(groupId) {
+      const ok = await router.reviveGroup({ groupId });
+      return ok ? `已把 ${groupId} 送回待派工` : `${groupId} 現在的狀態不能重新派工`;
+    },
+  });
 
   // 崩潰對帳：必須在主控迴圈開始前跑完，否則上次殘留的 in_progress 任務永遠沒人撿。
   // 上次沒收乾淨（鎖檔帶 unclean 標記）時自動轉保守：那些 worktree 可能還有被 orphan 的

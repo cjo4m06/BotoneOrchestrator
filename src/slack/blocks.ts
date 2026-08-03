@@ -41,6 +41,8 @@ export interface ActionValue {
   taskId?: string;
   groupId?: string;
   optionId?: string;
+  /** 設定裡的專案 id（App Home 的停用／啟用鈕）。 */
+  projectId?: string;
 }
 
 export function encodeActionValue(v: ActionValue): string {
@@ -59,7 +61,7 @@ export function decodeActionValue(raw: string | undefined): ActionValue | undefi
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
   const o = parsed as Record<string, unknown>;
   const pick = (k: string): string | undefined => (typeof o[k] === 'string' ? (o[k] as string) : undefined);
-  return { taskId: pick('taskId'), groupId: pick('groupId'), optionId: pick('optionId') };
+  return { taskId: pick('taskId'), groupId: pick('groupId'), optionId: pick('optionId'), projectId: pick('projectId') };
 }
 
 // ── 任務卡（thread root） ──

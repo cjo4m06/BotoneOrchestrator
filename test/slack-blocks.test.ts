@@ -160,12 +160,12 @@ test('needsHuman：只有真的在等人的狀態才算', () => {
 
 test('encode/decodeActionValue：round-trip 與拒絕非法輸入', () => {
   const v = { taskId: 'T-1', optionId: 'opt-a' };
-  assert.deepEqual(decodeActionValue(encodeActionValue(v)), { taskId: 'T-1', optionId: 'opt-a', groupId: undefined });
+  assert.deepEqual(decodeActionValue(encodeActionValue(v)), { taskId: 'T-1', optionId: 'opt-a', groupId: undefined, projectId: undefined });
   assert.equal(decodeActionValue(undefined), undefined);
   assert.equal(decodeActionValue('不是 json'), undefined);
   assert.equal(decodeActionValue('[1,2]'), undefined);
   // 非字串欄位一律丟棄（不信任入站 payload）
-  assert.deepEqual(decodeActionValue('{"taskId":123}'), { taskId: undefined, optionId: undefined, groupId: undefined });
+  assert.deepEqual(decodeActionValue('{"taskId":123}'), { taskId: undefined, optionId: undefined, groupId: undefined, projectId: undefined });
 });
 
 // ── 生命週期事件 ──
@@ -228,7 +228,7 @@ test('clarificationBlocks：問題 + 理由 + 建議預設 + 每個選項一顆�
     btns.map((b) => b.action_id),
     [ACTION_IDS.clarifyOption, ACTION_IDS.clarifyOption, ACTION_IDS.clarifyFreeText],
   );
-  assert.deepEqual(decodeActionValue(btns[0]!.value), { taskId: 'T-9', optionId: 'restock', groupId: undefined });
+  assert.deepEqual(decodeActionValue(btns[0]!.value), { taskId: 'T-9', optionId: 'restock', groupId: undefined, projectId: undefined });
   assert.equal(btns[0]!.style, 'primary'); // 建議選項標記
   assert.match(btns[0]!.text.text, /（建議）/);
   assert.equal(btns[1]!.style, undefined);

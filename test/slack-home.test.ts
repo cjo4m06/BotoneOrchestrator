@@ -37,6 +37,16 @@ const item = (over: Partial<PendingItem> & { kind: PendingItem['kind']; id: stri
   title: `標題 ${over.id}`, repo: 'cjo4m06/Baolu', detail: '細節', actions: [], ...over,
 });
 
+/** 在任何 actions/accessory 裡找出指定 action_id 的按鈕。 */
+function buttonWith(blocks: unknown[], actionId: string): { value?: string; confirm?: unknown; style?: string } | undefined {
+  for (const b of blocks as { accessory?: Record<string, unknown>; elements?: Record<string, unknown>[] }[]) {
+    if (b.accessory?.action_id === actionId) return b.accessory as never;
+    const hit = b.elements?.find((e) => e.action_id === actionId);
+    if (hit) return hit as never;
+  }
+  return undefined;
+}
+
 const task = (id: string, state: TaskState): Task => ({
   id, payloadHash: 'h', repo: 'acme/web', category: 'dev', title: `任務 ${id}`, description: '',
   dependencies: [], docRefs: [], state, attempts: 0, createdAt: NOW, updatedAt: NOW,
@@ -53,7 +63,7 @@ describe('App Home 版面', () => {
     const pending = Array.from({ length: 60 }, (_, i) => item({ kind: 'clarification', id: `T-${i}` }));
     const blocks = homeViewBlocks(home({ pending }));
     assert.ok(blocks.length < 100, `block 數 ${blocks.length} 應遠低於 Slack 上限`);
-    assert.match(textOf(blocks), /另有 48 項/);
+    assert.match(textOf(blocks), /另有 52 項/);
   });
 
   it('沒有待辦時明講「沒有需要你決定的事」', () => {
@@ -82,12 +92,18 @@ describe('App Home 版面', () => {
   });
 
   it('needs_human 提供重試鈕，且帶得回任務 id', () => {
-    const blocks = homeViewBlocks(home({ pending: [item({ kind: 'needs_human', id: 'T-7' })] })) as {
-      accessory?: { action_id?: string; value?: string };
-    }[];
-    const btn = blocks.find((b) => b.accessory?.action_id === 'task_retry')?.accessory;
+    const btn = buttonWith(homeViewBlocks(home({ pending: [item({ kind: 'needs_human', id: 'T-7' })] })), 'task_retry');
     assert.ok(btn, '應有重試鈕');
     assert.equal(decodeActionValue(btn.value)?.taskId, 'T-7');
+  });
+
+  it('卡住的群組給重新派工鈕，帶得回群組 id', () => {
+    const btn = buttonWith(
+      homeViewBlocks(home({ pending: [item({ kind: 'stuck_group', id: 'g_abc' })] })),
+      HOME_ACTION_IDS.groupRetry,
+    );
+    assert.ok(btn, '應有重新派工鈕');
+    assert.equal(decodeActionValue(btn.value)?.groupId, 'g_abc');
   });
 
   it('進度區顯示各狀態數量與執行中的任務', () => {
@@ -95,8 +111,8 @@ describe('App Home 版面', () => {
     tasksByState.in_progress = [task('T-1', 'in_progress')];
     tasksByState.done = [task('T-2', 'done'), task('T-3', 'done')];
     const s = textOf(homeViewBlocks(home({ tasksByState })));
-    assert.match(s, /執行中 \*1\*/);
-    assert.match(s, /完成 \*2\*/);
+    assert.match(s, /執行中　\*1\*/);
+    assert.match(s, /完成 2/);
     assert.match(s, /T-1/);
   });
 
@@ -127,9 +143,9 @@ describe('App Home 版面', () => {
       ],
     })));
 
-    assert.match(s, /專案　2/);
-    assert.match(s, /📁 \*web\*/);
-    assert.match(s, /📁 \*api\*/);
+    assert.match(s, /\*專案\*　2/);
+    assert.match(s, /\*web\*/);
+    assert.match(s, /\*api\*/);
     assert.match(s, /\$1\.50/);
     assert.match(s, /\$4\.00/);
     // 受阻只在有的時候才顯示，而且只掛在 api 那一段
@@ -140,8 +156,8 @@ describe('App Home 版面', () => {
 
   it('完全沒有任務的專案也要列出來（否則分不清「很閒」和「沒載入」）', () => {
     const s = textOf(homeViewBlocks(home({ projects: [{ repo: 'acme/idle' }] })));
-    assert.match(s, /📁 \*idle\*/);
-    assert.match(s, /執行中 \*0\*/);
+    assert.match(s, /\*idle\*/);
+    assert.match(s, /執行中　\*0\*/);
   });
 
   it('設定裡沒有、但 ledger 有任務的 repo 也要顯示（不讓任務變孤兒）', () => {
@@ -149,7 +165,7 @@ describe('App Home 版面', () => {
     tasksByState.blocked = [task('T-9', 'blocked')];
     tasksByState.blocked[0]!.repo = 'old/removed';
     const s = textOf(homeViewBlocks(home({ projects: [], tasksByState })));
-    assert.match(s, /📁 \*removed\*/);
+    assert.match(s, /\*removed\*/);
   });
 
   it('一個專案都沒有 → 明講是設定或連線有問題', () => {
@@ -158,10 +174,14 @@ describe('App Home 版面', () => {
   });
 
   it('待辦每一列都標出所屬專案', () => {
-    const s = textOf(homeViewBlocks(home({
+    // 多專案時不標出來，人根本不知道這件事是哪個專案的。
+    // 斷言結構而不是字串：所屬專案要跟那一列綁在一起，不能只是「頁面某處有出現 api」
+    const blocks = homeViewBlocks(home({
       pending: [item({ kind: 'clarification', id: 'T-5', repo: 'acme/api' })],
-    })));
-    assert.match(s, /_api_/);
+    })) as { type: string; text?: { text?: string }; elements?: { text?: string }[] }[];
+    const i = blocks.findIndex((b) => b.text?.text?.includes('T-5'));
+    assert.ok(i >= 0, '應該有 T-5 那一列');
+    assert.match(blocks[i + 1]?.elements?.[0]?.text ?? '', /api/, '緊接著的說明列要標出所屬專案');
   });
 
   it('成本區顯示今天與累計', () => {
@@ -182,6 +202,123 @@ describe('App Home 版面', () => {
       pending: [item({ kind: 'clarification', id: 'T-1', title: '修 <script> & 標籤' })],
     })));
     assert.match(s, /&lt;script&gt; &amp; 標籤/);
+  });
+
+  /**
+   * 使用者明確要求：不要表情符號。
+   *
+   * 用正則掃整份輸出而不是逐段檢查——這樣以後任何人在任何一段加了 emoji 都會被擋下來，
+   * 不必記得回來補測試。
+   */
+  /**
+   * 合併是這整條鏈上唯一真正不可逆的動作。放上來的前提就是二次確認——
+   * 沒有它的話，隨手滑過去誤觸的代價是一個 PR 直接進 base。
+   */
+  it('核准合併鈕一定附二次確認', () => {
+    const blocks = homeViewBlocks(home({ pending: [item({ kind: 'merge_approval', id: 'g_1' })] }));
+    const ok = buttonWith(blocks, 'merge_approve');
+    assert.ok(ok, '應有核准鈕');
+    assert.ok(ok.confirm, '核准合併沒有二次確認就不該放在這一頁');
+    assert.equal(decodeActionValue(ok.value)?.groupId, 'g_1');
+    // 退回是可逆的，不必攔
+    const no = buttonWith(blocks, 'merge_reject');
+    assert.ok(no, '應有退回鈕');
+    assert.equal(no.confirm, undefined);
+  });
+
+  /** 這一頁沒有輸入框。放個按不了的鈕比沒有更糟——人會一直找它在哪。 */
+  it('要打字才能處理的事，明講去哪裡處理', () => {
+    for (const kind of ['clarification', 'no_change'] as const) {
+      const s = textOf(homeViewBlocks(home({ pending: [item({ kind, id: 'T-1', category: 'already_satisfied' })] })));
+      assert.match(s, /npm run ask|任務卡/, `${kind} 要指出處理位置`);
+    }
+  });
+
+  it('整頁沒有任何 emoji', () => {
+    const blocks = homeViewBlocks(home({
+      pending: [
+        item({ kind: 'clarification', id: 'T-1' }),
+        item({ kind: 'needs_human', id: 'T-2' }),
+        item({ kind: 'stuck_group', id: 'g_1' }),
+        item({ kind: 'merge_approval', id: 'g_2' }),
+        item({ kind: 'no_change', id: 'T-3', category: 'already_satisfied' }),
+      ],
+      activities: [{ kind: 'plan', title: '規劃 14 個任務', repo: 'acme/web', detail: '第 2/2 次嘗試', startedAt: NOW - 372_000, stale: false }],
+      lastFailure: { at: NOW - 60_000, detail: '規劃 agent 無法產出可用的計畫' },
+      quietWaits: [{ repo: 'cjo4m06/Baolu', count: 3, waitMs: 60_000 }],
+    }));
+    const s = textOf(blocks);
+    const emoji = s.match(/\p{Extended_Pictographic}/gu);
+    assert.equal(emoji, null, `不該有 emoji，但找到：${emoji?.join('') ?? ''}`);
+    // Slack 的 emoji 短碼（:white_check_mark: 之類）也算
+    assert.doesNotMatch(s, /:[a-z0-9_+-]+:/, '也不該用 Slack emoji 短碼');
+  });
+
+  // ── 現在在做什麼：這一頁存在的主要理由 ──
+
+  it('顯示進行中的工作、用人看得懂的詞、附經過時間', () => {
+    const s = textOf(homeViewBlocks(home({
+      activities: [
+        { kind: 'plan', title: '規劃 14 個任務要怎麼分群', repo: 'acme/web', detail: '第 2/2 次嘗試', startedAt: NOW - 372_000, stale: false },
+        { kind: 'code', title: 'T-101 修好手機版選單', repo: 'acme/web', detail: '第 3 輪：跑驗收關卡', startedAt: NOW - 90_000, stale: false },
+      ],
+    })));
+    assert.match(s, /現在在做什麼\*　2/);
+    assert.match(s, /分群規劃/, 'kind 要翻成人看得懂的詞，不是 plan');
+    assert.match(s, /已 6 分 12 秒/, '要看得到跑多久了');
+    assert.match(s, /第 2\/2 次嘗試/, '重問也要看得到——一次嘗試就是好幾分鐘');
+  });
+
+  it('沒有工作在跑時明講「閒著」，而不是留白', () => {
+    // 留白的話，跟「這一區壞了」分不出來
+    assert.match(textOf(homeViewBlocks(home({ activities: [] }))), /閒著/);
+  });
+
+  it('心跳失聯的要標出來——那與「跑很久」是兩件事', () => {
+    const s = textOf(homeViewBlocks(home({
+      activities: [{ kind: 'code', title: 'T-9', startedAt: NOW - 3_600_000, stale: true }],
+    })));
+    assert.match(s, /沒有心跳/);
+  });
+
+  it('整輪失敗要擺在最上面並寫出原因', () => {
+    const blocks = homeViewBlocks(home({
+      lastFailure: { at: NOW - 60_000, detail: 'afterExisting 指到不存在的群組：B、G、I、N' },
+    })) as { text?: { text?: string } }[];
+    const i = blocks.findIndex((b) => b.text?.text?.includes('上一輪執行失敗'));
+    assert.ok(i >= 0 && i < 4, `失敗要在最前面（實際在第 ${i} 個 block）`);
+    assert.match(textOf(blocks), /afterExisting 指到不存在的群組/, '要寫真正的原因，不是「發生錯誤」');
+  });
+
+  // ── 快捷操作 ──
+
+  it('啟用中的專案給停用鈕，且一定附二次確認', () => {
+    const btn = buttonWith(
+      homeViewBlocks(home({ projects: [{ repo: 'acme/web', id: 'p1', enabled: true }] })),
+      HOME_ACTION_IDS.projectDisable,
+    );
+    assert.ok(btn, '應有停用鈕');
+    assert.equal(decodeActionValue(btn.value)?.projectId, 'p1');
+    // 停用會清掉本機任務／群組／worktree／分支，在隨手滑過的頁面上誤觸代價太高
+    assert.ok(btn.confirm, '停用一定要有二次確認');
+    assert.equal(btn.style, 'danger');
+  });
+
+  it('已停用的專案給啟用鈕，不必確認（可逆）', () => {
+    const blocks = homeViewBlocks(home({ projects: [{ repo: 'acme/web', id: 'p1', enabled: false }] }));
+    const btn = buttonWith(blocks, HOME_ACTION_IDS.projectEnable);
+    assert.ok(btn, '應有啟用鈕');
+    assert.equal(btn.confirm, undefined, '啟用只是打開旗標，不必攔一次');
+    assert.match(textOf(blocks), /已停用/, '要標出它現在是停用狀態');
+  });
+
+  it('設定裡沒有的孤兒 repo 不給切換鈕（沒有東西可以切）', () => {
+    const tasksByState = emptyTasks();
+    tasksByState.blocked = [task('T-9', 'blocked')];
+    tasksByState.blocked[0]!.repo = 'old/removed';
+    const blocks = homeViewBlocks(home({ projects: [], tasksByState }));
+    assert.equal(buttonWith(blocks, HOME_ACTION_IDS.projectDisable), undefined);
+    assert.equal(buttonWith(blocks, HOME_ACTION_IDS.projectEnable), undefined);
   });
 
   it('有重新整理鈕', () => {
