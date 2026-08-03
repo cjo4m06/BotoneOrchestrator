@@ -36,6 +36,38 @@ describe('WorktreeManager', () => {
 
   const wtPath = (branch: string): string => join(base.path, branch.replace(/[^a-zA-Z0-9._-]/g, '-'));
 
+  /**
+   * **同一個 repo 的 worktree add 必須序列化。**
+   *
+   * git 在 `.git/worktrees/<name>/` 下分好幾個檔案寫管理資料，而每次 add 都會掃描
+   * 整個目錄。兩個同時跑的話後者會讀到前者寫到一半的狀態：
+   *
+   *   fatal: failed to read .git/worktrees/orch-Dinosaur-g_xxx/commondir: Undefined error: 0
+   *
+   * 而例外會被收斂成群組 failed（終態）——**一次併發競態＝一整群永久死掉**（實跑撞到）。
+   * 這個測試用真 git 併發跑，走的正是那條路。
+   */
+  it('同一個 repo 併發建 worktree 不會互相踩壞', async () => {
+    const branches = ['feat/c1', 'feat/c2', 'feat/c3', 'feat/c4', 'feat/c5'];
+
+    const results = await Promise.allSettled(
+      branches.map((b) => wm.create(repo.path, b, { base: 'main' })),
+    );
+
+    const failed = results.filter((r) => r.status === 'rejected');
+    assert.deepEqual(
+      failed.map((r) => (r as PromiseRejectedResult).reason?.message?.slice(0, 90)),
+      [],
+      '併發建立不該有任何一個失敗',
+    );
+    for (const b of branches) {
+      assert.ok(existsSync(wtPath(b)), `${b} 的 worktree 應該存在`);
+    }
+    // git 自己也要認得這些 worktree（管理目錄沒被寫壞）
+    const listed = execaSync('git', ['-C', repo.path, 'worktree', 'list']).stdout;
+    for (const b of branches) assert.match(listed, new RegExp(b.replace('/', '\\/')), `git 應該列得出 ${b}`);
+  });
+
   it('建立新分支的 worktree：目錄存在且停在該分支', async () => {
     const info = await wm.create(repo.path, 'feat/g1', { base: 'main' });
 

@@ -2,6 +2,7 @@ import { execa } from 'execa';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Logger } from '../observability/logger.js';
+import { withRepoLock } from '../core/repo-lock.js';
 
 export interface WorktreeInfo {
   path: string;
@@ -80,12 +81,27 @@ export class WorktreeManager {
     const reused = await this.reuseExisting(repoPath, worktreePath, branch);
     if (reused) return reused;
 
-    if (await this.branchExists(repoPath, branch)) {
-      await this.git(repoPath, ['worktree', 'add', worktreePath, branch]);
-    } else {
-      const base = opts.base ?? 'HEAD';
-      await this.git(repoPath, ['worktree', 'add', '-b', branch, worktreePath, base]);
-    }
+    // **同一個 repo 的 worktree add 必須序列化。**
+    //
+    // git 在 `.git/worktrees/<name>/` 下分好幾個檔案寫管理資料（commondir、gitdir…），
+    // 而每次 `worktree add` 都會掃描整個 `.git/worktrees/`。兩個同時跑的話，
+    // 後者會讀到前者還沒寫完的目錄，然後：
+    //
+    //   fatal: failed to read .git/worktrees/orch-Dinosaur-g_xxx/commondir: Undefined error: 0
+    //
+    // 那個「Undefined error: 0」就是讀到寫到一半的狀態。例外會被收斂成群組 failed（終態），
+    // 也就是說**一次併發競態＝一整群永久死掉**（實跑撞到，20:41）。
+    //
+    // 鍵用 repoPath：不同專案照樣並行，只有同一個 repo 的群互相排隊。
+    // 建 worktree 只有幾百毫秒，序列化的代價可以忽略。
+    await withRepoLock(repoPath, async () => {
+      if (await this.branchExists(repoPath, branch)) {
+        await this.git(repoPath, ['worktree', 'add', worktreePath, branch]);
+      } else {
+        const base = opts.base ?? 'HEAD';
+        await this.git(repoPath, ['worktree', 'add', '-b', branch, worktreePath, base]);
+      }
+    });
 
     await this.excludeToolJunk(worktreePath);
     this.log.info({ repoPath, branch, worktreePath }, '建立 worktree');
