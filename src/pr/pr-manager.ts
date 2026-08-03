@@ -2,6 +2,7 @@ import { execa } from 'execa';
 import { z } from 'zod';
 import type { PullRequest } from '../types.js';
 import type { Logger } from '../observability/logger.js';
+import { withFetchLock } from '../git/fetch-lock.js';
 
 /** 外部指令的執行結果（已正規化：連「指令不存在」都回結果而不丟例外）。 */
 export interface CommandResult {
@@ -268,7 +269,7 @@ export class PrManager {
       // 安全性靠 `--force-with-lease`：只有在遠端還停在**我上次 fetch 到的那顆 commit**
       // 時才覆寫；中間只要有人推了東西就中止。這跟裸 `--force` 是兩回事——
       // 裸 force 會無條件蓋掉，那個我們永遠不用。
-      await this.git(repoPath, ['fetch', 'origin', branch]);
+      await withFetchLock(repoPath, () => this.git(repoPath, ['fetch', 'origin', branch]));
       const lease = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${branch}`])).stdout.trim();
       if (!lease) {
         throw new Error(`分支 ${branch} 與遠端分歧，但取不到遠端狀態，無法安全更新 PR #${openPr.number}：${openPr.url}`);
@@ -295,7 +296,7 @@ export class PrManager {
     //   (b) 這個分支上有 **已合併** 的 PR——GitHub 說進去了就是進去了（squash 合併走這條）
     // 少了 (b) 這條路實際上是死的：預設合併方式是 squash，它會把整條分支壓成一顆新
     // commit，原本的 commits 一顆都不是 base 的祖先，(a) 永遠不成立。
-    await this.git(repoPath, ['fetch', 'origin', branch, base]);
+    await withFetchLock(repoPath, () => this.git(repoPath, ['fetch', 'origin', branch, base]));
     const remoteTip = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${branch}`])).stdout.trim();
     const baseTip = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${base}`])).stdout.trim();
     const ancestor =

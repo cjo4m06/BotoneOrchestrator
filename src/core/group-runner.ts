@@ -23,6 +23,7 @@ import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { GateReport, Group, GroupState, MergeVerdict, PullRequest, Task, TaskDetail, TaskState } from '../types.js';
 import { withActivity } from '../observability/activity.js';
+import { withFetchLock } from '../git/fetch-lock.js';
 
 /** 一個專案在執行期需要的東西（由 registry 解析）。 */
 /** 與 MergeGuard 相同的 git 執行方式（reject:false，讓呼叫端自己判 exitCode）。 */
@@ -995,7 +996,8 @@ export class GroupRunner {
   ): Promise<{ verified: string; current: string } | undefined> {
     if (!verifiedSha) return undefined;
     const ref = `${proj.remote ?? 'origin'}/${proj.baseBranch}`;
-    const fetched = await this.git(proj.repoPath, ['fetch', '--quiet', proj.remote ?? 'origin', proj.baseBranch]);
+    const fetched = await withFetchLock(proj.repoPath, () =>
+      this.git(proj.repoPath, ['fetch', '--quiet', proj.remote ?? 'origin', proj.baseBranch]));
     if (fetched.exitCode !== 0) return undefined; // 取不到最新狀態就不亂擋（守衛自己已標但書）
     const now = (await this.git(proj.repoPath, ['rev-parse', ref])).stdout.trim();
     if (!now || now === verifiedSha) return undefined;

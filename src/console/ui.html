@@ -549,7 +549,12 @@ async function loadState() {
     + (s.canDecide ? '' : '　·　唯讀（daemon 未在同一行程）');
 
   $('cards').innerHTML = [
-    card('play', '執行中', t.in_progress + t.verifying, `排隊 ${t.queued + t.discovered}`),
+    // **數的是「正在做事的東西」，不是「in_progress 的任務」。**
+    // maxConcurrentWorkers 控制的是**群組**併發，而一個群組可能正在開 PR、
+    // 跑合併把關、建 worktree——那些期間沒有任何任務是 in_progress。
+    // 只數任務的話，使用者設了 3 卻看到 1，以為系統沒吃到設定（實跑撞到）。
+    card('play', '執行中', (s.activities ?? []).filter((a) => !a.stale).length || t.in_progress + t.verifying,
+      `任務 ${t.in_progress + t.verifying}　排隊 ${t.queued + t.discovered}`),
     card('block', '受阻', t.blocked, t.blocked > 0 ? '需要你處理' : '無'),
     card('coin', '今日花費', money(s.cost.today.costUsd), `${s.cost.today.rounds} 輪`),
     card('coin', '累計花費', money(s.cost.total.costUsd), `${s.cost.total.sessions} 個 session`),

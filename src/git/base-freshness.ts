@@ -1,4 +1,5 @@
 import type { Logger } from '../observability/logger.js';
+import { withFetchLock } from './fetch-lock.js';
 
 /**
  * base 新鮮度：這次要對著「remote 上真實的 base」還是「可能過期的本地 base」工作。
@@ -65,9 +66,14 @@ export async function resolveBaseFreshness(
   const names = remotes.stdout.split('\n').map((s) => s.trim());
   if (remotes.exitCode !== 0 || !names.includes(remote)) return stale(`找不到 remote「${remote}」`);
 
-  const fetched = await git(repoPath, ['fetch', '--quiet', remote, base], {
-    timeoutMs: opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
-  });
+  // 同一個 repo 的 fetch 要序列化：兩個同時跑會撞 refs/remotes/<remote>/<base> 的
+  // compare-and-swap（`cannot lock ref … is at X but expected Y`，實跑撞到）。
+  // 這裡失敗的後果是「守衛驗的是過期的 base」——它照樣放行只掛但書，
+  // 所以競態不會停下流程，它會讓一次合併把關悄悄降級。
+  const fetched = await withFetchLock(repoPath, () =>
+    git(repoPath, ['fetch', '--quiet', remote, base], {
+      timeoutMs: opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
+    }));
   if (fetched.exitCode !== 0) return stale(`git fetch 失敗：${tail(`${fetched.stderr}\n${fetched.stdout}`, 3).trim()}`);
 
   // 標準 clone 會同時更新 refs/remotes/<remote>/<base>；refspec 沒設定時只有 FETCH_HEAD。

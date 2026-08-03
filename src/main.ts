@@ -38,6 +38,7 @@ import { MergeRiskJudge } from './core/merge-risk-judge.js';
 import { DriftJudge } from './pr/drift-judge.js';
 import { UiJudge } from './worker/ui-judge.js';
 import { hasClaudeAuth } from './worker/reviewer.js';
+import { withFetchLock } from './git/fetch-lock.js';
 import { InboundRouter, type CompleteTaskFn } from './notify/notifier.js';
 import { createNotifier, slackHandlesOf, type HumanGateway } from './slack/gateway.js';
 import { AppHome } from './slack/app-home.js';
@@ -757,7 +758,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {
-      const f = await git(repoPath, ['fetch', '--quiet', remote, baseBranch]);
+      const f = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', remote, baseBranch]));
       if (f.exitCode !== 0) return undefined; // 取不到最新狀態就不亂擋
       const r = await git(repoPath, ['rev-parse', `${remote}/${baseBranch}`]);
       const sha = r.stdout.trim();
@@ -767,7 +768,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       // 沒有 remote 的本地 repo 不算錯誤（Merge Guard 會自己標「但書」）
       const remotes = await git(repoPath, ['remote']);
       if (remotes.exitCode !== 0 || !remotes.stdout.split('\n').map((s) => s.trim()).includes('origin')) return;
-      const r = await git(repoPath, ['fetch', '--quiet', 'origin', baseBranch]);
+      const r = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', 'origin', baseBranch]));
       if (r.exitCode !== 0) throw new Error(`git fetch origin ${baseBranch} 失敗：${(r.stderr || r.stdout).trim()}`);
     },
     // 合併工作區用完要放掉群組分支（見 releaseMergeWorktreeBranch）
