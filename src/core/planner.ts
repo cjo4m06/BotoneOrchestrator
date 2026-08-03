@@ -23,6 +23,7 @@ export interface PlanAgentLike {
     inFlight: InFlightGroup[],
     /** 回報進度給控制台（第幾次嘗試）。可不理會。 */
     onProgress?: (detail: string) => void,
+    signal?: AbortSignal,
   ): Promise<{
     groups: { id: string; taskIds: string[]; files: string[]; why: string; afterExisting?: string[] }[];
     stages: string[][];
@@ -82,7 +83,7 @@ export class Planner {
     this.log = deps.log ?? NOOP_LOG;
   }
 
-  async plan(pending: Task[]): Promise<PlanResult> {
+  async plan(pending: Task[], signal?: AbortSignal): Promise<PlanResult> {
     const groups: PlannedGroup[] = [];
 
     // 只在同 repo 內分群
@@ -94,7 +95,7 @@ export class Planner {
     }
 
     if (this.deps.planAgent) {
-      for (const [repo, tasks] of byRepo) groups.push(...(await this.planWithAgent(repo, tasks)));
+      for (const [repo, tasks] of byRepo) groups.push(...(await this.planWithAgent(repo, tasks, signal)));
       return { groups, schedule: scheduleFromStages(groups) };
     }
 
@@ -177,7 +178,7 @@ export class Planner {
    * 失敗一律往上擲：這是刻意的。規劃 agent 呼叫不通，代表後面寫程式的 agent 也不通，
    * 此時退回啟發式分群只是把問題往後推——而且推成一個更難查的形態（並行撞車）。
    */
-  private async planWithAgent(repo: string, tasks: Task[]): Promise<PlannedGroup[]> {
+  private async planWithAgent(repo: string, tasks: Task[], signal?: AbortSignal): Promise<PlannedGroup[]> {
     const repoPath = this.deps.resolveRepoPath?.(repo);
     if (!repoPath) {
       throw new Error(`規劃 ${repo} 需要本地 checkout 路徑（規劃 agent 要實際看 repo 才判斷得出誰會撞誰）`);
@@ -199,9 +200,9 @@ export class Planner {
             title: `規劃 ${tasks.length} 個任務要怎麼分群`,
             detail: '讀 repo 判斷誰會動到同一批檔案',
           },
-          (update) => this.deps.planAgent!.plan(tasks, repoPath, inFlight, update),
+          (update) => this.deps.planAgent!.plan(tasks, repoPath, inFlight, update, signal),
         )
-      : await this.deps.planAgent!.plan(tasks, repoPath, inFlight);
+      : await this.deps.planAgent!.plan(tasks, repoPath, inFlight, undefined, signal);
 
     // 群代號 → 階段序號。parsePlanResponse 已保證每個群剛好出現在一個階段。
     const stageOf = new Map<string, number>();

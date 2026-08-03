@@ -620,8 +620,11 @@ export class Orchestrator {
   private async runPlan(repo: string, tasks: Task[], signal?: AbortSignal): Promise<void> {
     const { ledger, planner, log } = this.deps;
     try {
-      const full = await planner.plan(tasks);
-      if (signal?.aborted) return void log.info({ repo }, '規劃完成時已收到中止訊號，不建群');
+      const full = await planner.plan(tasks, signal);
+      // **中止時照樣建群。** 規劃已經花掉十幾分鐘與相應的錢，把成果丟掉等於
+      // 下次啟動要從頭再燒一次。建群只是寫 ledger（ready ＋ queued），
+      // 不會啟動任何東西——派工是 tick 的第 4 步，而 daemon 已經在停了。
+      if (signal?.aborted) log.info({ repo }, '收到中止訊號，但規劃已完成 → 照樣建群，成果留給下次啟動');
 
       // 只收這個 repo 的群。規劃現在是 per-repo 發動的（一個 repo 跑十幾分鐘不該擋住
       // 另一個），所以回傳裡出現別的 repo 就是不對——照收會重複建群。
@@ -644,10 +647,24 @@ export class Orchestrator {
       for (const [stage, inStage] of groupByStage(plan.groups)) {
         const created: string[] = [];
         for (const pg of inStage) {
+          // 規劃跑了十幾分鐘，這段時間任務可能已經不在了——最常見的是
+          // 使用者在控制台停用了專案（那會清掉該專案的任務與群組）。
+          // 不確認的話會建出一個指向不存在任務的群，而它永遠跑不完。
+          const alive = pg.taskIds.filter((id) => ledger.getTask(id) !== undefined);
+          if (alive.length === 0) {
+            log.info({ repo, tasks: pg.taskIds }, '規劃期間這些任務已被清除（多半是專案被停用），略過建群');
+            continue;
+          }
+          if (alive.length !== pg.taskIds.length) {
+            log.warn(
+              { repo, missing: pg.taskIds.filter((id) => !alive.includes(id)) },
+              '規劃期間部分任務被清除，只用還在的那些建群',
+            );
+          }
           const g = ledger.createGroup({
             repo: pg.repo,
             branch: '',
-            taskIds: pg.taskIds,
+            taskIds: alive,
             footprint: pg.footprint,
             // 規劃 agent 讀完整個 repo 才得出的判斷，存下來給下游 agent 當起手線索
             rationale: pg.rationale,
@@ -655,10 +672,10 @@ export class Orchestrator {
             afterGroups: [...new Set([...previousStage, ...(pg.afterExisting ?? [])])],
           });
           if (!g.branch) ledger.upsertGroup({ ...g, branch: branchFor(pg.repo, g.id) }); // 補分支名（需 id）
-          for (const tid of pg.taskIds) ledger.updateTaskState(tid, 'queued', { groupId: g.id });
+          for (const tid of alive) ledger.updateTaskState(tid, 'queued', { groupId: g.id });
           created.push(g.id);
           log.info(
-            { group: g.id, stage, tasks: pg.taskIds.length, files: pg.footprint.slice(0, 8), rationale: pg.rationale },
+            { group: g.id, stage, tasks: alive.length, files: pg.footprint.slice(0, 8), rationale: pg.rationale },
             '建群',
           );
         }

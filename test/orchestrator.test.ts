@@ -302,6 +302,84 @@ describe('Orchestrator — 主控迴圈', () => {
   });
 
   /**
+   * 規劃已經燒了十幾分鐘與相應的錢。中止時把成果丟掉，等於下次啟動要從頭再燒一次。
+   * 建群只是寫 ledger（ready ＋ queued），不會啟動任何東西。
+   */
+  it('中止時已完成的規劃照樣建群，成果留給下次啟動', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }]]);
+    // 中止必須發生在**規劃回來之前**，否則測不到那個分支
+    let release: (() => void) | undefined;
+    const planner = {
+      plan: () => new Promise<PlanResult>((r) => {
+        release = () => r({
+          groups: [{ repo: 'acme/web', taskIds: ['T-1'], footprint: ['a.ts'], rationale: 'r', stageIndex: 0 }],
+          schedule: [],
+        });
+      }),
+    } as unknown as Planner;
+    const { orch } = build(poller, { planner });
+
+    const ac = new AbortController();
+    await orch.tick(ac.signal);
+    ac.abort();          // daemon 收到 SIGTERM
+    release?.();         // 規劃這時候才回來
+    await orch.settlePlanning();
+
+    assert.equal(tmp.ledger.listGroupsByState('ready').length, 1, '花掉的錢不該白花');
+    assert.equal(tmp.ledger.getTask('T-1')?.state, 'queued');
+  });
+
+  /**
+   * 規劃跑十幾分鐘，這段時間任務可能已經不在了——最常見的是使用者在控制台停用專案
+   * （那會清掉該專案的任務與群組）。不確認的話會建出一個指向不存在任務的群，
+   * 而它永遠跑不完。
+   */
+  it('規劃期間任務被清掉 → 不建出指向幽靈任務的群', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }, { id: 'T-2' }]]);
+    let release: (() => void) | undefined;
+    const planner = {
+      plan: () => new Promise<PlanResult>((r) => {
+        release = () => r({
+          groups: [{ repo: 'acme/web', taskIds: ['T-1', 'T-2'], footprint: [], rationale: '', stageIndex: 0 }],
+          schedule: [],
+        });
+      }),
+    } as unknown as Planner;
+    const { orch } = build(poller, { planner });
+
+    await orch.tick();
+    // 規劃還在跑的時候，任務被清掉（模擬控制台停用專案）
+    tmp.ledger.deleteTask('T-1');
+    release?.();
+    await orch.settlePlanning();
+
+    const groups = tmp.ledger.listGroupsByState('ready');
+    assert.equal(groups.length, 1);
+    assert.deepEqual(groups[0]?.taskIds, ['T-2'], '只用還在的任務建群');
+  });
+
+  it('規劃期間任務全被清掉 → 完全不建群', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }]]);
+    let release: (() => void) | undefined;
+    const planner = {
+      plan: () => new Promise<PlanResult>((r) => {
+        release = () => r({
+          groups: [{ repo: 'acme/web', taskIds: ['T-1'], footprint: [], rationale: '', stageIndex: 0 }],
+          schedule: [],
+        });
+      }),
+    } as unknown as Planner;
+    const { orch } = build(poller, { planner });
+
+    await orch.tick();
+    tmp.ledger.deleteTask('T-1');
+    release?.();
+    await orch.settlePlanning();
+
+    assert.equal(tmp.ledger.listGroupsByState('ready').length, 0);
+  });
+
+  /**
    * 規劃改成背景跑之後，它的失敗**不再從 tick 冒出來**——這是刻意的。
    * 讓它冒出來的話，一次規劃失敗就會把同一輪的看審查、合併佇列全部跳過，
    * 而那些跟規劃一點關係都沒有。改成寫 tick_failed，控制台紅色橫幅與 Slack 照樣看得到。

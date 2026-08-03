@@ -120,6 +120,14 @@ const SYSTEM_PROMPT =
   '你可以用 Read/Glob/Grep 實際看 repo 來確認任務會落在哪些檔案，不要憑任務標題猜。' +
   '只輸出要求的 JSON。';
 
+/** 把 AbortSignal 接到 SDK 要的 AbortController 上（已中止的訊號要立即生效）。 */
+function abortControllerOf(signal: AbortSignal): AbortController {
+  const ac = new AbortController();
+  if (signal.aborted) ac.abort();
+  else signal.addEventListener('abort', () => ac.abort(), { once: true });
+  return ac;
+}
+
 export class PlanAgent {
   constructor(private deps: PlanAgentDeps) {}
 
@@ -131,6 +139,11 @@ export class PlanAgent {
     repoPath: string,
     inFlight: InFlightGroup[] = [],
     onProgress?: (detail: string) => void,
+    /**
+     * 中止訊號。**沒有它，SIGTERM 之後規劃 agent 還會繼續跑十幾分鐘**——
+     * daemon 已經退出，那個子行程還在燒錢，而且沒有人會收它的成果。
+     */
+    signal?: AbortSignal,
   ): Promise<PlanAgentResult> {
     const attempts = 1 + Math.max(0, this.deps.retries ?? 1);
     let lastErr = '';
@@ -139,7 +152,8 @@ export class PlanAgent {
       // 一輪規劃跑十幾分鐘會被當成當機
       onProgress?.(attempts > 1 && i > 1 ? `第 ${i}/${attempts} 次嘗試（上一次回應不合格）` : '讀 repo 判斷誰會動到同一批檔案');
       const prompt = buildPlanPrompt(tasks, inFlight, lastErr);
-      const text = await this.runQuery(prompt, repoPath, tasks[0]?.repo);
+      if (signal?.aborted) throw new Error('規劃已中止');
+      const text = await this.runQuery(prompt, repoPath, tasks[0]?.repo, signal);
       const parsed = parsePlanResponse(text, tasks.map((t) => t.id), inFlight.map((g) => g.id));
       if (parsed.ok) {
         this.deps.log.info(
@@ -159,7 +173,7 @@ export class PlanAgent {
     throw new Error(`規劃 agent 無法產出可用的計畫（試了 ${attempts} 次）：${lastErr}`);
   }
 
-  private async runQuery(prompt: string, cwd: string, repo?: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, repo?: string, signal?: AbortSignal): Promise<string> {
     const q: PlanQueryFn =
       this.deps.queryFn ??
       ((args) =>
