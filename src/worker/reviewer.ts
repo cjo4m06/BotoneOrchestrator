@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { Logger } from '../observability/logger.js';
 import type { CheckResult, GateReport, TaskDetail } from '../types.js';
 import type { LoadedDoc } from './agent-runtime.js';
+import { collectDiffSince } from '../git/status.js';
 
 /**
  * 獨立 reviewer agent（DESIGN.md §5）。DoD 綠燈只證明「build/test 過」，證明不了
@@ -51,8 +52,17 @@ export interface ReviewOptions {
   decisions?: { question: string; answer: string }[];
   /** 直接指定要審的 diff（測試/已算好時用）；未給則由 collectDiff 取。 */
   diff?: string;
-  /** 取 diff 的比較基準，預設 HEAD（即工作區未 commit 的變更）。 */
-  baseRef?: string;
+  /**
+   * 比較基準＝**本任務開始時的 HEAD sha**，與 DoD「diff 非空」關卡同一枚
+   * （worker 的 gateConfig.diff.baseRef）。
+   *
+   * `undefined` ＝ 連基準都取不到（cwd 不是 git 工作區）→ 回 skipped，不要亂猜。
+   *
+   * **不可以用會動的 ref。** 先前預設 `'HEAD'`，於是 agent 自行 commit 之後
+   * `git diff HEAD` 就是空的，一份正確的實作被判成「看不到任何實作」（實跑撞到）。
+   * 必填鍵而非 optional：optional 的話漏傳照樣編得過，等於什麼都沒鎖。
+   */
+  baseRef: string | undefined;
   /** diff 過長時截斷長度（字元）。 */
   maxDiffChars?: number;
 }
@@ -78,7 +88,7 @@ export class Reviewer {
   constructor(private deps: ReviewerDeps) {}
 
   /** 對映 DESIGN §13 的 `reviewer.check(task, docs, ctx.worktree)`。 */
-  async check(task: TaskDetail, docs: LoadedDoc[], cwd: string, opts: ReviewOptions = {}): Promise<ReviewOutcome> {
+  async check(task: TaskDetail, docs: LoadedDoc[], cwd: string, opts: ReviewOptions): Promise<ReviewOutcome> {
     const hasAuth = this.deps.hasAuth ?? hasClaudeAuth;
     if (!hasAuth()) {
       this.deps.log.warn({ taskId: task.id }, 'reviewer 略過：未設定 Claude 認證');
@@ -92,8 +102,13 @@ export class Reviewer {
     const collect = this.deps.collectDiff ?? collectGitDiff;
     let diff = opts.diff;
     if (diff === undefined) {
+      if (opts.baseRef === undefined) {
+        // 取不到基準就不要審。退回 'HEAD' 是錯的——agent 自行 commit 後那是空的，
+        // 會把做完的成果判成「沒有實作」再回灌給它（實跑害了兩輪）。
+        return toReviewOutcome({ status: 'skipped', reason: '取不到比較基準（cwd 不是 git 工作區），無法審查' });
+      }
       try {
-        diff = await collect(cwd, opts.baseRef ?? 'HEAD');
+        diff = await collect(cwd, opts.baseRef);
       } catch (e) {
         return toReviewOutcome({ status: 'skipped', reason: `無法取得 diff：${msg(e)}` });
       }
@@ -334,12 +349,9 @@ function toViolation(v: unknown): ReviewViolation[] {
   ];
 }
 
-async function collectGitDiff(cwd: string, baseRef: string): Promise<string> {
-  const tracked = await execa('git', ['-C', cwd, 'diff', '--no-color', baseRef], { reject: false });
-  const untracked = await execa('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], { reject: false });
-  const extra = untracked.stdout.trim() ? `\n\n# 未追蹤的新檔案\n${untracked.stdout}` : '';
-  return `${tracked.stdout}${extra}`;
-}
+// git 失敗要擲錯而不是回空字串——空字串在上面等於「你沒有實作」，
+// 那是把量測端的故障翻譯成對 agent 的指控。實作見 src/git/status.ts。
+const collectGitDiff = (cwd: string, baseRef: string): Promise<string> => collectDiffSince(cwd, baseRef);
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);

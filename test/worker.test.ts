@@ -97,17 +97,17 @@ function fakeNotifier(): Notifier & { events: LifecycleEvent[] } {
 }
 
 interface FakeReviewer extends ReviewerLike {
-  calls: { taskId: string; docRefs: string[]; cwd: string }[];
+  calls: { taskId: string; docRefs: string[]; cwd: string; baseRef?: string | undefined }[];
 }
 
 /** 依序回傳判定；用完後重複最後一筆（模擬 reviewer 反覆否決）。 */
 function fakeReviewer(verdicts: ReviewVerdict[]): FakeReviewer {
-  const calls: { taskId: string; docRefs: string[]; cwd: string }[] = [];
+  const calls: { taskId: string; docRefs: string[]; cwd: string; baseRef?: string | undefined }[] = [];
   let i = 0;
   return {
     calls,
-    async check(task, docs, cwd) {
-      calls.push({ taskId: task.id, docRefs: docs.map((d) => d.ref), cwd });
+    async check(task, docs, cwd, opts) {
+      calls.push({ taskId: task.id, docRefs: docs.map((d) => d.ref), cwd, baseRef: opts.baseRef });
       const v = verdicts[Math.min(i, verdicts.length - 1)] ?? { status: 'pass' as const, notes: [] };
       i += 1;
       return toReviewOutcome(v);
@@ -171,6 +171,45 @@ describe('Worker — 單任務監督迴圈', () => {
    * 「agent 在改第 3 輪」「在跑 npm test」「reviewer 在審」的等待時間差很多，
    * 分不出來的話人只能盯著同一個狀態猜平台是不是掛了（使用者實際回報過）。
    */
+  /**
+   * reviewer 與 DoD 必須用**同一枚基準**。
+   *
+   * 實跑災情：reviewer 預設用 'HEAD'，agent 把工作 commit 之後 `git diff HEAD` 就是空的，
+   * 一份正確的 15 行實作被判成「看不到任何實作」，白繞兩輪、燒 $6.78，
+   * 而且逼得 agent 去 `git reset HEAD~1` 改寫歷史來繞過。
+   *
+   * 這個測試鎖的是**接線**：worker 有沒有真的把 gateConfig.diff.baseRef 交給 reviewer。
+   */
+  it('reviewer 收到的基準＝DoD 的基準（不是 HEAD、不是 undefined）', async () => {
+    const task = makeTask();
+    seed(task);
+    const sha = 'c'.repeat(40);
+    const reviewer = fakeReviewer([{ status: 'pass', notes: [] }]);
+    const { worker } = build({
+      reviewer,
+      mcp: fakeMcp(),
+      // 任務起點：withDiffGate 會拿它當 diff 關卡的基準
+      headRef: async () => sha,
+    });
+
+    await worker.runTask({ task, ...cfg });
+
+    assert.equal(reviewer.calls.length, 1, 'reviewer 應該被呼叫');
+    assert.equal(reviewer.calls[0]?.baseRef, sha, 'reviewer 拿到的必須是任務起點 sha');
+  });
+
+  /** 取不到基準時要傳 undefined 讓 reviewer 自己 skip——不可以偷偷退回 'HEAD'。 */
+  it('取不到 HEAD → 傳 undefined 給 reviewer，不退回 HEAD', async () => {
+    const task = makeTask();
+    seed(task);
+    const reviewer = fakeReviewer([{ status: 'pass', notes: [] }]);
+    const { worker } = build({ reviewer, mcp: fakeMcp(), headRef: async () => undefined });
+
+    await worker.runTask({ task, ...cfg });
+
+    assert.equal(reviewer.calls[0]?.baseRef, undefined);
+  });
+
   it('回報現在在哪一步（給控制台的「現在在做什麼」）', async () => {
     const task = makeTask();
     seed(task);
@@ -825,7 +864,7 @@ describe('Worker — 單任務監督迴圈', () => {
       const out = await worker.runTask({ task, cwd: '/tmp/wt-r', verifierConfig: {} });
 
       assert.deepEqual(out, { status: 'done' });
-      assert.deepEqual(reviewer.calls, [{ taskId: 'T-1', docRefs: ['spec/ui.md#按鈕'], cwd: '/tmp/wt-r' }]);
+      assert.deepEqual(reviewer.calls, [{ taskId: 'T-1', docRefs: ['spec/ui.md#按鈕'], cwd: '/tmp/wt-r', baseRef: undefined }]);
       assert.equal(mcp.completeCalls.length, 1);
     });
 

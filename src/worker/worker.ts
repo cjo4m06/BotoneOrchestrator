@@ -278,7 +278,7 @@ export class Worker {
       this.say(threadTs, { type: 'iterating', round }, detail);
 
       input.onPhase?.(`第 ${round} 輪：agent 寫程式中`);
-      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
+      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
         // 只注入一次：不標消費的話，之後每一輪都會再貼一次同樣的答覆，
@@ -350,7 +350,9 @@ export class Worker {
       let effective = gate;
       if (gate.green) {
         input.onPhase?.(`第 ${round} 輪：關卡綠燈，reviewer 對規格審查中`);
-        const review = await this.review(detail, docs, cwd, threadTs, reviewRejections);
+        // baseRef 一定要傳，而且**不要 `?? 'HEAD'`**——讓 undefined 一路傳到 reviewer，
+        // 由它決定「沒有基準就不審」。退回 HEAD 正是這個 bug 的源頭。
+        const review = await this.review(detail, docs, cwd, threadTs, reviewRejections, gateConfig.diff?.baseRef);
         if (review.rejected) {
           reviewRejections += 1;
           effective = review.report;
@@ -495,7 +497,11 @@ export class Worker {
     }
 
     if (!baseRef) {
-      log.error({ taskId, cwd }, '⚠️ 無法取得工作區 HEAD → 本任務停用「diff 非空」關卡（agent 沒改東西也可能被判完成）');
+      log.error(
+        { taskId, cwd },
+        '⚠️ 無法取得工作區 HEAD → 本任務停用「diff 非空」關卡（agent 沒改東西也可能被判完成）；'
+          + 'reviewer 會 skip（沒有基準不審），Stop hook 退回 porcelain（agent 自行 commit 後會被誤判成沒做事）',
+      );
       return config;
     }
     log.debug({ taskId, baseRef }, 'diff 非空關卡基準 = 任務開始時的 HEAD');
@@ -750,6 +756,8 @@ export class Worker {
     cwd: string,
     threadTs: string | undefined,
     rejectionsSoFar: number,
+    /** 與 DoD diff 關卡同一枚基準（任務開始時的 HEAD sha）。undefined ＝ 取不到，reviewer 會 skip。 */
+    baseRef: string | undefined,
   ): Promise<{ rejected: false } | { rejected: true; report: GateReport }> {
     const { reviewer, notifier, log } = this.deps;
     if (!reviewer) return { rejected: false };
@@ -760,7 +768,7 @@ export class Worker {
       void Promise.resolve(this.deps.notifier.updateTaskCard?.(detail.id, 'reviewing')).catch(() => {});
       // 把人已經拍板的決定一起給 reviewer。少了它，規格寫「沒有定論」的地方
       // 會被重新提出來退回——而那個問題明明已經有答案了（實跑撞到，白費一輪）。
-      outcome = await reviewer.check(detail, docs, cwd, { decisions: this.settledDecisions(detail.id) });
+      outcome = await reviewer.check(detail, docs, cwd, { baseRef, decisions: this.settledDecisions(detail.id) });
     } catch (e) {
       // reviewer 掛掉不能拖垮任務：DoD 已綠，退化成「沒有 reviewer」的既有行為
       log.warn({ taskId: detail.id, err: e instanceof Error ? e.message : String(e) }, 'reviewer 呼叫失敗，略過審查');

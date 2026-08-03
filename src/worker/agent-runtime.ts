@@ -38,6 +38,12 @@ export interface IterateInput {
    */
   signal?: AbortSignal;
   answer?: { question: string; answer: string }; // 澄清答覆注入
+  /**
+   * 本任務起點 sha（＝DoD diff 關卡與 reviewer 同一枚）。
+   * Stop hook 用它判「這一輪到底做了沒」；未給 → 退回 porcelain，
+   * 那只看得到未 commit 的東西，agent 自行 commit 後會被誤判成什麼都沒做。
+   */
+  baseRef?: string;
 }
 
 export interface ClarificationCapture {
@@ -258,7 +264,7 @@ export interface AgentRuntimeDeps {
    */
   docs?: (repo: string) => DocsSource | undefined;
   /** 工作區是否有變更（Stop hook 判斷用）。預設 git/status，可注入假件測試。 */
-  workingTreeChanged?: (cwd: string) => Promise<boolean>;
+  workingTreeChanged?: (cwd: string, baseRef?: string) => Promise<boolean>;
   /** 工具紅線的保護路徑覆寫（來自專案設定）。未給時用安全預設。 */
   toolPolicy?: ToolPolicyOptions;
   /**
@@ -427,6 +433,7 @@ export class AgentRuntime {
       captured,
       state,
       maxBlocks: MAX_STOP_BLOCKS,
+      ...(input.baseRef ? { baseRef: input.baseRef } : {}),
       workingTreeChanged: this.deps.workingTreeChanged ?? workingTreeChanged,
     });
   }
@@ -990,7 +997,14 @@ export function evaluateStopHook(input: StopDecisionInput): StopDecision {
       '先讀規格與相關程式碼，實際寫入 / 修改檔案。' +
       '若規格有不可逆的歧義而無法動手，請用 ask_human 提問；' +
       '若你查證後確認這個任務本來就不需要任何程式碼改動（功能已存在／描述與現況不符／' +
-      '缺外部依賴），請用 report_no_change 說明理由。不要直接結束，也不要為了讓驗證通過而亂改程式碼。',
+      '缺外部依賴），請用 report_no_change 說明理由。不要直接結束，也不要為了讓驗證通過而亂改程式碼。' +
+        // 實跑撞到：agent 做完並 commit 之後被這句話告知「你什麼都沒做」，
+        // 它的反應是 git reset HEAD~1 把 commit 退掉讓變更「重新出現」。
+        // 量測端已經修好（Stop hook 現在比對任務起點），但這條路要明擋——
+        // 因為下一個量測缺陷出現時，它還是會想到同一招。
+        '\n\n**如果你已經把變更 commit 了，那些變更本來就算數**——' +
+        '不要用 reset／amend／rebase 去讓變更「重新出現」。' +
+        '真的看不到你的變更時那是量測端的問題，請用 report_friction 回報。',
   };
 }
 

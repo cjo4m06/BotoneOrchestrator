@@ -48,11 +48,22 @@ export interface ReviewerLike {
     task: TaskDetail,
     docs: LoadedDoc[],
     cwd: string,
-    /**
-     * 人已經拍板的決定。規格上懸而未決的地方，reviewer 需要知道它已經有答案了，
-     * 否則會把一個解決過的問題重新提出來退回（實跑撞到，白費一輪）。
-     */
-    opts?: { decisions?: { question: string; answer: string }[] },
+    opts: {
+      /**
+       * 比較基準＝**本任務開始時的 HEAD sha**，與 DoD「diff 非空」關卡同一枚。
+       * `undefined` ＝ 取不到基準 → reviewer 回 skipped（不是判「沒有實作」）。
+       *
+       * **必填鍵、可為 undefined**（不是 optional key）：optional 的話漏傳照樣編得過，
+       * 而漏傳正是這個 bug 的成因——reviewer 退回預設的 `'HEAD'`，
+       * agent 一 commit 就被判成「看不到任何實作」。
+       */
+      baseRef: string | undefined;
+      /**
+       * 人已經拍板的決定。規格上懸而未決的地方，reviewer 需要知道它已經有答案了，
+       * 否則會把一個解決過的問題重新提出來退回（實跑撞到，白費一輪）。
+       */
+      decisions?: { question: string; answer: string }[];
+    },
   ): Promise<ReviewOutcome>;
 }
 

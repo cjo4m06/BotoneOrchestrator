@@ -16,6 +16,9 @@ import type { ReviewerLike } from '../src/contracts.js';
 import type { Logger } from '../src/observability/logger.js';
 import type { TaskDetail } from '../src/types.js';
 
+/** 任務起點 sha：reviewer 與 DoD 用的是同一枚，不是會動的 'HEAD'。 */
+const BASE = 'a'.repeat(40);
+
 const log = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 
 const task: TaskDetail = {
@@ -162,7 +165,7 @@ describe('Reviewer.check', () => {
 
   it('無金鑰 → skipped（不炸、不擋）', async () => {
     const r = new Reviewer({ log, hasAuth: () => false, queryFn: fakeQuery('{"status":"fail","violations":[]}') });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
     assert.equal(out.ok, true);
     assert.equal(out.asGateReport().green, true);
@@ -170,7 +173,7 @@ describe('Reviewer.check', () => {
 
   it('沒有 docRefs 規格 → skipped', async () => {
     const r = new Reviewer({ ...base, queryFn: fakeQuery('{"status":"pass","violations":[]}') });
-    const out = await r.check(task, [], '/wt');
+    const out = await r.check(task, [], '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
   });
 
@@ -185,14 +188,14 @@ describe('Reviewer.check', () => {
         return fakeQuery('')(args);
       },
     });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.ok, false);
     assert.equal(called, false);
   });
 
   it('合格 → ok=true', async () => {
     const r = new Reviewer({ ...base, queryFn: fakeQuery('```json\n{"status":"pass","notes":["符合"],"violations":[]}\n```') });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.ok, true);
     assert.equal(out.verdict.status, 'pass');
   });
@@ -202,7 +205,7 @@ describe('Reviewer.check', () => {
       ...base,
       queryFn: fakeQuery('{"status":"fail","violations":[{"requirement":"密碼至少 8 碼","problem":"沒檢查"}]}'),
     });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.ok, false);
     const g = out.asGateReport();
     assert.equal(g.green, false);
@@ -218,7 +221,7 @@ describe('Reviewer.check', () => {
         return fakeQuery('{"status":"pass","violations":[]}')(args);
       },
     });
-    await r.check(task, docs, '/wt');
+    await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.match(seen, /密碼至少 8 碼/);
     assert.match(seen, /const ok = true/);
   });
@@ -230,20 +233,20 @@ describe('Reviewer.check', () => {
         throw new Error('network down');
       },
     });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
     assert.equal(out.ok, true);
   });
 
   it('SDK 回錯誤結果 → skipped', async () => {
     const r = new Reviewer({ ...base, queryFn: fakeQuery('', 'error_max_turns') });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
   });
 
   it('回應無法解析 → skipped（避免無限迴圈）', async () => {
     const r = new Reviewer({ ...base, queryFn: fakeQuery('嗯，看起來不錯') });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
     assert.equal(out.ok, true);
   });
@@ -257,7 +260,7 @@ describe('Reviewer.check', () => {
       },
       queryFn: fakeQuery('{"status":"pass","violations":[]}'),
     });
-    assert.equal((await r.check(task, docs, '/wt')).verdict.status, 'skipped');
+    assert.equal((await r.check(task, docs, '/wt', { baseRef: BASE })).verdict.status, 'skipped');
   });
 
   it('opts.diff 可覆寫 collectDiff', async () => {
@@ -273,7 +276,7 @@ describe('Reviewer.check', () => {
         return fakeQuery('{"status":"pass","violations":[]}')(args);
       },
     });
-    const out = await r.check(task, docs, '/wt', { diff: 'INLINE_DIFF_MARKER' });
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE, diff: 'INLINE_DIFF_MARKER' });
     assert.equal(out.ok, true);
     assert.match(seen, /INLINE_DIFF_MARKER/);
   });
@@ -282,7 +285,7 @@ describe('Reviewer.check', () => {
 describe('Reviewer 與 Worker 的契約', () => {
   it('Reviewer 可直接當 ReviewerLike 注入 Worker（型別對得上就不會在整合處才爆）', async () => {
     const r: ReviewerLike = new Reviewer({ log, hasAuth: () => false });
-    const out = await r.check(task, docs, '/wt');
+    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.ok, true, '無金鑰時必須放行，不能擋住 Worker 的監督迴圈');
   });
 });

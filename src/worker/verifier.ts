@@ -8,6 +8,7 @@ import type { Logger } from '../observability/logger.js';
 import { decomposeShellCommand, evaluateCommandRedline } from './agent-runtime.js';
 import { uiCheck, type UiVerdict } from './ui-judge.js';
 import { DEFAULT_BREAKPOINTS, VisualVerifier, classifyVisualError, toGateFragment, type VisualConfig, type VisualResult } from './visual.js';
+import { EMPTY_TREE, changedSince } from '../git/status.js';
 
 /** 指令型關卡（跑得到 exit code 的那種）。 */
 export type VerifierCommand = 'typecheck' | 'lint' | 'build' | 'test';
@@ -737,9 +738,6 @@ function timeoutOf(config: VerifierConfig, deps: VerifierDeps): number {
 
 // ── diff 非空關卡的 git 查詢 ──
 
-/** git 空樹的固定 sha：repo 還沒有任何 commit 時當基準，等於「所有檔案都是新增」。 */
-const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-
 type GitOut = { ok: true; stdout: string } | { ok: false; detail: string };
 
 async function git(cwd: string, args: string[]): Promise<GitOut> {
@@ -765,39 +763,9 @@ export async function gitHeadRef(cwd: string): Promise<string | undefined> {
   return inside.ok && inside.stdout.trim() === 'true' ? EMPTY_TREE : undefined;
 }
 
-export type WorkspaceChanges = { ok: true; files: string[] } | { ok: false; detail: string };
-
-/**
- * 相對 baseRef 有沒有任何變更。兩路都要查，缺一不可：
- *  - `git diff --name-only <baseRef>`：工作區 vs baseRef，涵蓋「已 commit」與「改了還沒 commit」
- *    的追蹤檔（agent 自己 commit 過也算數）。
- *  - `git ls-files --others --exclude-standard`：**未追蹤的新檔案**——新增檔案也是變更，
- *    但還沒進 index，上面那道 diff 看不到它。
- *
- * 截圖不會混進來：Verifier 已強制把截圖目錄導到 worktree 之外（見 resolveVisualDirs）。
- */
-export async function changedSince(cwd: string, baseRef: string): Promise<WorkspaceChanges> {
-  const tracked = await git(cwd, ['diff', '--name-only', '-z', baseRef, '--']);
-  if (!tracked.ok) return tracked;
-  const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z']);
-  if (!untracked.ok) return untracked;
-
-  const files = [...splitNul(tracked.stdout), ...splitNul(untracked.stdout)].filter(countsAsChange);
-  return { ok: true, files: [...new Set(files)] };
-}
-
-/** -z 輸出以 NUL 分隔（避免路徑含空白/中文被 git 加引號跳脫）。 */
-function splitNul(s: string): string[] {
-  return s.split('\0').filter((x) => x.length > 0);
-}
-
-/**
- * node_modules 不算「本任務的變更」：GroupRunner 會把它 symlink 進 worktree，
- * 專案若沒把它加進 .gitignore 就會被列成未追蹤檔——那正是我們要防的「空 diff 誤判成有做事」。
- */
-function countsAsChange(path: string): boolean {
-  return path !== 'node_modules' && !path.startsWith('node_modules/');
-}
+// changedSince 的定義搬到 src/git/status.ts（那裡是「相對基準有沒有變更」的唯一來源）。
+// 這裡 re-export 讓既有的 `import { changedSince } from './verifier.js'` 不必改。
+export { changedSince, type WorkspaceChanges } from '../git/status.js';
 
 /** 去掉只有 Verifier 看得懂的欄位（*Root/when/categories），剩下的才是 VisualVerifier 的設定。 */
 function stripGateOnly(config: VisualGateConfig): VisualConfig {
