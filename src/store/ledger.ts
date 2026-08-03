@@ -354,10 +354,10 @@ export class Ledger {
     this.db
       .prepare(
         `INSERT INTO agent_sessions
-           (task_id, group_id, session_id, rounds, cost_usd, input_tokens, output_tokens,
+           (task_id, kind, repo, group_id, session_id, rounds, cost_usd, input_tokens, output_tokens,
             cache_read_tokens, models, status, created_at, updated_at)
          VALUES
-           (@taskId, @groupId, @sessionId, 1, @costUsd, @inputTokens, @outputTokens,
+           (@taskId, @kind, @repo, @groupId, @sessionId, 1, @costUsd, @inputTokens, @outputTokens,
             @cacheReadTokens, @models, @status, @ts, @ts)
          ON CONFLICT(task_id, session_id) DO UPDATE SET
            rounds = rounds + 1,
@@ -365,6 +365,8 @@ export class Ledger {
            input_tokens = input_tokens + @inputTokens,
            output_tokens = output_tokens + @outputTokens,
            cache_read_tokens = cache_read_tokens + @cacheReadTokens,
+           -- 同一 session 後續輪次補上先前缺的 repo；null 不可以洗掉已有值
+           repo = COALESCE(@repo, repo),
            -- models 併集：同一 session 中途換模型時兩個都要留下
            models = @models,
            status = @status,
@@ -373,7 +375,9 @@ export class Ledger {
       )
       .run({
         taskId: input.taskId,
-        kind: input.kind,
+        // 型別上是必填，但 JS 呼叫端（測試假件、舊資料路徑）可能沒帶——
+        // 之前欄位不在 SQL 裡時是靠 DEFAULT 兜住的，明寫之後要自己補
+        kind: input.kind ?? 'worker',
         repo: input.repo ?? null,
         groupId: input.groupId ?? null,
         sessionId: input.sessionId,
@@ -440,13 +444,16 @@ export class Ledger {
   costByRepo(sinceMs?: number): RepoCost[] {
     const rows = this.db
       .prepare(
-        `SELECT COALESCE(t.repo, '(unknown)') AS repo,
+        // **s.repo 要排在 t.repo 前面。** 判斷者與規劃者不屬於任何單一任務
+        // （task_id 是 '' 哨兵值），join 不到 tasks——只看 join 的話它們的錢
+        // 全部歸進 '(unknown)'，而那正是加 repo 欄位要解決的問題。
+        `SELECT COALESCE(s.repo, t.repo, '(unknown)') AS repo,
                 COALESCE(SUM(s.cost_usd),0) AS cost,
                 COALESCE(SUM(s.rounds),0) AS rounds,
                 COUNT(*) AS sessions
            FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id
           WHERE s.created_at >= ?
-          GROUP BY COALESCE(t.repo, '(unknown)')
+          GROUP BY COALESCE(s.repo, t.repo, '(unknown)')
           ORDER BY cost DESC`,
       )
       .all(sinceMs ?? 0) as { repo: string; cost: number; rounds: number; sessions: number }[];

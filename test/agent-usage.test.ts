@@ -56,6 +56,28 @@ test('記進 ledger，並標明角色與專案', (t) => {
 
   const total = h.ledger.costSummary();
   assert.equal(total.costUsd, 1.25, '規劃的花費要算進總額——預算閘門看的就是這個');
+
+  // **一定要把欄位讀回來比對。** 只斷言總額的話，kind／repo 根本沒被寫進 SQL
+  // 也照樣綠燈——better-sqlite3 對「statement 裡不存在的具名參數」是靜靜忽略的，
+  // 而那正是第一版的 bug（欄位加了、參數傳了，但 INSERT 的欄位清單忘了加）。
+  assert.deepEqual(
+    h.ledger.costByRepo().map((r) => r.repo),
+    ['acme/web'],
+    '判斷者的錢要歸得出專案；歸進 (unknown) 代表 repo 欄位沒寫進去',
+  );
+});
+
+test('不同角色的花費各自歸戶，不會全部擠進 (unknown)', (t) => {
+  const h = createTmpLedger();
+  t.after(() => h.cleanup());
+  const log = createSilentLogger();
+  recordAgentUsage(h.ledger, log, { kind: 'plan', repo: 'acme/web' }, RESULT);
+  recordAgentUsage(h.ledger, log, { kind: 'ui_judge', repo: 'acme/api' }, { ...RESULT, session_id: 's-2' });
+  recordAgentUsage(h.ledger, log, { kind: 'reviewer', repo: 'acme/web' }, { ...RESULT, session_id: 's-3' });
+
+  const byRepo = Object.fromEntries(h.ledger.costByRepo().map((r) => [r.repo, r.costUsd]));
+  assert.deepEqual(byRepo, { 'acme/web': 2.5, 'acme/api': 1.25 });
+  assert.ok(!('(unknown)' in byRepo), '不該有任何一筆歸不出專案');
 });
 
 test('不屬於任何任務的角色也記得下來（taskId 用哨兵值）', (t) => {

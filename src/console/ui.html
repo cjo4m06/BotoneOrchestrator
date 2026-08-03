@@ -509,7 +509,10 @@ function toast(msg, kind = '') {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: opts.body ? { 'content-type': 'application/json' } : {} });
+  // **無條件帶 content-type。** 只在有 body 時帶的話，DELETE 這種沒有 body 的請求
+  // 會被伺服器的跨站防護擋掉（它要求寫入請求一律是 application/json）——
+  // 症狀是「刪除按鈕按了沒反應」，而那是我們自己擋自己。
+  const res = await fetch(path, { ...opts, headers: { 'content-type': 'application/json' } });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
   return data;

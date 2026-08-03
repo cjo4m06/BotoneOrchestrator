@@ -1773,6 +1773,13 @@ export async function main(): Promise<void> {
   if (process.argv.includes('--once')) {
     log.info('--once：執行一輪 tick 後結束');
     await orchestrator.tick();
+    // 規劃改成背景執行之後（見 orchestrator 的 startPlanning），tick() 回來時
+    // 通常還沒建群。不等它有兩個後果：(a) --once 什麼群都不會建，
+    // (b) finish() 會關掉 ledger，而背景規劃回來時撞上已關閉的 DB，
+    // 行程還被規劃子行程吊著十幾分鐘（鎖已經放掉，看起來像當掉）。
+    await orchestrator.settlePlanning();
+    // 再跑一輪才派得出去：dispatch 是第 4 步，規劃收尾發生在它之後
+    await orchestrator.tick();
     await finish();
     return;
   }

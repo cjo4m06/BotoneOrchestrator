@@ -561,7 +561,14 @@ export interface StopHookArgs {
   captured: CapturedSignals;
   state: { blocks: number };
   maxBlocks: number;
-  workingTreeChanged: (cwd: string) => Promise<boolean>;
+  /**
+   * 本任務起點 sha（＝DoD diff 關卡與 reviewer 同一枚）。
+   *
+   * 沒有它就只看得到「未 commit 的東西」，而 agent 有 commit 的能力——
+   * 它做完並提交之後會被當面告知「你什麼都沒做」（實跑撞到，見 git/status.ts）。
+   */
+  baseRef?: string;
+  workingTreeChanged: (cwd: string, baseRef?: string) => Promise<boolean>;
 }
 
 /** Stop hook：判定見 evaluateStopHook；此處只負責取狀態、計數與回傳 SDK 形狀。 */
@@ -569,7 +576,7 @@ export function createStopHook(args: StopHookArgs) {
   return async (hookInput: Record<string, unknown>) => {
     let treeChanged = true; // 取不到就當有變更（寧可放行，也不要因 git 失敗把 agent 關在迴圈裡）
     try {
-      treeChanged = await args.workingTreeChanged(args.cwd);
+      treeChanged = await args.workingTreeChanged(args.cwd, args.baseRef);
     } catch (e) {
       args.log.debug({ err: e instanceof Error ? e.message : String(e) }, 'Stop hook：無法取得工作區狀態，放行');
     }
@@ -1184,6 +1191,50 @@ const READONLY_COMMANDS = new Set([
   'sort', 'uniq', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'file', 'stat', 'echo', 'true',
 ]);
 
+/**
+ * 取出所有命令替換的內容。
+ *
+ * **括號要用數的，不能用正則。** `/\$\(([^()]*)\)/` 的字元集排除括號，
+ * 遇到 `$(echo $(rm -rf x))` 時只匹配得到最內層那一個，外層那段從未被檢查。
+ */
+export function extractSubstitutions(text: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === '`') {
+      const end = text.indexOf('`', i + 1);
+      if (end < 0) break;
+      const inner = text.slice(i + 1, end).trim();
+      if (inner) out.push(inner);
+      i = end;
+      continue;
+    }
+    if (text[i] !== '$' || text[i + 1] !== '(') continue;
+    let depth = 1;
+    let j = i + 2;
+    for (; j < text.length && depth > 0; j += 1) {
+      if (text[j] === '(') depth += 1;
+      else if (text[j] === ')') depth -= 1;
+    }
+    if (depth !== 0) break; // 括號不對稱：交給下面的白名單擋，這裡不猜
+    const inner = text.slice(i + 2, j - 1).trim();
+    if (inner) out.push(inner);
+    i = j - 1;
+  }
+  return out;
+}
+
+/** `$(` 的括號有沒有對稱。不對稱代表我們拆不出裡面有什麼。 */
+function unbalancedSubstitution(text: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === '$' && text[i + 1] === '(') { depth += 1; i += 1; }
+    else if (text[i] === ')' && depth > 0) depth -= 1;
+  }
+  if (depth !== 0) return true;
+  // 反引號要成對
+  return (text.match(/`/g) ?? []).length % 2 !== 0;
+}
+
 /** shell 語法關鍵字：不是指令，剝掉之後才看得到真正要跑的東西。 */
 const SHELL_KEYWORDS = new Set([
   'for', 'do', 'done', 'while', 'until', 'if', 'then', 'else', 'elif', 'fi',
@@ -1203,6 +1254,21 @@ function stripShellKeywords(tokens: string[]): string[] {
   }
   return tokens.slice(i);
 }
+
+/**
+ * 白名單裡的指令**自己就能寫檔**的旗標。
+ *
+ * 「這個指令在白名單裡」不等於「這次呼叫是唯讀的」——實測全部繞得過去：
+ *   find . -name x -delete          刪檔
+ *   find . -name x -exec rm {} +    執行任意指令
+ *   sort -o out.txt in.txt          寫檔（不用重導向）
+ * 白名單擋的是「哪個程式」，這一層擋的是「它被要求做什麼」。
+ */
+const WRITE_CAPABLE_FLAGS: Record<string, string[]> = {
+  find: ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fls', '-fprint', '-fprint0', '-fprintf'],
+  sort: ['-o', '--output'],
+  grep: ['--devices', '--directories'],
+};
 
 /** git 的唯讀子指令。git 本身既能讀也能寫，所以要看第一個子指令。 */
 const READONLY_GIT_SUBCOMMANDS = new Set([
@@ -1227,13 +1293,22 @@ export function evaluateReadonlyCommand(cmd: string, depth = 0): PolicyVerdict {
     }
   }
 
+  // **拆不下去就擋，不要當成「沒東西」。** 這是整個唯讀判定的骨幹原則：
+  // 看不懂一條指令時，唯一安全的答案是拒絕——唯讀角色只需要簡單的查詢，
+  // 寫得出巢狀反引號或不對稱括號的，本來就不該是它要跑的東西。
+  if (/\\`/.test(cmd) || unbalancedSubstitution(cmd)) {
+    return {
+      deny: true,
+      reason: '紅線：這條指令的巢狀結構解析不出來（跳脫的反引號／括號不對稱），唯讀角色不接受看不懂的指令。'
+        + '請改用單純的查詢寫法。',
+    };
+  }
+
   // 命令替換：`echo $(rm -rf x)` 的第一個 token 是 echo，逐段掃描看不到裡面。
   // 巢狀深度設限，避免病態輸入。
   if (depth < 3) {
     for (const src of sources) {
-      for (const m of src.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)) {
-        const inner = (m[1] ?? m[2] ?? '').trim();
-        if (!inner) continue;
+      for (const inner of extractSubstitutions(src)) {
         const v = evaluateReadonlyCommand(inner, depth + 1);
         if (v.deny) return v;
       }
@@ -1252,14 +1327,35 @@ export function evaluateReadonlyCommand(cmd: string, depth = 0): PolicyVerdict {
       let i = 1;
       while (i < tokens.length && tokens[i]!.startsWith('-')) i += tokens[i] === '-C' || tokens[i] === '-c' ? 2 : 1;
       const sub = tokens[i] ?? '';
+      // --output=/path 幾乎每個 git 查詢子指令都吃，而它會寫檔
+      const gitWrite = tokens.slice(i).find((t) => t === '--output' || t.startsWith('--output='));
+      if (gitWrite) {
+        return { deny: true, reason: `紅線：唯讀角色不可以用 \`${gitWrite}\` 把輸出寫進檔案。` };
+      }
       if (!READONLY_GIT_SUBCOMMANDS.has(sub)) {
         return { deny: true, reason: `紅線：唯讀角色只能用 git 的查詢子指令，不能用 \`git ${sub || '(未知)'}\`。` };
       }
-      // git config 只能讀：帶值就是在寫
-      if (sub === 'config' && tokens.slice(i + 1).filter((t) => !t.startsWith('-')).length > 1) {
-        return { deny: true, reason: '紅線：唯讀角色不可以寫 git 設定。' };
+      // git config 只能讀。帶值是在寫，而 --unset / --add / --edit 這些**不帶值也在寫**
+      const CONFIG_WRITE = ['--unset', '--unset-all', '--add', '--replace-all', '--edit', '-e', '--rename-section', '--remove-section'];
+      if (sub === 'config') {
+        const flag = tokens.slice(i + 1).find((t) => CONFIG_WRITE.includes(t));
+        if (flag) return { deny: true, reason: `紅線：唯讀角色不可以用 \`git config ${flag}\` 改設定。` };
+        if (tokens.slice(i + 1).filter((t) => !t.startsWith('-')).length > 1) {
+          return { deny: true, reason: '紅線：唯讀角色不可以寫 git 設定。' };
+        }
+      }
+      // git branch 列出來是唯讀的，但 -d/-D/-m/-M/-c/-C 會刪或改分支
+      const BRANCH_WRITE = ['-d', '-D', '--delete', '-m', '-M', '--move', '-c', '-C', '--copy', '-f', '--force', '-u', '--set-upstream-to', '--unset-upstream'];
+      if (sub === 'branch') {
+        const flag = tokens.slice(i + 1).find((t) => BRANCH_WRITE.includes(t) || t.startsWith('--set-upstream-to='));
+        if (flag) return { deny: true, reason: `紅線：唯讀角色不可以用 \`git branch ${flag}\` 改動分支。` };
       }
       continue;
+    }
+    // 白名單裡的指令也可能被要求去寫東西
+    const bad = (WRITE_CAPABLE_FLAGS[bin] ?? []).find((f) => tokens.includes(f) || tokens.some((t) => t.startsWith(`${f}=`)));
+    if (bad) {
+      return { deny: true, reason: `紅線：\`${bin} ${bad}\` 會寫入或執行其他指令，唯讀角色不可以用。` };
     }
     if (!READONLY_COMMANDS.has(bin)) {
       return {

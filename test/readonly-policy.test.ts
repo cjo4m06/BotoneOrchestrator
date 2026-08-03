@@ -85,6 +85,66 @@ test('組合指令逐段判定', () => {
   assert.equal(deny('echo $(rm -rf x)').deny, true, '命令替換要拆開看');
 });
 
+/**
+ * **「這個指令在白名單裡」不等於「這次呼叫是唯讀的」。**
+ * 下面每一條的第一個 token 都在白名單內，但實際上會寫檔或執行別的指令——
+ * 對抗性複查實測全部繞得過第一版。
+ */
+test('白名單指令被要求去寫東西時一樣要擋', () => {
+  for (const cmd of [
+    'find . -name "*.ts" -delete',
+    'find . -name x -exec rm {} +',
+    'find . -name x -execdir rm {} ;',
+    'find . -name x -fprint out.txt',
+    'sort -o out.txt in.txt',
+    'sort --output=out.txt in.txt',
+    'git log --output=/tmp/x',
+    'git config --unset user.name',
+    'git config --add core.hooksPath /tmp/evil',
+    'git config --edit',
+    'git branch -D main',
+    'git branch -m old new',
+    'git branch --set-upstream-to=origin/evil',
+  ]) {
+    assert.equal(deny(cmd).deny, true, `應擋下：${cmd}`);
+  }
+});
+
+test('同一批指令的良性用法不可以被誤擋', () => {
+  for (const cmd of [
+    'find . -name "*.ts"',
+    'find . -type f -not -path "*/node_modules/*"',
+    'sort a.txt',
+    'git log --oneline -20',
+    'git config --get remote.origin.url',
+    'git branch --list',
+    'git branch -a',
+    'grep -rn x src',
+  ]) {
+    assert.equal(allow(cmd).deny, false, `不該擋：${cmd}`);
+  }
+});
+
+/** 正則的字元集排除括號，巢狀時只抓得到最內層——外層那段從未被檢查。 */
+test('巢狀命令替換每一層都要看', () => {
+  assert.equal(deny('echo $(echo $(rm -rf /tmp/x))').deny, true);
+  assert.equal(deny('echo $(cat $(find . -name x -delete))').deny, true);
+  assert.equal(allow('ls $(git rev-parse HEAD)').deny, false, '單層的良性替換不該被擋');
+});
+
+/**
+ * **拆不下去就擋，不要當成「沒東西」。**
+ * 這是整個唯讀判定的骨幹原則：看不懂一條指令時，唯一安全的答案是拒絕。
+ */
+test('解析不出來的指令一律擋', () => {
+  for (const cmd of ['echo `echo \\`rm -rf x\\``', 'echo $(rm -rf x', 'echo `rm -rf x']) {
+    assert.equal(deny(cmd).deny, true, `應擋下：${cmd}`);
+  }
+  // 一般寫法不能因此被誤擋
+  assert.equal(allow('grep -rn "a(b)c" src').deny, false);
+  assert.equal(allow('echo `git rev-parse HEAD`').deny, false);
+});
+
 test('唯讀角色不能用寫檔工具（Edit/Write）', () => {
   assert.equal(evaluateToolPolicy('Write', { file_path: 'a.ts', content: 'x' }, RO).deny, true);
   assert.equal(evaluateToolPolicy('Edit', { file_path: 'a.ts' }, RO).deny, true);
