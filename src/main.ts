@@ -633,6 +633,35 @@ export interface CreateMergePipelineInput {
  *
  * 回 undefined = 沒有任何專案拿得到合併工作區（環境問題），不是設定選擇。
  */
+/**
+ * 合併工作區用完之後放掉群組分支。
+ *
+ * **必須 detach，不能 checkout 分支。** git 不允許同一條分支同時被兩個 worktree 檢出，
+ * 而 base 分支正被使用者的主 checkout 佔著：
+ *
+ *   fatal: 'main' is already used by worktree at '/Users/…/work/Dinosaur'
+ *
+ * 合併工作區建立時本來就是 `worktree add --detach`，釋放時卻去 checkout 一條分支，
+ * 是當初寫得不一致。這個失敗被上層 catch 成 warn，看起來無害——但它代表群組分支
+ * **從來沒被放掉**，那一群要重做時 `worktree add` 就會失敗，整組 failed。
+ * 實跑每次合併完都噴一次。
+ */
+export async function releaseMergeWorktreeBranch(
+  repoPath: string,
+  baseBranch: string,
+  git: GitRun = defaultGitRun,
+): Promise<void> {
+  // 優先 detach 到遠端的 base（合併後最新的位置）；沒有 remote 就用本地那條
+  for (const ref of [`origin/${baseBranch}`, baseBranch]) {
+    if ((await git(repoPath, ['checkout', '--detach', ref])).exitCode === 0) return;
+  }
+  // 都不行就退回 HEAD——目的只是「不要再佔著群組分支」，停在哪個 commit 不重要
+  const fallback = await git(repoPath, ['checkout', '--detach', 'HEAD']);
+  if (fallback.exitCode !== 0) {
+    throw new Error(`釋放合併工作區失敗：${(fallback.stderr || fallback.stdout).trim()}`);
+  }
+}
+
 export async function createMergePipeline(input: CreateMergePipelineInput): Promise<MergePipelineDeps | undefined> {
   const { log } = input;
 
@@ -741,14 +770,8 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       const r = await git(repoPath, ['fetch', '--quiet', 'origin', baseBranch]);
       if (r.exitCode !== 0) throw new Error(`git fetch origin ${baseBranch} 失敗：${(r.stderr || r.stdout).trim()}`);
     },
-    // 合併工作區用完切回 base，釋放群組分支——否則同一條分支被兩個 worktree 占住，
-    // 群組要重做時建不了任務 worktree，整組 failed（實跑撞到）。
-    releaseBranch: async (repoPath, baseBranch) => {
-      const r = await git(repoPath, ['checkout', baseBranch]);
-      if (r.exitCode !== 0) {
-        throw new Error(`切回 ${baseBranch} 失敗：${(r.stderr || r.stdout).trim()}`);
-      }
-    },
+    // 合併工作區用完要放掉群組分支（見 releaseMergeWorktreeBranch）
+    releaseBranch: (repoPath, baseBranch) => releaseMergeWorktreeBranch(repoPath, baseBranch, git),
   };
 }
 

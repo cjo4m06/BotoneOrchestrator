@@ -89,7 +89,13 @@ export interface ReviewerDeps {
 
 const DEFAULT_MAX_DIFF_CHARS = 60_000;
 /** reviewer 只讀不寫：限制工具集，避免它「順手把問題改掉」而失去審查意義。 */
-const REVIEWER_TOOLS = ['Read', 'Glob', 'Grep'];
+// Bash 一定要留：審查者要跑 `git diff`、`grep -rn`、`find` 才查得動「這個實作有沒有符合規格」。
+// 它跑在 readonly policy 底下（見 agent-runtime 的 evaluateReadonlyCommand），
+// 只能執行查詢類指令——邊界劃在「指令」而不是「工具」。
+//
+// 先前這份清單只交給 SDK 的 allowedTools，而那個對工具不具強制力，所以少列 Bash 沒有後果；
+// 改成由 PreToolUse hook 強制之後，少列就等於**默默拿掉它一直在用的能力**（實跑撞到）。
+const REVIEWER_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
 
 export class Reviewer {
   constructor(private deps: ReviewerDeps) {}

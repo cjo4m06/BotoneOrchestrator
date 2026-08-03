@@ -66,7 +66,7 @@ const VerdictSchema = z.union([
 ]);
 
 /** 判斷者只能看，不能動。跟其他判斷者同一個原則：判斷交給 agent，邊界由程式守住。 */
-export const RISK_JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame'];
+export const RISK_JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', 'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame'];
 
 const SYSTEM_PROMPT =
   '你是合併前的最後一道人工判斷。你的唯一問題是：**這個改動要是做錯了，救得回來嗎？**'

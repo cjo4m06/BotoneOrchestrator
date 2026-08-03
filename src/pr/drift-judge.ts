@@ -75,7 +75,9 @@ export interface DriftJudgeDeps {
 }
 
 /** 判斷者只讀不寫：它的職責是判斷，不是順手把問題改掉。 */
-const JUDGE_TOOLS = ['Read', 'Glob', 'Grep'];
+// Bash 一定要留：語意飄移判斷要跑 git 查詢與 grep 才看得出「改的東西有沒有超出任務範圍」。
+// 它跑在 readonly policy 底下，只能執行查詢類指令（見 reviewer.ts 同一段說明）。
+const JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
 
 const SYSTEM_PROMPT =
   '你在判斷兩份各自正確的變更合併之後，產品行為會不會自相矛盾。' +

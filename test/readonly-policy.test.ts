@@ -209,3 +209,36 @@ test('四個唯讀角色都把 PreToolUse hook 接到 query 上', () => {
     assert.match(src, /(?:^|[\s,{])hooks:\s*\{\s*PreToolUse/m, `${who}（${file}）沒有掛 PreToolUse hook —— allowedTools 擋不住工具`);
   }
 });
+
+/**
+ * **把 allowTools 變成強制的，就不能少列任何一個原本在用的工具。**
+ *
+ * 實跑災情：allowedTools 先前對工具不具強制力，所以清單少列 Bash 沒有後果——
+ * reviewer／飄移判斷者／合併風險判斷者都一直在用它跑 git 查詢與 grep。
+ * 改成由 PreToolUse hook 強制之後，少列就等於默默拿掉它們的能力：
+ *
+ *   WARN 政策閘門擋下工具呼叫  toolName: "Bash"  reason: "紅線：這個工具不在允許清單內：Bash。"
+ *
+ * 而它們的職責就是「去查證」，沒有 Bash 等於瞎了。
+ */
+test('要查證的角色都必須有 Bash', () => {
+  const roles = [
+    ['src/worker/reviewer.ts', 'REVIEWER_TOOLS', 'reviewer（要跑 git diff／grep 核對規格）'],
+    ['src/pr/drift-judge.ts', 'JUDGE_TOOLS', '語意飄移判斷者（要看改動有沒有超出範圍）'],
+    ['src/core/merge-risk-judge.ts', 'RISK_JUDGE_TOOLS', '合併風險判斷者'],
+    ['src/core/plan-agent.ts', 'PLAN_TOOLS', '規劃 agent（find/grep 批次查詢）'],
+  ] as const;
+
+  for (const [file, constName, who] of roles) {
+    const src = readFileSync(file, 'utf8');
+    const line = new RegExp(`${constName}[^=]*=\\s*\\[([^\\]]*)\\]`, 's').exec(src)?.[1] ?? '';
+    assert.match(line, /'Bash'/, `${who} 的工具清單少了 Bash —— 它跑在 readonly policy 底下，只能執行查詢類指令，不給等於讓它瞎了`);
+  }
+});
+
+/** 介面判斷者是例外：它有專屬的唯讀 git 工具，不需要 Bash（刻意的設計）。 */
+test('介面判斷者用專屬的唯讀 git 工具，不需要 Bash', () => {
+  const src = readFileSync('src/worker/ui-judge.ts', 'utf8');
+  assert.match(src, /mcp__git__git_diff/, '沒有 Bash 就一定要有唯讀 git，否則它查不出「這次改了什麼」');
+  assert.match(src, /mcp__git__git_log/);
+});
