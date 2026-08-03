@@ -182,7 +182,16 @@ describe('Worker — 人回覆後接回原 session', () => {
     );
   });
 
-  it('沒有人類回覆 → 不 resume、不注入（全新一輪）', async () => {
+  /**
+   * 這條原本鎖的是「沒有人類回覆就開全新 session」。那是錯的：
+   * daemon 重啟後、或群組被重新派工時，agent 會完全不記得自己上一輪做過什麼，
+   * 先前試過又放棄的方向可能再試一次。
+   *
+   * 現在一律續接同一個任務的 session；只有「注入人工答覆」才看 pending。
+   * session 存在 Claude Code engine 的磁碟上，不是行程記憶體，重啟後接得回來；
+   * 真過期了 iterate 會自己降級開新的。
+   */
+  it('沒有人類回覆 → 照樣續接同一個 session，但不注入答覆', async () => {
     const { Worker } = await import('../src/worker/worker.js');
     const { ProgressMonitor } = await import('../src/worker/progress.js');
     const { makeTaskDetail } = await import('./helpers/index.js');
@@ -219,7 +228,7 @@ describe('Worker — 人回覆後接回原 session', () => {
 
     await worker.runTask({ task, cwd: '/tmp/wt', verifierConfig: { test: 'exit 0' } });
 
-    assert.equal(inputs[0]?.resume, undefined);
-    assert.equal(inputs[0]?.answer, undefined);
+    assert.equal(inputs[0]?.resume, 's-old', '同一個任務要記得自己上一輪做過什麼');
+    assert.equal(inputs[0]?.answer, undefined, '沒有待注入的答覆就不該注入');
   });
 });

@@ -1,9 +1,10 @@
-import { test, describe, it } from 'node:test';
+import { test, describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { hasClaudeAuth } from '../src/worker/reviewer.js';
 import {
   InstanceLockedError,
   acquireInstanceLock,
@@ -15,6 +16,7 @@ import {
   createMcpClient,
   createMergePipeline,
   createShutdown,
+  applyClaudeAuth,
   ensureMergeWorkspace,
   externalActionFlags,
   hasRemote,
@@ -1199,5 +1201,94 @@ describe('hasRemote — 專案走不走得完整條路', () => {
 
   it('git 查不到 → 放行，讓後續流程去報真正的錯', async () => {
     assert.equal(await hasRemote('/r', 'origin', fake('', 128)), true);
+  });
+});
+
+/**
+ * reviewer 與所有判斷者（分群／介面／飄移／風險）都是**在 daemon 自己的行程裡**
+ * 直接呼叫 query()，只看 process.env。寫程式的 agent 不一樣——它走子行程，
+ * 認證是注入進去的，所以它能跑不代表判斷者能跑。
+ *
+ * 實跑撞到：把認證搬進 DB、正式資料夾是全新 clone（沒有 .env），於是
+ *   · reviewer  → 「未設定 Claude 認證」直接略過（DoD 綠燈但沒人審過）
+ *   · 分群 agent → 沒接線 → 退回啟發式 → 足跡混進整個目錄 → 任何兩群都重疊
+ * 而日誌只有一行 WARN，「Claude 認證已載入」還照印——那行只證明讀得到設定。
+ */
+describe('applyClaudeAuth — 認證要套進本行程，判斷者才跑得起來', () => {
+  it('DB 有認證、環境沒有 → 套進去，hasClaudeAuth 才會是 true', () => {
+    const env: NodeJS.ProcessEnv = {};
+    assert.equal(hasClaudeAuth(env), false, '前提：環境本來沒有');
+    const applied = applyClaudeAuth({ authToken: 'tok', baseUrl: 'https://x' }, env);
+    assert.deepEqual(applied, ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']);
+    assert.equal(hasClaudeAuth(env), true, '套完之後判斷者才用得到');
+  });
+
+  it('API key 也算', () => {
+    const env: NodeJS.ProcessEnv = {};
+    applyClaudeAuth({ apiKey: 'sk-x' }, env);
+    assert.equal(env.ANTHROPIC_API_KEY, 'sk-x');
+    assert.equal(hasClaudeAuth(env), true);
+  });
+
+  /** 使用者用 .env 或 launchd 明確指定時，不該被 DB 的舊值蓋掉。 */
+  it('環境變數優先，不被 DB 覆寫', () => {
+    const env: NodeJS.ProcessEnv = { ANTHROPIC_AUTH_TOKEN: '環境的' };
+    const applied = applyClaudeAuth({ authToken: 'DB 的' }, env);
+    assert.equal(env.ANTHROPIC_AUTH_TOKEN, '環境的');
+    assert.deepEqual(applied, [], '沒套用任何東西');
+  });
+
+  it('空字串／空白視為沒設定（不會把 env 洗成空值）', () => {
+    const env: NodeJS.ProcessEnv = {};
+    assert.deepEqual(applyClaudeAuth({ authToken: '  ', apiKey: '', baseUrl: undefined }, env), []);
+    assert.equal(hasClaudeAuth(env), false);
+  });
+});
+
+/**
+ * 上面那組測的是 applyClaudeAuth 這個函式本身。但這個 bug 的本質不是函式壞掉，
+ * 是**沒有人呼叫它**——能力存在、接線沒接，而症狀只有一行 WARN。
+ *
+ * 所以真正要鎖的是：建 pipeline 就一定先套過認證。放在 buildPipeline 裡
+ * （而不是 main()）就是為了這個：main() 沒辦法在單元測試裡跑，buildPipeline 可以。
+ */
+describe('buildPipeline 一定會先套用 Claude 認證', () => {
+  const KEYS = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'] as const;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+    for (const k of KEYS) delete process.env[k];
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  it('認證只在設定裡（環境沒有）→ 建完 pipeline 後判斷者用得到', () => {
+    assert.equal(hasClaudeAuth(), false, '前提：環境本來沒有');
+    const tmp = createTmpLedger();
+    try {
+      const dir = createTmpDir();
+      const config = loadConfig(dir.path);
+      // 認證只存在設定裡（＝控制台存進 DB 的情況），環境變數是空的
+      config.orchestrator.agent = { authToken: 'tok-from-db', baseUrl: 'https://gw.example' };
+      buildPipeline({
+        config,
+        ledger: tmp.ledger,
+        log: createSilentLogger(),
+        gateway: fakeGateway().gateway,
+        registry: emptyRegistry(),
+        allowLocalMerge: false,
+        worktreeBase: dir.join('worktrees'),
+      });
+      dir.cleanup();
+      assert.equal(hasClaudeAuth(), true, 'reviewer 與所有判斷者靠這個決定要不要接線');
+      assert.equal(process.env.ANTHROPIC_BASE_URL, 'https://gw.example');
+    } finally {
+      tmp.cleanup();
+    }
   });
 });

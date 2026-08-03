@@ -216,6 +216,47 @@ export function resolveFlag(env: NodeJS.ProcessEnv, key: string, fromConfig: boo
  * 已有環境變數時不覆蓋：外部注入（launchd / shell）應優先於設定檔。
  * 回傳只描述動作，永遠不回傳 token 本身，避免被記進 log。
  */
+/**
+ * 把 DB 裡的 Claude 認證套進**本行程的** process.env。
+ *
+ * ── 為什麼需要，以及少了它會發生什麼 ──
+ *
+ * 寫程式的 agent 走 AgentRuntime，認證是**注入子行程環境**的（envOverrides），
+ * 所以它不看 process.env 也能跑。但 reviewer、分群 agent、介面判斷者、語意飄移判斷者、
+ * 合併風險判斷者全都是**在 daemon 自己的行程裡**直接呼叫 query()——它們只看 process.env。
+ *
+ * launchd 的環境沒有 ANTHROPIC_*（那是刻意的：金鑰不該寫進 plist），於是實跑變成：
+ *   · reviewer     → 「未設定 Claude 認證」直接略過（DoD 綠燈但沒人審過）
+ *   · 分群 agent    → 沒接線 → 退回啟發式分群 → 足跡混進整個目錄
+ *                    （實跑：一群 4 個任務、描述只指名 5 個檔案，足跡卻宣稱 131 個，
+ *                      裡面有 apps/web/components、docs 這種目錄項——於是任何兩群
+ *                      都重疊，併發調到 3 也永遠只跑得動一群）
+ *   · 介面判斷者    → 略過（視覺關卡會因此判紅，那個至少會吵）
+ *
+ * 最糟的是**它們全部安靜地降級**：日誌只有一行 WARN，而 DoD 照樣綠燈。
+ * 「Claude 認證已載入」那行也騙人——它只表示「讀得到設定」，不代表用得到。
+ *
+ * 回傳實際套用了哪些變數，讓呼叫端把它印出來（看得到才知道有沒有生效）。
+ */
+export function applyClaudeAuth(
+  cfg: { authToken?: string; apiKey?: string; baseUrl?: string },
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const applied: string[] = [];
+  const set = (key: string, value: string | undefined): void => {
+    const v = value?.trim();
+    if (!v) return;
+    // 環境變數優先：使用者用 .env 或 launchd 明確指定時，不該被 DB 蓋掉
+    if (env[key]?.trim()) return;
+    env[key] = v;
+    applied.push(key);
+  };
+  set('ANTHROPIC_AUTH_TOKEN', cfg.authToken);
+  set('ANTHROPIC_API_KEY', cfg.apiKey);
+  set('ANTHROPIC_BASE_URL', cfg.baseUrl);
+  return applied;
+}
+
 export function applyGithubToken(token: string | undefined, env: NodeJS.ProcessEnv, log?: Logger): 'set' | 'kept' | 'absent' {
   return createGithubTokenApplier(env, log)(token);
 }
@@ -1192,6 +1233,22 @@ export interface Pipeline {
 export function buildPipeline(input: PipelineInput): Pipeline {
   const { config, ledger, log, gateway, registry } = input;
 
+  // **認證必須在建判斷者之前套進本行程的 env。**
+  //
+  // 放在這裡而不是 main()：下面每一個 `hasClaudeAuth() ? ... : {}` 都是靠 process.env
+  // 決定要不要接線。認證只在 DB 裡（正式資料夾是全新 clone，沒有 .env）的話，
+  // 它們會全部安靜地不接——reviewer 略過、分群退回啟發式，而 DoD 照樣綠燈。
+  //
+  // main() 也呼叫一次是無害的（applyClaudeAuth 不覆寫既有環境變數）；
+  // 但真正的保證在這裡：**要建 pipeline 就一定先套過認證**，不會有人忘了接。
+  applyClaudeAuth(config.orchestrator.agent, process.env);
+  if (!hasClaudeAuth()) {
+    log.error(
+      'Claude 認證不可用：reviewer 與分群／介面／飄移／風險判斷者**全部不會接線**，'
+        + '而 DoD 仍會綠燈。請檢查「設定 → Claude 認證」或 .env 的 ANTHROPIC_AUTH_TOKEN／API_KEY。',
+    );
+  }
+
   // ★ 需求 7 的接線核心：整個 daemon 只有這一個實例。
   //   可由外部注入，因為 InboundRouter 比 buildPipeline 更早建立，而人在 Slack／CLI
   //   退回時附的意見要寫進**同一個** store 才有人讀得到。
@@ -1394,6 +1451,9 @@ export async function main(): Promise<void> {
   // 只看環境變數的話，把 token 搬進 DB 之後每次啟動都會噴一個假警告——
   // 假警告比沒有警告更糟，因為它會讓人學會忽略這一行。
   const agentCfg = config.orchestrator.agent;
+  // **一定要套進本行程的 env**：reviewer 與所有判斷者（分群／介面／飄移／風險）
+  // 都是 in-process 呼叫 query()，只看 process.env。少了這一步它們會全部安靜地略過。
+  const appliedAuth = applyClaudeAuth(agentCfg, process.env);
   const authed = Boolean(agentCfg.authToken || agentCfg.apiKey) || auth.method !== 'none';
   if (!authed) log.warn('未設定 Claude 認證（控制台「設定 → Claude 認證」或環境變數）；agent 實跑會失敗');
   else {
@@ -1401,6 +1461,9 @@ export async function main(): Promise<void> {
       {
         source: agentCfg.authToken || agentCfg.apiKey ? '資料庫' : '環境變數',
         baseUrl: agentCfg.baseUrl || auth.baseUrl || '(預設)',
+          // 印出來才看得到「有沒有真的生效」——先前只印「已載入」，而那只表示讀得到設定
+          套進本行程: appliedAuth.length ? appliedAuth.join(', ') : '（沿用既有環境變數）',
+          審查者與判斷者可用: hasClaudeAuth(process.env),
       },
       'Claude 認證已載入',
     );
@@ -1416,6 +1479,15 @@ export async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
+
+  // 認證讀得到卻套不進本行程 = reviewer 與所有判斷者全部略過，而 DoD 照樣綠燈。
+  // 這是「靜默地少做事」，必須吵出來。
+  if (authed && !hasClaudeAuth(process.env)) {
+    log.error(
+      '⚠️ Claude 認證讀得到但套不進本行程環境：reviewer 與分群／介面／飄移／風險判斷者'
+        + '**全部會被略過**，而 DoD 仍會綠燈。請檢查「設定 → Claude 認證」的 Auth Token / API Key。',
+    );
+  }
     throw e;
   }
 

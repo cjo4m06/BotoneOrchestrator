@@ -884,6 +884,24 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     assert.equal(tmp.ledger.getGroup(group.id)?.state, 'in_review');
   });
 
+  /**
+   * 被 reviewer／Merge Guard 打回來重做時，agent 先前是用**全新對話**在修。
+   * 審查意見會透過 feedback 進提示詞，所以它知道「要修什麼」，但不知道自己
+   * 上一輪為什麼那樣寫、試過哪些方向、哪條路已經撞牆——等於每次被退回都
+   * 重新認識這個任務一次。
+   */
+  it('rework 時續接同一個 session（要記得自己上一輪做過什麼）', async () => {
+    const group = seedGroup(['已完成的任務']);
+    tmp.ledger.updateTaskState('T-1', 'done');
+    tmp.ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-上一輪' });
+    const agent = fakeAgent();
+    const h = build({ agent, feedback: fakeFeedback(reviewFeedback(group.id, ['@bob: 這個命名要改'])) });
+  
+    await h.runner.run(group);
+  
+    assert.equal(agent.calls[0]?.resumeSessionId, 's-上一輪');
+  });
+  
   it('群內任務都已 done + 有審查意見 → 走 rework 迴圈修正並提交，全程不碰 MCP', async () => {
     const group = seedGroup(['已完成的任務']);
     tmp.ledger.updateTaskState('T-1', 'done');

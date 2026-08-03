@@ -1100,7 +1100,16 @@ export class GroupRunner {
     // 所以另外記下重做開始時的 HEAD，用「分支有沒有往前」當作真正的判準。
     const headBefore = await gitHeadRef(wtPath).catch(() => undefined);
 
-    let session: string | undefined;
+    // **續接同一個 session。**
+    //
+    // 先前這裡是 undefined 起手，也就是每次被 reviewer／Merge Guard 打回來重做，
+    // agent 都是用**全新對話**在修。審查意見會透過 feedback 進提示詞，所以它知道
+    // 「要修什麼」，但不知道自己上一輪為什麼那樣寫、試過哪些方向、哪條路已經撞牆。
+    // 等於每次被退回都重新認識這個任務一次。
+    //
+    // 能力本來就有：agent_sessions 存了 session_id，iterate 吃 resumeSessionId，
+    // 連 session 過期的降級路徑都寫好了（開新的，不讓整輪報銷）。只是沒去撈。
+    let session: string | undefined = this.deps.ledger.latestAgentSession(task.id)?.sessionId;
     let feedback: GateReport | undefined = gate;
     let committedAny = false;
 

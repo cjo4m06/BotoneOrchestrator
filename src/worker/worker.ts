@@ -220,7 +220,15 @@ export class Worker {
     // 3) 監督迴圈
     //    人回覆過就接回原 session 並注入答案；沒有回覆則是全新一輪（session 從頭開始）。
     const pending = this.pendingReply(task.id);
-    let session = pending ? this.deps.ledger.latestAgentSession(task.id)?.sessionId : undefined;
+    // **不只等人回覆時才續接。**
+    //
+    // 先前只有 pending（有待注入的人工答覆）才撈 session，其餘一律開新的。
+    // 於是 daemon 重啟後、或群組被重新派工時，agent 完全不記得自己上一輪做過什麼——
+    // 它會從零重新理解任務，先前試過又放棄的方向可能再試一次。
+    //
+    // session 存在 Claude Code engine 的磁碟上，不是我們行程的記憶體，重啟後照樣接得回來；
+    // 真的過期了 iterate 會自己降級開新的（isResumeFailure），不會讓這一輪報銷。
+    let session = this.deps.ledger.latestAgentSession(task.id)?.sessionId;
     let answer = pending ? { question: pending.question, answer: pending.answer } : undefined;
     if (pending) {
       log.info(
