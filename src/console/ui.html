@@ -379,7 +379,50 @@
           全綠才算完成——這是它唯一無法自己宣稱通過的關卡。
           填了 devServer 才會啟動瀏覽器做視覺驗證與截圖。
         </div>
-      </div>
+        </div>
+
+        <label for="p-cmdtimeout">指令逾時（秒）</label>
+        <input type="number" id="p-cmdtimeout" min="1" placeholder="留空 = 用全域設定">
+        <div class="hint">
+          單一驗收指令跑多久算逾時。<strong>逾時會被判成紅燈</strong>，而 agent 收到的訊息是
+          「測試失敗」——它會開始修一個沒壞的東西。要 migrate 資料庫、跑多語言測試的專案，
+          全域那個值通常不夠，在這裡覆寫。
+        </div>
+
+        <label for="p-routes" style="align-self:start;padding-top:6px">視覺驗證</label>
+        <div>
+          <input type="text" id="p-routes" placeholder="要看的路由：/, /settings（逗號分隔；留空 = 不做視覺驗證）" autocomplete="off">
+          <div class="hint" style="grid-column:auto;margin-top:8px">
+            填了路由才會啟動瀏覽器。判斷者會自己導頁、操作、改視窗尺寸，然後判斷畫面行不行。
+            <strong>路由亂填的話它會在不相干的頁面上打轉</strong>——只填這次改動會影響到的頁面。
+          </div>
+
+          <table class="cmds" style="margin-top:10px">
+            <tr><th>項目</th><th>設定</th></tr>
+            <tr>
+              <td>時機<div class="why">什麼時候啟動瀏覽器</div></td>
+              <td><select id="p-when">
+                <option value="auto">auto（依任務類別判斷）</option>
+                <option value="always">always（每個任務都跑）</option>
+                <option value="never">never（完全不跑）</option>
+              </select></td>
+            </tr>
+            <tr>
+              <td>視窗尺寸<div class="why">名稱:寬x高，逗號分隔</div></td>
+              <td><input type="text" id="p-breakpoints" placeholder="desktop:1280x800, mobile:390x844（留空 = 375/768/1440）" autocomplete="off"></td>
+            </tr>
+            <tr>
+              <td>就緒逾時<div class="why">dev server 起多久算超時（秒）</div></td>
+              <td><input type="number" id="p-serverready" min="1" placeholder="留空 = 60"></td>
+            </tr>
+          </table>
+          <div class="hint" style="grid-column:auto;margin-top:8px">
+            預先截圖只涵蓋你列的那幾個寬度，<strong>中間那些寬度沒有任何證據</strong>——
+            判斷者會被告知這件事並自己去掃縫隙，但斷點挑得好可以省它很多時間。
+            大型專案 dev server 冷啟動常常超過 60 秒，等不到會被當成「環境缺件」而跳過視覺驗證。
+          </div>
+        </div>
+
     </form>
   </div>
   <div class="foot">
@@ -580,6 +623,12 @@ async function openEditor(p) {
   $('p-url').value = raw.mcp?.url ?? '';
   $('p-token').value = raw.mcp?.token ?? '';
   for (const k of CMD_KEYS) $('c-' + k).value = raw.commands?.[k] ?? '';
+  $('p-cmdtimeout').value = raw.commandTimeoutSec ?? '';
+  $('p-routes').value = (raw.visual?.routes ?? []).join(', ');
+  $('p-when').value = raw.visual?.when ?? 'auto';
+  $('p-breakpoints').value = (raw.visual?.breakpoints ?? [])
+    .map((b) => `${b.name}:${b.width}x${b.height}`).join(', ');
+  $('p-serverready').value = raw.visual?.serverReadyTimeoutMs ? raw.visual.serverReadyTimeoutMs / 1000 : '';
   $('deleteProject').hidden = !p;
   await loadBranches(raw.baseBranch ?? '');
   $('projectDialog').showModal();
@@ -629,6 +678,24 @@ function formProject() {
   };
   if ($('p-base').value) out.baseBranch = $('p-base').value;
   if ($('p-quiet').value !== '') out.quietPeriodMinutes = Number($('p-quiet').value);
+  if ($('p-cmdtimeout').value !== '') out.commandTimeoutSec = Number($('p-cmdtimeout').value);
+
+  // 視覺設定：routes 留空就整組不送（＝ 這個專案不做視覺驗證，完全不啟瀏覽器）
+  const routes = $('p-routes').value.split(',').map((x) => x.trim()).filter(Boolean);
+  const visual = {};
+  if (routes.length) visual.routes = routes;
+  if ($('p-when').value !== 'auto') visual.when = $('p-when').value;
+  // "desktop:1280x800, mobile:390x844" → [{name,width,height}]
+  const bpRaw = $('p-breakpoints').value.split(',').map((x) => x.trim()).filter(Boolean);
+  const bps = bpRaw.map((x) => {
+    const m = /^([A-Za-z0-9_-]+)\s*:\s*(\d+)\s*[xX*]\s*(\d+)$/.exec(x);
+    return m ? { name: m[1], width: Number(m[2]), height: Number(m[3]) } : null;
+  });
+  if (bps.some((b) => b === null)) throw new Error('視窗尺寸格式應為 名稱:寬x高，例如 desktop:1280x800');
+  if (bps.length) visual.breakpoints = bps;
+  if ($('p-serverready').value !== '') visual.serverReadyTimeoutMs = Number($('p-serverready').value) * 1000;
+  if (Object.keys(visual).length) out.visual = visual;
+
   return out;
 }
 

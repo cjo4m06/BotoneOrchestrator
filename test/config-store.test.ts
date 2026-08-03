@@ -284,3 +284,28 @@ describe('yaml → DB 一次性遷移', () => {
     assert.ok(rec.messages('warn').some((m) => m.includes('yaml 改名失敗')));
   });
 });
+
+/**
+ * 控制台的埠也要分 profile。
+ *
+ * 兩邊都寫死 8787 的話，在開發資料夾開一次控制台就會搶掉正式那份的埠——
+ * 症狀是「正式的控制台起不來」或「打開看到的是測試的資料」，兩種都很難查。
+ * 這是繼 ledger、產出目錄之後第三個被共用的資源。
+ */
+describe('控制台的埠依 profile 分開', () => {
+  it('正式 8787、測試 8788', () => {
+    assert.equal(loadBootstrap({}, '/base').consolePort, 8787);
+    assert.equal(loadBootstrap({ ORCH_PROFILE: 'test' }, '/base').consolePort, 8788);
+  });
+
+  it('ORCH_CONSOLE_PORT 覆寫兩者', () => {
+    assert.equal(loadBootstrap({ ORCH_CONSOLE_PORT: '9999' }, '/base').consolePort, 9999);
+    assert.equal(loadBootstrap({ ORCH_PROFILE: 'test', ORCH_CONSOLE_PORT: '9999' }, '/base').consolePort, 9999);
+  });
+
+  it('不合法的值忽略（不會變成 NaN 或 0 而讓伺服器綁到隨機埠）', () => {
+    for (const v of ['', '  ', 'abc', '0', '-1', '70000']) {
+      assert.equal(loadBootstrap({ ORCH_CONSOLE_PORT: v }, '/base').consolePort, 8787, `值：${JSON.stringify(v)}`);
+    }
+  });
+});

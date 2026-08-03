@@ -25,7 +25,7 @@ export async function main(): Promise<void> {
   const ledger = new Ledger(boot.ledgerPath, log);
   ledger.init();
 
-  const port = Number(process.env.ORCH_CONSOLE_PORT ?? 8787);
+  const port = boot.consolePort;
   const server = new ConsoleServer({ store, ledger, log, port });
   const { url } = await server.start();
   console.log(`\n  控制台：${url}\n`);

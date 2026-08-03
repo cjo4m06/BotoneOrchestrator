@@ -1519,7 +1519,7 @@ export async function main(): Promise<void> {
   // 本機控制台。只綁 loopback；帶上 router ⇒ 網頁上的裁決走與 Slack／CLI 相同的那一條路。
   const consoleServer = new ConsoleServer({
     store, ledger, log, router, inProcess: true,
-    port: Number(process.env.ORCH_CONSOLE_PORT ?? 8787),
+    port: boot.consolePort,
   });
   try {
     await consoleServer.start();

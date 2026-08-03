@@ -26,10 +26,22 @@ export interface Bootstrap {
   ledgerPath: string;
   /** 單一實例鎖檔路徑（絕對路徑）。 */
   lockPath: string;
+  /** 控制台的埠（正式 8787、測試 8788；ORCH_CONSOLE_PORT 可覆寫）。 */
+  consolePort: number;
 }
 
 export const DEFAULT_DATA_ROOT = './data';
 export const TEST_DATA_ROOT = './data/test';
+
+/**
+ * 控制台的埠也要分 profile。
+ *
+ * 兩邊都寫死 8787 的話，在開發資料夾開一次控制台就會搶掉正式那份的埠
+ * ——而且症狀是「正式的控制台起不來」或「打開看到的是測試的資料」，兩種都很難查。
+ * 這是資料目錄之外的第三個共用資源（前兩個：ledger、worktree 等產出目錄）。
+ */
+export const DEFAULT_CONSOLE_PORT = 8787;
+export const TEST_CONSOLE_PORT = 8788;
 /** ledger 與鎖檔在各自的 dataRoot 底下，檔名一致（看路徑就知道是哪個 profile）。 */
 export const LEDGER_FILENAME = 'ledger.db';
 export const LOCK_FILENAME = 'orchestrator.lock';
@@ -64,5 +76,13 @@ export function loadBootstrap(env: NodeJS.ProcessEnv = process.env, baseDir = pr
     // 明確指定的路徑優先（e2e harness 會指到自己的暫存目錄）
     ledgerPath: pick(env.ORCH_LEDGER_PATH, join(dataRoot, LEDGER_FILENAME)),
     lockPath: pick(env.ORCH_LOCK_PATH, join(dataRoot, LOCK_FILENAME)),
+    consolePort: consolePortOf(env, profile),
   };
+}
+
+/** 控制台的埠：環境變數優先，其次依 profile。 */
+export function consolePortOf(env: NodeJS.ProcessEnv = process.env, profile: Profile = profileOf(env)): number {
+  const raw = Number(env.ORCH_CONSOLE_PORT);
+  if (Number.isInteger(raw) && raw > 0 && raw < 65536) return raw;
+  return profile === 'test' ? TEST_CONSOLE_PORT : DEFAULT_CONSOLE_PORT;
 }
