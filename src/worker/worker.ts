@@ -2,6 +2,7 @@ import { computeBackoffDelay, realSleep, type BackoffOptions } from '../core/ret
 import { changedSince, gitHeadRef } from './verifier.js';
 import { markHumanReplyConsumed, pendingHumanReply, settledDecisions, type HumanReply } from './human-reply.js';
 import { cardStatusOf } from '../core/card-status.js';
+import { RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { AgentLike, McpTaskClient, Notifier, ReviewerLike, TaskCardProgress, VerifierLike } from '../contracts.js';
@@ -206,15 +207,40 @@ export class Worker {
     const { mcp, agent, verifier, progress, ledger, notifier, diffHash, log } = this.deps;
 
     // 1) 認領（MCP 檢查依賴/指派；signal=依賴未到 → 標 blocked）
+    let detail: TaskDetail;
     const claim = await mcp.startTask(task.id);
     if (!claim.ok) {
       if (claim.kind === 'signal') return this.handleDepsBlocked(task, claim.detail, threadTs);
       // permanent/transient：重試無用或已重試耗盡。留下稽核軌跡，讓人查得到「為什麼這群停在這」
       ledger.logEvent('task', task.id, 'claim_failed', `${claim.kind}：${claim.detail}`);
-      log.error({ taskId: task.id, kind: claim.kind, detail: claim.detail }, '認領失敗且非依賴問題，交由群組停下來處理');
-      return { status: 'error', detail: claim.detail };
+      
+      // **認領不到的最常見原因是「這張卡本來就是我們自己認領的」。**
+      //
+      // daemon 重啟時對帳會把 in_progress 任務推回 queued 重跑，但任務板那一側
+      // 還停在「進行中」——而 MCP 只讓「待辦」被認領，也沒有取消認領的工具。
+      // 於是重新認領必定失敗，而人按重試也永遠是同樣的結果
+      //（實跑：使用者對同一個群按了 4 次，每次 3 分鐘後同樣失敗）。
+      //
+      // 我們手上有本機證據（CLAIM_EVENT）與 get_task 可以查任務板現況，
+      // 兩邊都確認「還是我們的」就直接續做，不必再認領一次。
+      // **只有我們認領過的才走續認領那條路。** 沒有本機認領紀錄時，認領失敗就是
+      // 一般的永久性錯誤（任務不存在、設定錯、指派給別人）——那些要維持原本的
+      // 「交由群組停下來」，而不是給人一句誤導的「請到任務板改回待辦」。
+      if (!ledger.latestEvent('task', task.id, CLAIM_EVENT)) {
+        log.error({ taskId: task.id, kind: claim.kind, detail: claim.detail }, '認領失敗且非依賴問題，交由群組停下來處理');
+        return { status: 'error', detail: claim.detail };
+      }
+
+      const resumed = await this.tryResumeClaim(task);
+      if (resumed.v === 'resume') {
+        log.info({ taskId: task.id }, '這張卡本來就是我們認領的（重啟前），直接續做，不重新認領');
+        detail = resumed.detail;
+      } else {
+        return this.parkUnreclaimable(task, claim.detail, resumed, threadTs);
+      }
+    } else {
+      detail = claim.value;
     }
-    const detail = claim.value;
     // 認領成功 = 依賴已滿足 → 之前累積的「連續受阻」歸零（見 depsBlockStreak）
     ledger.logEvent('task', task.id, CLAIM_EVENT, detail.title);
     // 用 clearBlock 而非 updateTaskState：先前受阻留下的 block:deps 不會自己消失，
@@ -425,6 +451,70 @@ export class Worker {
     log.error({ taskId: detail.id, maxRounds }, '⚠️ 監督迴圈撞到輪數上限，park 交人（可恢復）');
     return { status: 'blocked', reason: 'needs_human', detail: why };
   }
+
+  /**
+   * 認領被拒時，判斷「這張卡是不是本來就是我們認領的」。
+   *
+   * 兩層證據都要對得上才續做——**只信本機會很危險**：ledger 說我們認領過，
+   * 但那張卡可能已經被轉給別人、或被人改回待辦又指派出去。
+   * 只憑本機紀錄就跳過認領，等於去做別人正在做的任務。
+   *
+   *   ① 本機：有沒有 CLAIM_EVENT（我們確實認領過）
+   *   ② 任務板：get_task 回來的狀態還是不是「進行中」、repo 對不對
+   *
+   * 任何一層對不上就不續做——寧可停下來問人，也不要兩個人做同一張卡。
+   */
+  private async tryResumeClaim(
+    task: TaskDetail,
+  ): Promise<{ v: 'resume'; detail: TaskDetail } | { v: 'not_mine'; why: string } | { v: 'unknown'; why: string }> {
+    const { mcp, ledger } = this.deps;
+
+    // ① 本機證據（呼叫端已經先擋過一次，這裡是防禦性的第二道）
+    if (!ledger.latestEvent('task', task.id, CLAIM_EVENT)) {
+      return { v: 'not_mine', why: '本機沒有這張卡的認領紀錄' };
+    }
+
+    // ② 任務板現況。查不到就不猜——「查不到」與「還是我的」是兩件事
+    let board: TaskDetail;
+    try {
+      board = await mcp.getTask(task.id);
+    } catch (e) {
+      return { v: 'unknown', why: `查不到任務板現況：${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (board.repo !== task.repo) return { v: 'not_mine', why: `任務板說它屬於 ${board.repo}` };
+    if (board.status === 'done') return { v: 'not_mine', why: '這張卡在任務板上已經結案' };
+    if (board.status !== 'in_progress') return { v: 'not_mine', why: `任務板狀態是「${board.status}」` };
+
+    return { v: 'resume', detail: board };
+  }
+
+  /**
+   * 認領不回來 → park 交人，並**明講要去哪裡做什麼**。
+   *
+   * 這一類的解法不在這個系統裡：任務板上那張卡還停在「進行中」，而 MCP 沒有
+   * 取消認領的工具。所以這裡刻意不回 `error`（那會讓群組進 failed 終態，
+   * 而人看到的只有一顆按了沒用的重試鈕），改成 blocked:needs_human 並帶上
+   * RECLAIM_BLOCK_PREFIX——待處理清單會把它單獨列成一類，寫清楚要去任務板改回待辦。
+   */
+  private parkUnreclaimable(
+    task: TaskDetail,
+    claimDetail: string,
+    reason: { v: 'not_mine' | 'unknown'; why: string },
+    threadTs: string | undefined,
+  ): TaskOutcome {
+    const { ledger, log } = this.deps;
+    const detail =
+      `${RECLAIM_BLOCK_PREFIX}：${task.id} 認領被拒（${claimDetail}）。${reason.why}。`
+      + '**請到任務板把這張卡改回「待辦」**，改完再按重試——'
+      + '在這裡按重試不會有用，因為任務板沒有取消認領的工具。';
+
+    ledger.setBlock(task.id, 'needs_human', detail);
+    ledger.logEvent('task', task.id, 'reclaim_blocked', detail);
+    log.error({ taskId: task.id, why: reason.why }, '認領不回來，交人處理（要去任務板改狀態）');
+    this.say(threadTs, { type: 'problem', detail }, task);
+    return { status: 'blocked', reason: 'needs_human', detail };
+  }
+
 
   /**
    * 認領被依賴擋下時的處置（缺陷 3）。

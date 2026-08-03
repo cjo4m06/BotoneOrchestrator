@@ -35,14 +35,27 @@ interface FakeMcp extends McpTaskClient {
   docCalls: string[][];
 }
 
-function fakeMcp(over: Partial<{ start: McpOut<TaskDetail>; complete: McpOut<void>; docs: LoadedDoc[] }> = {}): FakeMcp {
+function fakeMcp(
+  over: Partial<{ start: McpOut<TaskDetail>; complete: McpOut<void>; docs: LoadedDoc[]; board: TaskDetail | Error }> = {},
+) {
   const startCalls: string[] = [];
+  const getCalls: string[] = [];
   const completeCalls: { id: string; opts?: { summary?: string } }[] = [];
   const docCalls: string[][] = [];
   return {
     startCalls,
     completeCalls,
     docCalls,
+    getCalls,
+    // 認領被拒時 Worker 會用它查任務板現況——那是「這張還是不是我的」的唯一外部證據
+    async getTask(id: string): Promise<TaskDetail> {
+      getCalls.push(id);
+      if (over.board instanceof Error) throw over.board;
+      return over.board ?? makeTask();
+    },
+    async listTasks() {
+      return [];
+    },
     async startTask(id) {
       startCalls.push(id);
       return over.start ?? { ok: true, value: makeTask() };
@@ -208,6 +221,103 @@ describe('Worker — 單任務監督迴圈', () => {
     await worker.runTask({ task, ...cfg });
 
     assert.equal(reviewer.calls[0]?.baseRef, undefined);
+  });
+
+  // ── 重啟後的續認領 ──
+  //
+  // MCP 只讓「待辦」被認領，而且**沒有取消認領的工具**。daemon 重啟時對帳把
+  // in_progress 任務推回 queued 重跑，但任務板那側還停在「進行中」→ 重新認領必定失敗。
+  // 實跑：使用者對同一個群按了 4 次重試，每次 3 分鐘後同樣失敗。
+
+  const CLAIM_REJECTED: McpOut<TaskDetail> = {
+    ok: false, kind: 'permanent', detail: '任務狀態是「進行中」，不能再次認領（只有「待辦」可以）',
+  };
+
+  it('這張卡本來就是我們認領的 → 直接續做，不重新認領', async () => {
+    const task = makeTask();
+    seed(task);
+    const mcp = fakeMcp({ start: CLAIM_REJECTED, board: { ...task, status: 'in_progress' } });
+    const { worker } = build({ mcp });
+    // 本機證據：我們先前認領過（重啟前）
+    tmp.ledger.logEvent('task', task.id, 'task_claimed', task.title);
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.deepEqual(out, { status: 'done' }, '應該續做完成，而不是停下來等人');
+    assert.deepEqual(mcp.getCalls, [task.id], '要查任務板確認「還是我的」');
+    assert.equal(mcp.completeCalls.length, 1);
+  });
+
+  /**
+   * **這是最重要的一條：不可以去做別人的卡。**
+   * ledger 說我們認領過，但那張卡可能已經被轉給別人、或被改回待辦又指派出去。
+   * 只憑本機紀錄就跳過認領，等於兩個人做同一張卡。
+   */
+  it('任務板說它已經不是我們的 → 停下來交人，不續做', async () => {
+    const task = makeTask();
+    seed(task);
+    const mcp = fakeMcp({ start: CLAIM_REJECTED, board: { ...task, status: 'todo' } });
+    const { worker } = build({ mcp });
+    tmp.ledger.logEvent('task', task.id, 'task_claimed', task.title);
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.equal(out.status, 'blocked');
+    assert.equal(out.status === 'blocked' ? out.reason : '', 'needs_human');
+    assert.equal(mcp.completeCalls.length, 0, '絕不可以結案別人的卡');
+    assert.match(tmp.ledger.getTask(task.id)?.block?.detail ?? '', /認領不回來/);
+  });
+
+  it('任務板說已經結案 → 停下來，不重做', async () => {
+    const task = makeTask();
+    seed(task);
+    const mcp = fakeMcp({ start: CLAIM_REJECTED, board: { ...task, status: 'done' } });
+    const { worker } = build({ mcp });
+    tmp.ledger.logEvent('task', task.id, 'task_claimed', task.title);
+
+    const out = await worker.runTask({ task, ...cfg });
+    assert.equal(out.status, 'blocked');
+    assert.equal(mcp.completeCalls.length, 0);
+  });
+
+  /** 查不到任務板現況 ≠ 還是我的。不敢確認就不要動。 */
+  it('查不到任務板現況 → 停下來，不猜', async () => {
+    const task = makeTask();
+    seed(task);
+    const mcp = fakeMcp({ start: CLAIM_REJECTED, board: new Error('MCP 連不上') });
+    const { worker } = build({ mcp });
+    tmp.ledger.logEvent('task', task.id, 'task_claimed', task.title);
+
+    const out = await worker.runTask({ task, ...cfg });
+    assert.equal(out.status, 'blocked');
+    assert.match(tmp.ledger.getTask(task.id)?.block?.detail ?? '', /查不到它在任務板上的現況|查不到任務板現況/);
+  });
+
+  /** 沒有本機認領紀錄的失敗是一般的永久性錯誤，要維持原本的「交由群組停下來」。 */
+  it('沒認領過的卡認領失敗 → 維持 error，不給誤導的「去改任務板」', async () => {
+    const task = makeTask();
+    seed(task);
+    const mcp = fakeMcp({ start: CLAIM_REJECTED });
+    const { worker } = build({ mcp });
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.equal(out.status, 'error');
+    assert.deepEqual(mcp.getCalls, [], '沒認領過就不必去查任務板');
+  });
+
+  /** 卡住的訊息必須講出「去哪裡做什麼」——按這邊的重試永遠沒用。 */
+  it('認領不回來的說明要指出解法在任務板', async () => {
+    const task = makeTask();
+    seed(task);
+    const { worker } = build({ mcp: fakeMcp({ start: CLAIM_REJECTED, board: { ...task, status: 'todo' } }) });
+    tmp.ledger.logEvent('task', task.id, 'task_claimed', task.title);
+
+    await worker.runTask({ task, ...cfg });
+
+    const detail = tmp.ledger.getTask(task.id)?.block?.detail ?? '';
+    assert.match(detail, /請到任務板把這張卡改回「待辦」/);
+    assert.match(detail, /在這裡按重試不會有用/, '不講的話人會一直按（實跑按了 4 次）');
   });
 
   it('回報現在在哪一步（給控制台的「現在在做什麼」）', async () => {

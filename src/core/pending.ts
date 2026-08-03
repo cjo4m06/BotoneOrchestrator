@@ -1,4 +1,4 @@
-import { NO_CHANGE_BLOCK_PREFIX } from '../notify/notifier.js';
+import { NO_CHANGE_BLOCK_PREFIX, RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Group, Task } from '../types.js';
 
@@ -11,7 +11,19 @@ import type { Group, Task } from '../types.js';
  */
 
 /** 一筆待人處理的事項。 */
-export type PendingKind = 'clarification' | 'no_change' | 'needs_human' | 'merge_approval' | 'stuck_group';
+export type PendingKind =
+  | 'clarification'
+  | 'no_change'
+  | 'needs_human'
+  /**
+   * 認領不回來——**解法不在這個系統裡**。任務板上那張卡還停在「進行中」，
+   * 而 MCP 沒有取消認領的工具。人必須去任務板改回「待辦」，
+   * 在這邊按重試永遠沒用（實跑：使用者按了 4 次，每次 3 分鐘後同樣失敗）。
+   * 所以要跟一般的 needs_human 分開，介面才講得出「去哪裡做什麼」。
+   */
+  | 'reclaim_blocked'
+  | 'merge_approval'
+  | 'stuck_group';
 
 export interface PendingItem {
   kind: PendingKind;

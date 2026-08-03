@@ -23,6 +23,7 @@ import { basename, join, resolve } from 'node:path';
 import type { Group, GroupState, Task, TaskBrief, TaskState } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { preferRemoteRef, type GitRunner } from '../git/base-freshness.js';
+import { GROUP_ABORTED_EVENT } from './group-runner.js';
 
 // ── 可注入的相依 ──
 
@@ -38,6 +39,11 @@ export interface ReconcilerLedger {
   updateTaskState(id: string, state: TaskState, extra?: { lastError?: string; groupId?: string; incAttempts?: boolean }): void;
   updateGroupState(id: string, state: GroupState, extra?: { prUrl?: string; prNumber?: number }): void;
   logEvent(scope: 'task' | 'group' | 'system', refId: string | null, kind: string, detail?: string): void;
+  /**
+   * 查最近一筆事件。用來認出「上次是被停止而中斷的」——那種群組的 worktree 裡
+   * 有未 commit 的工作，絕不可以走清理路徑。
+   */
+  latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
   /** 可選：刪除 created_at 早於 cutoffMs 的稽核事件，回傳刪除筆數。 */
   pruneEvents?(cutoffMs: number): number;
   /** 可選：刪除 created_at 早於 cutoffMs 的迭代紀錄，但每個任務至少保留 keepPerTask 筆。 */
@@ -495,6 +501,21 @@ export class Reconciler {
     // 4) 沒有任何 commit、也沒有已完成任務 → 清乾淨重做。
     //    但這一步會刪掉 worktree 裡未 commit 的東西：MCP 證據暫時拿不到時（可能有任務其實已 done）
     //    先延後，等下次對帳資訊齊全再決定。沒設定 MCP 的部署不受影響（degraded=false）。
+    // **上次是被停止而中斷的，一律不清理。** agent 做到一半被 SIGTERM 打斷，
+    // 成果就在 worktree 裡而且還沒 commit——「沒有 commit」在這個情境下代表
+    // 「工作還在進行中」，不是「什麼都沒做」。清掉等於每次重啟都把進行中的工作丟掉。
+    if (wtAlive && ledger.latestEvent?.('group', group.id, GROUP_ABORTED_EVENT)) {
+      const requeued = this.requeueGroupTasks(tasks, report, dryRun, '上次被停止而中斷，接回去重跑');
+      if (!dryRun) ledger.updateGroupState(group.id, 'ready');
+      report.groupsRestarted += 1;
+      report.actions.push({
+        scope: 'group', ref: group.id, decision: 'restart',
+        detail: `上次因 daemon 停止而中斷 → 保留 worktree 直接接回去（重排 ${requeued} 個任務）`,
+      });
+      log.info({ group: group.id }, '上次被停止而中斷 → 保留現場接回去跑（不清理）');
+      return;
+    }
+
     if (evidence.degraded && wtAlive) {
       const detail = `證據不完整（${evidence.detail}）：暫不清理 worktree，延後到下次對帳`;
       if (!dryRun) ledger.logEvent('group', group.id, 'reconcile_deferred', detail);

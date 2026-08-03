@@ -6,8 +6,20 @@ import type { IterateInput, IterateResult, LoadedDoc } from './worker/agent-runt
 import type { VerifierConfig, VisualTaskHint } from './worker/verifier.js';
 import type { ReviewOutcome } from './worker/reviewer.js';
 
-/** Worker 需要的 MCP 子集。 */
-export interface McpTaskClient {
+/** Poller 需要的 MCP 讀取子集。 */
+export interface McpReadClient {
+  listTasks(q: { repo?: string; mine?: boolean; status?: 'todo' | 'in_progress' | 'done'; assigneeId?: string }): Promise<TaskBrief[]>;
+  getTask(id: string): Promise<TaskDetail>;
+}
+
+/**
+ * Worker 需要的 MCP 子集。
+ *
+ * **繼承 McpReadClient 是必要的，不是順手。** Worker 在認領被拒時要用 `getTask`
+ * 查任務板現況，才分得出「這張卡本來就是我們認領的」與「它已經是別人的」——
+ * 而那個判斷寫錯的後果是兩個人做同一張卡。設成可選的話漏接不會有任何症狀。
+ */
+export interface McpTaskClient extends McpReadClient {
   startTask(id: string): Promise<McpOut<TaskDetail>>;
   completeTask(id: string, opts?: { summary?: string }): Promise<McpOut<void>>;
   /** 依 docRefs（"path#section"）載入規格內容。 */
@@ -21,11 +33,6 @@ export interface McpTaskClient {
   readDoc?(docType: DocType, fileName: string, section?: string): Promise<string>;
 }
 
-/** Poller 需要的 MCP 讀取子集。 */
-export interface McpReadClient {
-  listTasks(q: { repo?: string; mine?: boolean; status?: 'todo' | 'in_progress' | 'done'; assigneeId?: string }): Promise<TaskBrief[]>;
-  getTask(id: string): Promise<TaskDetail>;
-}
 
 /** AgentRuntime 的結構介面（供注入假件）。 */
 export interface AgentLike {

@@ -65,6 +65,7 @@ export { summarizeFriction, type FrictionSummary } from '../worker/friction.js';
 const ICON: Record<PendingKind, string> = {
   clarification: '❓',
   no_change: '🤔',
+  reclaim_blocked: '🪪',
   needs_human: '🚧',
   merge_approval: '🔒',
   stuck_group: '⚠️',
@@ -73,6 +74,7 @@ const ICON: Record<PendingKind, string> = {
 const KIND_LABEL: Record<PendingKind, string> = {
   clarification: '澄清',
   no_change: '無需改動',
+  reclaim_blocked: '認領不回來',
   needs_human: '待人工',
   merge_approval: '待核准',
   stuck_group: '卡住',

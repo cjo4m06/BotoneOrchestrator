@@ -248,6 +248,14 @@ export const DISPATCHABLE_GROUP_STATE: GroupState = 'ready';
 export const PARKED_GROUP_STATE: GroupState = 'changes_requested';
 
 /** 群組「還在流程中」的狀態：例外收斂時只有這些可以被覆寫成 failed。 */
+/**
+ * 因 daemon 停止而中斷（不是崩潰）。
+ *
+ * 有這個事件的群組：狀態原樣保留、不消耗重派預算、下次開機由對帳接手；
+ * 而且對帳**不可以走清理路徑**——那會刪掉被中斷 agent 尚未 commit 的工作。
+ */
+export const GROUP_ABORTED_EVENT = 'group_aborted';
+
 const IN_FLIGHT_GROUP_STATES: GroupState[] = ['forming', 'ready', 'merge_guard'];
 
 /**
@@ -692,6 +700,25 @@ export class GroupRunner {
       outcome = await this.runGroup(group, proj, wt.path, details, signal);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      
+      // **被停止不是崩潰。** daemon 收到 SIGTERM 時中止訊號一路傳到 agent 與 DoD 指令，
+      // 它們擲出的例外落到這裡，而 SDK 的訊息是「Claude Code process aborted by user」——
+      // 看起來像使用者做錯什麼，實際上就是正常關機。
+      //
+      // 判準用 `signal.aborted` 而不是比對訊息：同一次 abort，SDK 在不同路徑會擲出
+      // 不同的英文字串，比對字串等於把恢復邏輯綁在別人的文案上。
+      //
+      // 這條路**完全不覆寫群組狀態**：abort 可能發生在 forming／merge_guard／pr_open
+      // 任何一個階段，寫成 failed 是終態，會讓開機對帳的恢復決策樹整個失效
+      //（failed 不在 GROUP_LIMBO，對帳根本不看它），於是每次重啟都要人一個一個按重試。
+      if (signal?.aborted) {
+        const state = ledger.getGroup(group.id)?.state;
+        ledger.logEvent('group', group.id, GROUP_ABORTED_EVENT, `${state ?? '?'}：${msg}`);
+        log.info({ group: group.id, state }, '收到停止訊號，中途停下（狀態原樣保留，交下次開機對帳接手）');
+        outcome = { ok: false, keep: true, reason: '收到停止訊號，中途停下' };
+        return;
+      }
+      
       log.error({ group: group.id, err: msg }, '群組執行擲出例外');
       ledger.logEvent('group', group.id, 'group_crashed', msg);
       this.notify(details, { type: 'failed', detail: `群組執行擲出例外：${msg}` });

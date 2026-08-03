@@ -73,8 +73,14 @@ class FakeLedger implements ReconcilerLedger {
     if (!g) throw new Error(`找不到群組 ${id}`);
     this.groups.set(id, { ...g, state, updatedAt: this.clockMs });
   }
-  logEvent(_scope: 'task' | 'group' | 'system', _refId: string | null, kind: string, detail?: string): void {
+  logEvent(scope: 'task' | 'group' | 'system', refId: string | null, kind: string, detail?: string): void {
     this.events.push({ kind, detail });
+    this.byRef.push({ scope, refId, kind, detail });
+  }
+  readonly byRef: { scope: string; refId: string | null; kind: string; detail?: string }[] = [];
+  /** 對帳用它認出「上次是被停止而中斷的」——那種群組的 worktree 絕不可以清掉。 */
+  latestEvent(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined {
+    return [...this.byRef].reverse().find((e) => e.scope === scope && e.refId === refId && e.kind === kind);
   }
   stateOf(id: string): TaskState | undefined {
     return this.tasks.get(id)?.state;
@@ -187,6 +193,30 @@ describe('群組恢復決策', () => {
     assert.deepEqual(git.removedWorktrees, [wtPathOf(g)]);
     assert.deepEqual(git.deletedBranches, [g.branch]);
     assert.equal(ledger.stateOf('t1'), 'queued');
+  });
+
+  /**
+   * **上次被停止而中斷的，絕不可以清掉 worktree。**
+   *
+   * agent 做到一半被 SIGTERM 打斷，成果就在 worktree 裡而且還沒 commit。
+   * 「沒有 commit」在這個情境下代表「工作還在進行中」，不是「什麼都沒做」——
+   * 走清理路徑等於每次重啟都把進行中的工作丟掉。
+   */
+  test('上次因停止而中斷 → 保留 worktree 直接接回去，不清理', async () => {
+    const g = group('g-abort', 'forming', ['t1']);
+    const ledger = new FakeLedger([task('t1', 'in_progress', { groupId: 'g-abort' })], [g]);
+    // GroupRunner 在被停止時留下的痕跡
+    ledger.logEvent('group', 'g-abort', 'group_aborted', 'forming：Claude Code process aborted by user');
+    const fs = new FakeFs(new Set([wtPathOf(g)]));
+    const git = new FakeGit(new Map([[g.branch, 0]])); // 沒有 commit——正是會被清掉的那個條件
+
+    const report = await new Reconciler(makeDeps({ ledger, fs, git })).reconcile();
+
+    assert.deepEqual(git.removedWorktrees, [], 'worktree 裡有未 commit 的工作，不可以刪');
+    assert.deepEqual(git.deletedBranches, [], '分支也不可以刪');
+    assert.equal(report.groupsRestarted, 1, '要接回去跑');
+    assert.equal(ledger.stateOf('t1'), 'queued');
+    assert.equal(ledger.groupStateOf('g-abort'), 'ready', '設成可派工，下一輪自己接回去（不必人按重試）');
   });
 
   test('分支不存在但已有 done 任務 → 成果遺失，標 failed 交人處理（現場一律保留）', async () => {

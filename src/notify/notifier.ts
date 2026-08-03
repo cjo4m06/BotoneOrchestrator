@@ -49,6 +49,15 @@ export class ConsoleNotifier implements Notifier {
  */
 export const NO_CHANGE_BLOCK_PREFIX = '無需改動';
 
+/**
+ * 「認領不回來」的封鎖前綴。
+ *
+ * 這一類要跟一般的 needs_human 分開，因為**解法不在這個系統裡**：
+ * 任務板上那張卡還停在「進行中」，而 MCP 沒有取消認領的工具。
+ * 人必須去任務板把它改回「待辦」，按這邊的重試永遠沒用（實跑：使用者按了 4 次）。
+ */
+export const RECLAIM_BLOCK_PREFIX = '認領不回來';
+
 /** 分類的中文標籤（Slack 版型與稽核共用；worker.ts 的同名表可改用這份，避免兩邊漂移）。 */
 export const NO_CHANGE_CATEGORY_LABEL: Record<NoChangeCategory, string> = {
   already_satisfied: '現況已符合需求',

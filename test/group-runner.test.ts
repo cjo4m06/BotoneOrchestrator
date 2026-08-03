@@ -25,6 +25,7 @@ import type { ReviewFeedback } from '../src/pr/review-watcher.js';
 import type { IterateInput, IterateResult } from '../src/worker/agent-runtime.js';
 import type { GateReport, Group, LifecycleEvent, MergeVerdict, TaskDetail } from '../src/types.js';
 import { createTmpLedger, createRecordingLogger, createSilentLogger, type RecordingLogger, type TmpLedger } from './helpers/index.js';
+import { GROUP_ABORTED_EVENT } from '../src/core/group-runner.js';
 
 // ── 假件（全部注入，測試不碰真實 git / repo） ──
 
@@ -765,6 +766,59 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     assert.equal(tmp.ledger.getGroup(group.id)?.state, 'failed');
     assert.deepEqual(h.wt.removed, [], '失敗現場必須保留');
     assert.ok(rec.messages('warn').some((m) => m.includes('保留 worktree')), 'log 要說明保留原因');
+  });
+
+  /**
+   * **被停止不是崩潰。**
+   *
+   * daemon 收到 SIGTERM 時中止訊號一路傳到 agent 與 DoD 指令，它們擲出的例外落到
+   * GroupRunner 的 catch。SDK 的訊息是「Claude Code process aborted by user」——
+   * 看起來像使用者做錯什麼，實際上就是正常關機。
+   *
+   * 先前這個例外被記成 group_crashed 並寫成 failed（終態），而 failed 不在對帳的
+   * GROUP_LIMBO 裡 → 開機時根本不會被看到，每次重啟都要人一個一個按重試
+   *（實跑 22:03 使用者按了 4 個群）。
+   */
+  it('中止造成的例外不算崩潰：狀態原樣保留，留下可辨識的痕跡', async () => {
+    const group = seedGroup(['做到一半被停止']);
+    const ac = new AbortController();
+    ac.abort();
+    const h = build({
+      agent: {
+        async iterate() {
+          // SDK 在 abort 時就是擲出這句（ProcessTransport）——它不是使用者做錯什麼
+          throw new Error('Claude Code process aborted by user');
+        },
+      },
+    });
+
+    await h.runner.run(group, ac.signal);
+
+    const state = tmp.ledger.getGroup(group.id)?.state;
+    assert.notEqual(state, 'failed', '被停止不該進終態——那會讓開機對帳的恢復路徑失效');
+    assert.ok(
+      tmp.ledger.latestEvent('group', group.id, GROUP_ABORTED_EVENT),
+      '要留下「被停止」的痕跡，事後才分得出這次重啟到底有沒有東西真的壞掉',
+    );
+    assert.equal(tmp.ledger.latestEvent('group', group.id, 'group_crashed'), undefined, '不該被記成崩潰');
+    assert.deepEqual(h.wt.removed, [], '未 commit 的工作在 worktree 裡，絕不可清掉');
+  });
+
+  /** 真的崩潰（沒有中止訊號）仍然要走原本的 failed 路徑。 */
+  it('沒有中止訊號時，例外照舊算崩潰', async () => {
+    const group = seedGroup(['真的爆炸']);
+    const h = build({
+      agent: {
+        async iterate() {
+          throw new Error('真的爆炸了');
+        },
+      },
+    });
+
+    await h.runner.run(group);
+
+    assert.equal(tmp.ledger.getGroup(group.id)?.state, 'failed');
+    assert.ok(tmp.ledger.latestEvent('group', group.id, 'group_crashed'));
   });
 
   // ── 群組狀態一定收斂（不可卡在 forming、可恢復的不可標 failed） ──

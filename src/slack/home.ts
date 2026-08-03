@@ -80,6 +80,7 @@ interface ProjectSlice {
 const KIND_LABEL: Record<PendingItem['kind'], string> = {
   clarification: '待澄清',
   no_change: '待確認不用做',
+  reclaim_blocked: '認領不回來（要先去任務板改）',
   needs_human: '待人工處理',
   merge_approval: '待核准合併',
   stuck_group: '群組卡住',
