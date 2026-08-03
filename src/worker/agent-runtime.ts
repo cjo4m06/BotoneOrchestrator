@@ -29,6 +29,14 @@ export interface IterateInput {
   docs: LoadedDoc[];
   feedback?: GateReport; // 上一輪 DoD 失敗細節（回灌）
   resumeSessionId?: string; // 續接同一 session
+  /**
+   * 中止訊號。daemon 收到 SIGTERM 時一路傳到這裡，讓 SDK 停止查詢並收掉子行程。
+   *
+   * 沒有它的後果實跑過：`stop` 之後 agent 完全不知道要停，繼續寫程式到寬限逾時，
+   * 然後行程被強制結束——它用 Bash 起的 `npm run dev` 就成了孤兒，
+   * 佔著 8843/8880/8888 三個埠活了一個多小時，而沒有任何地方看得到。
+   */
+  signal?: AbortSignal;
   answer?: { question: string; answer: string }; // 澄清答覆注入
 }
 
@@ -309,9 +317,19 @@ export class AgentRuntime {
     const stopState = { blocks: 0 };
     const toolsUsed = new Map<string, number>();
 
+    // SDK 吃的是 AbortController 而不是 AbortSignal，所以把上游的 signal 接過來。
+    // 已經是 aborted 就不要開始——省下一次白跑的查詢。
+    const abortController = input.signal ? new AbortController() : undefined;
+    if (abortController && input.signal) {
+      if (input.signal.aborted) abortController.abort();
+      else input.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+    }
+
     const stream = query({
       prompt: buildAgentPrompt(input),
       options: {
+        // 中止：SDK 會停止查詢並收掉它自己的子行程樹
+        ...(abortController ? { abortController } : {}),
         // 模型別名（opus / sonnet / haiku）。未設 → SDK 預設。
         ...(this.deps.model ? { model: this.deps.model } : {}),
         cwd: input.cwd,

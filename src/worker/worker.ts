@@ -153,6 +153,12 @@ export interface RunTaskInput {
   task: TaskDetail;
   cwd: string; // 群組 worktree 路徑
   verifierConfig: VerifierConfig;
+  /**
+   * 中止訊號（daemon 收到 SIGTERM 時一路傳下來）。
+   * 傳給 agent 與 DoD 指令，讓它們真的停下來並收掉子行程——
+   * 沒有它的話 stop 只是「不再排新工作」，正在跑的完全不知情。
+   */
+  signal?: AbortSignal;
   threadTs?: string;
   /** 所屬群組（session 紀錄用，方便按群彙總成本）。 */
   groupId?: string;
@@ -264,7 +270,7 @@ export class Worker {
       if (maxRounds > 0 && round > maxRounds) return this.parkRoundLimit(detail, maxRounds, feedback, threadTs);
       this.say(threadTs, { type: 'iterating', round }, detail);
 
-      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(answer ? { answer } : {}) });
+      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
         // 只注入一次：不標消費的話，之後每一輪都會再貼一次同樣的答覆，
@@ -320,6 +326,7 @@ export class Worker {
       const gate = await verifier.check({
         cwd,
         config: gateConfig,
+          ...(input.signal ? { signal: input.signal } : {}),
         task: {
           id: detail.id,
           category: detail.category,

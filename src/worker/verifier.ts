@@ -272,7 +272,7 @@ export class Verifier {
 
   constructor(private log: Logger, private deps: VerifierDeps = {}) {}
 
-  async check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint }): Promise<GateReport> {
+  async check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint; signal?: AbortSignal }): Promise<GateReport> {
     const checks: CheckResult[] = [];
     // 「有效關卡數」：真的驗到東西的關卡。說明性質的 check（視覺跳過、設定缺漏）不算數，
     // 否則「什麼都沒驗」會被當成綠燈（沿用原本「空驗證不算通過」的規則）。
@@ -296,7 +296,7 @@ export class Verifier {
     for (const name of ORDER) {
       const cmd = input.config[name];
       if (!cmd) continue;
-      checks.push(await this.runCheck(name, cmd, input.cwd, timeoutOf(input.config, this.deps)));
+      checks.push(await this.runCheck(name, cmd, input.cwd, timeoutOf(input.config, this.deps), input.signal));
       commandsRun += 1;
       effective += 1;
     }
@@ -516,7 +516,7 @@ export class Verifier {
    * 註：shell:true 時 execa 殺的是 shell；孫行程理論上可能殘留（子行程自己 detach 的情況），
    * 但至少監督迴圈能繼續走，不會整個調度器卡死。
    */
-  private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number): Promise<CheckResult> {
+  private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<CheckResult> {
     // 先過部署紅線：關卡指令是以 shell 實跑的，`npm run build` 可能一路展開到 `firebase deploy`。
     // 命中就**拒絕執行**並判紅（fail-closed）——寧可讓任務卡住等人看，也不能誤觸真實部署。
     const redline = await evaluateGateCommandRedline(cmd, cwd);
@@ -537,7 +537,7 @@ export class Verifier {
 
     let res: Awaited<ReturnType<typeof runShell>>;
     try {
-      res = await runShell(cmd, cwd, timeoutMs);
+      res = await runShell(cmd, cwd, timeoutMs, signal);
     } catch (e) {
       // reject:false 之外仍可能丟（cwd 不存在、無法 spawn shell）。跑都跑不起來 = 沒驗到東西，
       // 絕不能當成通過。
@@ -603,13 +603,16 @@ export class Verifier {
 }
 
 /** 實跑關卡指令（獨立成函式，讓呼叫端拿得到 execa 依選項推導出的結果型別）。 */
-function runShell(cmd: string, cwd: string, timeoutMs: number) {
+function runShell(cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal) {
   return execa(cmd, {
     cwd,
     shell: true,
     reject: false,
     all: true,
     timeout: timeoutMs,
+    // 中止時 execa 會殺掉子行程；沒有這個的話 daemon 收到 SIGTERM，
+    // 一個跑了半小時的 `npm test` 照樣會撐到寬限逾時、然後變成孤兒。
+    ...(signal ? { cancelSignal: signal } : {}),
     forceKillAfterDelay: 5_000, // SIGTERM 後還不死就 SIGKILL
   });
 }

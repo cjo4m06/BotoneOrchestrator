@@ -35,7 +35,7 @@ export interface AgentLike {
 /** Verifier 的結構介面（供注入假件）。 */
 export interface VerifierLike {
   // task 為可選提示：視覺關卡靠它做類別篩選與截圖分目錄；不帶則視為「需要驗」。
-  check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint }): Promise<GateReport>;
+  check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint; signal?: AbortSignal }): Promise<GateReport>;
 }
 
 /**

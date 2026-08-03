@@ -75,7 +75,7 @@ export interface ReviewWatcherLike {
 
 /** Dispatcher 的最小介面。`isRunning` 是 merge_guard 兩種語意的判別依據，不可省。 */
 export interface DispatcherLike {
-  dispatch(ready: Group[]): number;
+  dispatch(ready: Group[], signal?: AbortSignal): number;
   isRunning(id: string): boolean;
 }
 
@@ -351,7 +351,11 @@ export class Orchestrator {
     deps.gateway?.onMergeDecision?.((d) => this.onMergeDecision(d));
   }
 
-  async tick(): Promise<void> {
+  /**
+   * @param signal 中止訊號。一路傳到 agent 與 DoD 指令——
+   *   先前只用來停主迴圈，正在跑的工作完全收不到（見 run 的說明）。
+   */
+  async tick(signal?: AbortSignal): Promise<void> {
     const { poller, planner, dispatcher, ledger, log } = this.deps;
 
     // 0) 設定同步（控制台改的東西在這裡生效）。失敗不能讓整輪停擺——
@@ -417,7 +421,7 @@ export class Orchestrator {
       .filter((g) => this.projectAvailable(g))
       .filter((g) => this.depsInBase(g));
     if (ready.length) {
-      if (this.withinBudget(ready.length)) dispatcher.dispatch(ready);
+      if (this.withinBudget(ready.length)) dispatcher.dispatch(ready, signal);
     }
 
     // 5) 監看 PR 審查結果並消費事件（DESIGN §3 步驟 7）
@@ -1349,11 +1353,20 @@ export class Orchestrator {
   }
 
   /** 常駐循環。傳入 AbortSignal 可優雅停止（睡眠中收到 abort 會立刻醒來，不等滿一個週期）。 */
+  /**
+   * @param signal 收到 SIGTERM 時 abort。**它會一路傳到正在跑的 agent 與 DoD 指令**，
+   *   讓它們停下來並收掉自己的子行程。
+   *
+   *   先前這個 signal 只用來停這個迴圈——「不再排新工作」而已。正在寫程式的 agent
+   *   完全不知情，會一直做到收尾寬限逾時，然後整個行程被強制結束；
+   *   它用 Bash 起的 dev server／watch 就跳出 process group 變成孤兒。
+   *   實跑撞到：三個埠被佔了一個多小時，而沒有任何地方看得到。
+   */
   async run(signal?: AbortSignal): Promise<void> {
     this.deps.log.info({ intervalSec: this.currentInterval() }, '主控迴圈啟動');
     while (!signal?.aborted) {
       try {
-        await this.tick();
+        await this.tick(signal);
       } catch (e) {
         this.deps.log.error({ err: e instanceof Error ? e.message : String(e) }, 'tick 發生錯誤（續下一輪）');
       }

@@ -1,7 +1,7 @@
 import type { Group } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 
-export type GroupRunner = (group: Group) => Promise<void>;
+export type GroupRunner = (group: Group, signal?: AbortSignal) => Promise<void>;
 
 /**
  * 併發調度（DESIGN §3 步驟 4 / §D6-D7）：群間並行，但
@@ -45,7 +45,10 @@ export class Dispatcher {
   }
 
   /** 在併發上限內派出可跑的群；回傳本次新派出的數量。 */
-  dispatch(ready: Group[]): number {
+  /**
+   * @param signal 中止訊號，原樣交給每個被派出的群（見 GroupRunner 的說明）。
+   */
+  dispatch(ready: Group[], signal?: AbortSignal): number {
     let started = 0;
     for (const g of ready) {
       if (this.running.size >= this.cap()) break;
@@ -62,7 +65,7 @@ export class Dispatcher {
       this.running.set(g.id, g);
       started += 1;
       this.log.info({ group: g.id, repo: g.repo, active: this.running.size }, '派出群');
-      this.launch(g);
+      this.launch(g, signal);
     }
     return started;
   }
@@ -74,12 +77,12 @@ export class Dispatcher {
    * 該群永遠留在 running map（slot 洩漏，池子最後會漏光）→ 這裡用 try/catch 兜住，
    * 並把同步/非同步兩種失敗收斂成同一條處理路徑。
    */
-  private launch(g: Group): void {
+  private launch(g: Group, signal?: AbortSignal): void {
     const fail = (e: unknown): void =>
       this.log.error({ group: g.id, err: e instanceof Error ? e.message : String(e) }, '群執行失敗');
     try {
       // Promise.resolve 也順便容錯 runner 回傳非 Promise 的情況
-      void Promise.resolve(this.runner(g))
+      void Promise.resolve(this.runner(g, signal))
         .catch(fail)
         .finally(() => this.running.delete(g.id));
     } catch (e) {

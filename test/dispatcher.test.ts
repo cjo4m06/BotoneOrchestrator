@@ -271,3 +271,31 @@ describe('Dispatcher — 階段順序', () => {
     assert.equal(d.dispatch([makeGroup('g2', ['b.ts'], 'acme/web', ['g1'])]), 1);
   });
 });
+
+/**
+ * 中止訊號要一路傳到 agent 與 DoD 指令，不能只停主迴圈。
+ *
+ * 先前 AbortController 只傳給 orchestrator.run()——那只是「不再排新工作」。
+ * 正在寫程式的 agent 完全不知情，會做到收尾寬限逾時，然後整個行程被強制結束；
+ * 它用 Bash 起的 dev server／watch 跳出 process group 就成了孤兒。
+ * 實跑撞到：npm run dev 佔著 8843/8880/8888 活了一個多小時，沒有任何地方看得到。
+ */
+describe('中止訊號要傳到被派出的群', () => {
+  it('dispatch 收到的 signal 會原樣交給 runner', () => {
+    const got: (AbortSignal | undefined)[] = [];
+    const c = controllableRunner();
+    const d = new Dispatcher(4, async (g, s) => { got.push(s); return c.runner(g); }, createSilentLogger());
+    const ac = new AbortController();
+
+    d.dispatch([makeGroup('g1', ['a.ts'])], ac.signal);
+
+    assert.equal(got.length, 1);
+    assert.equal(got[0], ac.signal, 'runner 要拿得到同一個 signal，否則 agent 永遠不知道要停');
+  });
+
+  it('沒傳 signal 也照常運作（舊呼叫端不受影響）', () => {
+    const c = controllableRunner();
+    const d = new Dispatcher(4, c.runner, createSilentLogger());
+    assert.equal(d.dispatch([makeGroup('g1', ['a.ts'])]), 1);
+  });
+});

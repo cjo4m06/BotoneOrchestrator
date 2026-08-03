@@ -624,7 +624,13 @@ export class GroupRunner {
     this.deps.log.warn(ctx, msg);
   }
 
-  run = async (group: Group): Promise<void> => {
+  /**
+   * @param signal daemon 收到 SIGTERM 時傳下來。一路交給 worker → agent → DoD 指令，
+   *   讓它們真的停下來並收掉子行程。沒有它的話 `stop` 只是「不再排新工作」，
+   *   正在跑的 agent 完全不知情，寬限逾時後被強制殺掉——它用 Bash 起的
+   *   dev server／watch 就成了孤兒（實跑：三個埠被佔了一個多小時，沒人看得到）。
+   */
+  run = async (group: Group, signal?: AbortSignal): Promise<void> => {
     const { ledger, log } = this.deps;
     const proj = this.deps.resolveProject(group.repo);
     if (!proj) {
@@ -681,7 +687,7 @@ export class GroupRunner {
     const details: TaskDetail[] = [];
     let outcome: RunOutcome = { ok: false, keep: true, reason: '執行中擲出例外' };
     try {
-      outcome = await this.runGroup(group, proj, wt.path, details);
+      outcome = await this.runGroup(group, proj, wt.path, details, signal);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log.error({ group: group.id, err: msg }, '群組執行擲出例外');
@@ -728,7 +734,7 @@ export class GroupRunner {
   }
 
   /** 群組主流程；回傳執行結果（是否成功、worktree 去留）。 */
-  private async runGroup(group: Group, proj: ProjectRuntime, wtPath: string, details: TaskDetail[]): Promise<RunOutcome> {
+  private async runGroup(group: Group, proj: ProjectRuntime, wtPath: string, details: TaskDetail[], signal?: AbortSignal): Promise<RunOutcome> {
     const { ledger, log } = this.deps;
 
     const recorder = new SummaryRecorder(this.deps.agent, (taskId, text) => {
@@ -790,6 +796,7 @@ export class GroupRunner {
       const threadTs = await this.ensureTaskThread(t, detail);
       const outcome = await worker.runTask({
         task: detail, cwd: wtPath, verifierConfig: proj.verifierConfig, threadTs, groupId: group.id,
+          ...(signal ? { signal } : {}),
         // 給介面判斷者的比較基準：它要靠這個查出「這次改了什麼」，
         // 才不會把整個頁面的既有毛病都算到這次頭上
         baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,

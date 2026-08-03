@@ -871,3 +871,28 @@ describe('taskHintOf', () => {
     assert.deepEqual(Object.keys(h).sort(), ['baseRef', 'id']);
   });
 });
+
+/**
+ * DoD 指令也要能被中止。daemon 收到 SIGTERM 時，一個跑了半小時的 `npm test`
+ * 不該撐到寬限逾時然後被強制殺掉——那正是孤兒行程的來源之一。
+ */
+describe('Verifier — 中止訊號會停掉 DoD 指令', () => {
+  it('signal abort → 指令被殺掉，且不會判成綠燈', async () => {
+    const ac = new AbortController();
+    const v = new Verifier(createSilentLogger());
+    // 一個會跑很久的指令；100ms 後中止
+    setTimeout(() => ac.abort(), 100);
+    const r = await v.check({
+      cwd: process.cwd(),
+      config: { test: 'sleep 30' },
+      signal: ac.signal,
+    });
+    assert.equal(r.green, false, '被中止的關卡不可以算通過');
+  });
+
+  it('沒傳 signal 時行為不變', async () => {
+    const v = new Verifier(createSilentLogger());
+    const r = await v.check({ cwd: process.cwd(), config: { test: 'exit 0' } });
+    assert.equal(r.green, true);
+  });
+});
