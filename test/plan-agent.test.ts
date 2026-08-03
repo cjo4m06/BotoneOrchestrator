@@ -145,10 +145,36 @@ describe('buildPlanPrompt', () => {
     assert.match(p, /分階段是最貴的手段/);
   });
 
-  it('給出規模上限（群太大審不動，群太小每個都要付一輪驗證）', () => {
+  /** 群要多大是判斷題，不是算術題——不要給任何數字，也不要給額外的判準。 */
+  it('不對群的大小設任何限制', () => {
     const p = buildPlanPrompt([task('T-1')]);
-    assert.match(p, /一群最多 \d+ 個任務/);
-    assert.match(p, /files 合計最多 \d+ 個/);
+    assert.doesNotMatch(p, /一群最多 \d+ 個任務/);
+    assert.doesNotMatch(p, /files 合計最多 \d+/);
+    assert.doesNotMatch(p, /規模上限/);
+  });
+
+  /**
+   * **同一份規格的任務要合成一群，就算檔案完全不重疊。**
+   *
+   * 實跑撞到：6 個任務的 docRefs 全部指向同一份
+   * `issues/2026-07-31-mobile-menu-touch-target-below-44px.md`
+   * （同一種修法套用在六個元件），卻被切成 6 個群、6 個 PR。
+   * 每一條 rationale 都寫「獨立…N 個檔案皆無其他任務觸碰」——它是照著
+   * 「只看檔案交集」的判準正確推理的，因為舊版把「內容高度相關」那句刪掉了。
+   */
+  it('把「類似／相關的任務」列為最高優先，且明講與檔案無關', () => {
+    const p = buildPlanPrompt([task('T-1')]);
+    const rules = p.slice(p.indexOf('## 判準'), p.indexOf('## 輸出格式'));
+
+    const series = rules.indexOf('類似的、相關的、屬於同一件事的任務 → 放同一群');
+    const sameFile = rules.indexOf('會動到同一個檔案的任務 → 放同一群');
+    assert.ok(series >= 0, '要有「同一系列」這一條');
+    assert.ok(sameFile >= 0, '「同檔案」那一條要留著');
+    assert.ok(series < sameFile, '系列要排在檔案前面——不然又會變成純檔案分群');
+
+    assert.match(rules, /docRefs 指到同一份文件/, 'docRefs 是最強訊號，而它本來就在提示詞裡');
+    assert.match(rules, /這一條和檔案完全沒有關係/, '不明講的話它會繼續只看檔案交集');
+    assert.match(rules, /「類似」由你判斷/, '要讓它自己判斷相似，不要給封閉的清單');
   });
 
   /** 範例本身就是指示。只示範單任務群，等於默默鼓勵一群一個任務。 */
