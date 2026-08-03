@@ -260,7 +260,14 @@ describe('PmmMcpClient — docRef 解析（loadDocs → read_doc 參數）', () 
     ]);
   });
 
-  it('某段 read_doc 失敗 → 記錄警告並略過該段，其餘照樣載入', async () => {
+  /**
+   * 讀不到的規格**不可以靜默略過**。先前失敗只留一行 warn，agent 連「有這份規格」
+   * 都不知道就去做了——而它做出來的東西 build/test 都會過，看起來完全正常。
+   *
+   * 實跑撞到：任務的 docRef 是 issues/xxx.md，MCP 的 read_doc 只吃單數 issue，
+   * 於是每一個帶 issue 規格的任務，agent 都是沒看過原始稽核報告就開始做的。
+   */
+  it('某段 read_doc 失敗 → 把失敗本身交給 agent，並指名要自己去找', async () => {
     const rec = createRecordingLogger();
     const { client } = makeClient(
       (c) => (c.arguments.fileName === 'bad.md' ? text({ ok: false, error: '找不到文件' }) : text({ body: 'ok' })),
@@ -269,8 +276,29 @@ describe('PmmMcpClient — docRef 解析（loadDocs → read_doc 參數）', () 
 
     const docs = await client.loadDocs(['spec/bad.md', 'spec/good.md']);
 
-    assert.deepEqual(docs, [{ ref: 'spec/good.md', content: 'ok' }]);
-    assert.ok(rec.messages('warn').includes('read_doc 失敗，略過該段'));
+    assert.equal(docs.length, 2, '失敗的那份也要在，不能消失');
+    const bad = docs.find((d) => d.ref === 'spec/bad.md');
+    assert.match(bad?.content ?? '', /讀不到/);
+    assert.match(bad?.content ?? '', /search_docs/, '要指名用哪個工具找');
+    assert.match(bad?.content ?? '', /不要當作它不存在/);
+    assert.deepEqual(docs.find((d) => d.ref === 'spec/good.md'), { ref: 'spec/good.md', content: 'ok' });
+    assert.ok(rec.messages('warn').some((m) => m.includes('read_doc 失敗')));
+  });
+
+  /**
+   * MCP 自己的介面就對不上：list_docs 說文件在 issues/（複數），
+   * read_doc 的 docType 只吃 issue（單數）。任務板給的 docRef 照抄過去必定失敗。
+   */
+  it('docType 單複數不一致由這裡兜掉（issues/ → issue）', async () => {
+    const seen: Record<string, unknown>[] = [];
+    const { client } = makeClient((c) => {
+      seen.push(c.arguments);
+      return text({ body: 'ok' });
+    });
+
+    await client.loadDocs(['issues/a.md', 'specs/b.md', 'prds/c.md', 'spec/d.md']);
+
+    assert.deepEqual(seen.map((a) => a.docType), ['issue', 'spec', 'prd', 'spec']);
   });
 
   it('read_doc 回非 JSON 純文字 → 直接當成內容', async () => {

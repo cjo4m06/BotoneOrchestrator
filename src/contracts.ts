@@ -1,7 +1,7 @@
 // 服務契約（行為介面）——讓 Worker 等模組以介面相依，便於注入假件測試、
 // 也讓 MCP/Slack 具體實作可延後（等你的回應格式）。對映 DESIGN.md §12。
 
-import type { McpOut, TaskBrief, TaskDetail, LifecycleEvent, GateReport } from './types.js';
+import type { McpOut, TaskBrief, TaskDetail, LifecycleEvent, GateReport, DocType } from './types.js';
 import type { IterateInput, IterateResult, LoadedDoc } from './worker/agent-runtime.js';
 import type { VerifierConfig, VisualTaskHint } from './worker/verifier.js';
 import type { ReviewOutcome } from './worker/reviewer.js';
@@ -12,6 +12,13 @@ export interface McpTaskClient {
   completeTask(id: string, opts?: { summary?: string }): Promise<McpOut<void>>;
   /** 依 docRefs（"path#section"）載入規格內容。 */
   loadDocs(refs: string[]): Promise<LoadedDoc[]>;
+  /**
+   * 文件查找工具，會被掛給 agent 自己用（見 worker/docs-server.ts）。
+   * 可選：沒有這些能力的任務板照樣能跑，只是 agent 少了「規格讀不到時自己找」的路。
+   */
+  listDocs?(): Promise<string>;
+  searchDocs?(query: string): Promise<string>;
+  readDoc?(docType: DocType, fileName: string, section?: string): Promise<string>;
 }
 
 /** Poller 需要的 MCP 讀取子集。 */

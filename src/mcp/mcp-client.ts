@@ -150,10 +150,27 @@ export function classifyStartTaskFailure(err: { error: string; code?: string }):
 }
 
 /** "spec/mcp-test-sandbox.md#驗收標準" → { docType, fileName, section } */
-function parseDocRef(ref: string): { docType: DocType; fileName: string; section?: string } {
+/**
+ * docType 的單複數不一致要在這裡兜掉。
+ *
+ * MCP 自己的介面就對不上：`list_docs` 的說明講文件放在 `prd/`、`spec/`、**`issues/`**（複數），
+ * 但 `read_doc` 的 docType 只吃 `"prd" | "spec" | "issue"`（單數）。任務板給的 docRef 是
+ * `issues/2026-07-31-xxx.md`，照抄過去必定失敗——實跑就是這樣：
+ *   read_doc 失敗：未知的 docType：issues（可用值：prd / spec / issue）
+ * 而失敗的後果是 agent 根本沒拿到那份規格就去做了。
+ */
+export function normalizeDocType(raw: string): DocType {
+  const t = raw.trim().toLowerCase();
+  if (t === 'issues' || t === 'issue') return 'issue' as DocType;
+  if (t === 'specs' || t === 'spec') return 'spec' as DocType;
+  if (t === 'prds' || t === 'prd') return 'prd' as DocType;
+  return t as DocType; // 未知的原樣傳過去，讓 MCP 自己報錯（不要猜）
+}
+
+export function parseDocRef(ref: string): { docType: DocType; fileName: string; section?: string } {
   const [path, section] = ref.split('#');
   const slash = (path ?? '').indexOf('/');
-  const docType = (slash >= 0 ? path!.slice(0, slash) : 'spec') as DocType;
+  const docType = normalizeDocType(slash >= 0 ? path!.slice(0, slash) : 'spec');
   const fileName = slash >= 0 ? path!.slice(slash + 1) : (path ?? '');
   return { docType, fileName, section: section || undefined };
 }
@@ -344,11 +361,36 @@ export class PmmMcpClient implements McpTaskClient {
     return mapTaskDetail(j);
   }
 
+  /** 列出這個專案的所有文件（prd/ spec/ issues/）。找不到指定檔案時的第一手線索。 */
+  async listDocs(): Promise<string> {
+    const j = await this.rawOrThrow('handler__list_docs', {});
+    return typeof j === 'string' ? j : JSON.stringify(j);
+  }
+
+  /**
+   * 語意搜尋文件。**可能回傳不相干的結果**——呼叫端要自己讀過確認，
+   * 所以這個工具只給 agent 用，程式不會拿它的結果直接當規格。
+   */
+  async searchDocs(query: string): Promise<string> {
+    const j = await this.rawOrThrow('handler__search_docs', { query });
+    return typeof j === 'string' ? j : JSON.stringify(j);
+  }
+
   async readDoc(docType: DocType, fileName: string, section?: string): Promise<string> {
     const j = await this.rawOrThrow('handler__read_doc', { docType, fileName, ...(section ? { section } : {}) });
     return typeof j === 'string' ? j : (j.body ?? '');
   }
 
+  /**
+   * 讀不到的規格**不可以靜默略過**。
+   *
+   * 先前失敗只留一行 warn，agent 連「有這份規格」都不知道就去做了。
+   * 檔案改名、章節改名、docType 對不上——任何一種都會讓它少拿到一段需求，
+   * 而它做出來的東西看起來完全正常（build/test 都會過）。
+   *
+   * 改成把失敗本身當成一筆內容交給它，並指名要用 search_docs／list_docs 自己找。
+   * 那件事只有 agent 做得到：程式只能照字串比對，agent 讀得到內容、判斷得出像不像。
+   */
   async loadDocs(refs: string[]): Promise<LoadedDoc[]> {
     const out: LoadedDoc[] = [];
     for (const ref of refs) {
@@ -357,7 +399,17 @@ export class PmmMcpClient implements McpTaskClient {
         const content = await this.readDoc(docType, fileName, section);
         out.push({ ref, content });
       } catch (e) {
-        this.log.warn({ ref, err: e instanceof Error ? e.message : String(e) }, 'read_doc 失敗，略過該段');
+        const why = e instanceof Error ? e.message : String(e);
+        this.log.warn({ ref, err: why }, 'read_doc 失敗 → 改交給 agent 自己找');
+        out.push({
+          ref,
+          content:
+            `⚠️ 這份規格讀不到：${why}\n\n`
+            + `**不要當作它不存在。** 可能是檔案改名、章節改名，或 docType 對不上。\n`
+            + `請用 \`search_docs\`（語意搜尋，可能回不相干的結果，要自己讀過確認）`
+            + `或 \`list_docs\`（列出全部文件）把它找出來再動工。\n`
+            + `真的找不到，就用 ask_human 問，不要憑任務標題猜規格。`,
+        });
       }
     }
     return out;

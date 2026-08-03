@@ -1,4 +1,5 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
 import type { GateReport, TaskDetail } from '../types.js';
@@ -135,6 +136,9 @@ export const ALLOWED_TOOLS = [
   // 「這個系統擋到我了」的回報出口。不影響任務結果，純粹留紀錄——
   // 今天好幾個真 bug 是從 agent 順口說的話裡撿到的，那些不該只靠碰巧被讀到。
   'mcp__ask__report_friction',
+  // 規格文件：讓 agent 自己找。程式只能照 docRef 字串比對，對不上就整份讀不到
+  // （實跑：docType 單複數不一致，每個帶 issue 規格的任務都是沒看過規格就做的）。
+  ...DOCS_TOOLS,
   ...BROWSER_TOOLS,
 ];
 
@@ -237,6 +241,12 @@ export function agentAuthEnv(cfg: {
 }
 
 export interface AgentRuntimeDeps {
+  /**
+   * 依 repo 解析任務板的文件來源（MCP 是每個專案各自的）。
+   * 給了才會把 list_docs／search_docs／read_doc 掛給 agent，
+   * 讓它在規格讀不到時自己去找（見 docs-server.ts）。
+   */
+  docs?: (repo: string) => DocsSource | undefined;
   /** 工作區是否有變更（Stop hook 判斷用）。預設 git/status，可注入假件測試。 */
   workingTreeChanged?: (cwd: string) => Promise<boolean>;
   /** 工具紅線的保護路徑覆寫（來自專案設定）。未給時用安全預設。 */
@@ -290,6 +300,9 @@ export class AgentRuntime {
   private async runOnce(input: IterateInput): Promise<IterateResult> {
     const captured: CapturedSignals = {};
     const askServer = this.buildAskServer(captured, input.task.id);
+    // 有任務板連線才掛：沒有的話 agent 只能用提示詞裡程式先讀好的那份
+    const docsSource = this.deps.docs?.(input.task.repo);
+    const docsServer = docsSource ? createDocsServer(docsSource, this.log) : undefined;
     const browser = browserServerConfig(this.deps.browserOutputRoot, input.task.id);
     const stopState = { blocks: 0 };
     const toolsUsed = new Map<string, number>();
@@ -302,6 +315,7 @@ export class AgentRuntime {
         permissionMode: 'acceptEdits',
         mcpServers: {
           ask: askServer,
+          ...(docsServer ? { docs: docsServer } : {}),
           ...(browser ? { playwright: browser } : {}),
         },
         allowedTools: ALLOWED_TOOLS,

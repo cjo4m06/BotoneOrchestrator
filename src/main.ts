@@ -15,7 +15,7 @@ import { loadEnv } from './config/env.js';
 import { Ledger } from './store/ledger.js';
 import { backupLedger } from './store/backup.js';
 import { createLogger } from './observability/logger.js';
-import { PmmMcpClient, mcpResilienceFromEnv, type McpResilienceOptions } from './mcp/mcp-client.js';
+import { PmmMcpClient, mcpResilienceFromEnv, normalizeDocType, type McpResilienceOptions } from './mcp/mcp-client.js';
 import { Poller, type PollSource } from './core/poller.js';
 import { ProjectRegistry, type ProjectLookup, type RegisteredProject } from './core/project-registry.js';
 import { DEFAULT_QUIET_MINUTES } from './core/quiet-period.js';
@@ -1274,6 +1274,21 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
       // 摩擦回報寫進 ledger events，之後才彙總得起來
       frictionSink: ledger,
+      // 規格文件讓 agent 自己找：程式只能照 docRef 字串比對，檔案改名／章節改名／
+      // docType 對不上就整份讀不到（實跑：issues/ vs issue，每個帶 issue 規格的任務
+      // 都是沒看過規格就做的）。搜尋是語意的、會回不相干的東西，所以要它自己判斷。
+      docs: (repo) => {
+        const mcp = registry.runtimeOf(repo)?.mcp;
+        // 任務板沒有這些能力就不掛（agent 只會拿到程式先讀好的那份，行為與先前一致）
+        if (!mcp?.listDocs || !mcp.searchDocs || !mcp.readDoc) return undefined;
+        const { listDocs, searchDocs, readDoc } = mcp;
+        return {
+          listDocs: () => listDocs.call(mcp),
+          searchDocs: (q: string) => searchDocs.call(mcp, q),
+          // agent 若照任務裡的 issues/ 寫成複數，這裡一併正規化（同 parseDocRef）
+          readDoc: (t: string, f: string, sec?: string) => readDoc.call(mcp, normalizeDocType(t), f, sec),
+        };
+      },
     }),
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
     makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger)),
