@@ -104,7 +104,7 @@ export function homeViewBlocks(input: HomeInput): KnownBlock[] {
   blocks.push({ type: 'header', text: { type: 'plain_text', text: '開發調度器', emoji: false } });
   blocks.push({
     type: 'context',
-    elements: [{ type: 'mrkdwn', text: `更新於 ${timeLabel(input.now)}　·　這一頁在你打開或按重新整理時取最新狀態` }],
+    elements: [{ type: 'mrkdwn', text: `更新於 ${timeLabel(input.now)}　·　**這是當下的快照**，停在這一頁不會自己更新；重開分頁或按下面的重新整理` }],
   });
 
   // 剛按下去的那個動作的結果，擺在最上面——按鈕沒有回饋的話人會一直重按
@@ -276,7 +276,11 @@ function activitySection(acts: HomeInput['activities'] & object, now: number): K
     const meta = [
       ...(a.repo ? [escape(shortRepo(a.repo))] : []),
       ...(a.detail ? [escape(oneLine(a.detail, 100))] : []),
-      `已 ${elapsed(now - a.startedAt)}`,
+      // **絕對時間，不是「已 6 分 12 秒」。**
+      // 這一頁只在你打開或按重新整理時更新——停在上面不動它就凍住了。
+      // 凍住的相對時間會騙人（顯示 6 分，其實已經 40 分），
+      // 凍住的絕對時間永遠是對的：讀的人自己會算現在幾點。
+      `${timeLabel(a.startedAt)} 起（已 ${elapsed(now - a.startedAt)}）`,
       // 心跳停了就是 daemon 不在了，那與「跑很久」是完全不同的兩件事
       ...(a.stale ? ['*沒有心跳，daemon 可能已經不在了*'] : []),
     ].join('　·　');

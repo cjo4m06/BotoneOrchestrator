@@ -77,6 +77,8 @@ export class ConsoleServer {
       this.server.once('error', reject);
       this.server.listen(this.port, this.host, () => resolve());
     });
+    // 傳 0 讓 OS 挑埠時，實際埠號要回填——同源判斷要比對它
+    this.port = this.address().port || this.port;
     const url = `http://${this.host}:${this.port}`;
     this.deps.log.info({ url }, '控制台已啟動');
     return { url };
@@ -103,7 +105,14 @@ export class ConsoleServer {
         res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'max-age=86400' });
         return void res.end(svg);
       }
-      if (path.startsWith('/api/')) return await this.api(req, res, path, url);
+      if (path.startsWith('/api/')) {
+        const bad = crossSiteReason(req, this.port);
+        if (bad) {
+          this.deps.log.warn({ path, reason: bad }, '擋下跨站請求');
+          return this.json(res, 403, { error: bad });
+        }
+        return await this.api(req, res, path, url);
+      }
       this.json(res, 404, { error: '找不到' });
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
@@ -451,4 +460,54 @@ function latestTickFailure(ledger: ConsoleDeps['ledger'], now: number): { at: nu
   const e = ledger.latestEvent('system', null, TICK_FAILED_EVENT);
   if (!e || now - e.createdAt > 60 * 60_000) return null;
   return { at: e.createdAt, detail: e.detail ?? '（沒有細節）' };
+}
+
+
+/**
+ * 擋下跨站請求（回擋下的理由；同站回 undefined）。
+ *
+ * ── 為什麼只綁 loopback 不夠 ──
+ *
+ * 「能連到它的就是坐在這台機器前面的人」對**瀏覽器**不成立。
+ * 使用者瀏覽任何一個惡意網頁，那個網頁就能對 127.0.0.1:8787 發請求——
+ * 而這個介面可以改 MCP token、核准合併、**停用專案（會連 worktree 與分支一起清掉）**。
+ *
+ * 實測（改這段之前）：
+ *   curl -X PUT http://127.0.0.1:8901/api/projects \
+ *        -H 'Content-Type: text/plain' -H 'Origin: https://evil.example' -d '{...}'
+ *   → {"ok":true,"project":{"id":"pwned",...}}
+ *
+ * `text/plain` 是 CORS 的「簡單」型別，**不觸發 preflight**，所以瀏覽器會直接送出去。
+ *
+ * 兩道一起用：
+ *  1. Origin 標頭存在且不是自己 → 擋。（跨站請求一定帶 Origin）
+ *  2. 有 body 的方法要求 `application/json` → 強制觸發 preflight，
+ *     而我們不回 CORS 標頭，瀏覽器就過不了那一關。
+ *     這一條也擋掉「沒有 Origin 的表單送出」那種老派攻擊。
+ */
+export function crossSiteReason(
+  req: { method?: string | undefined; headers: Record<string, string | string[] | undefined> },
+  port: number,
+): string | undefined {
+  const origin = header(req.headers, 'origin');
+  if (origin) {
+    const ok = LOOPBACK_ORIGINS.some((h) => origin === `http://${h}:${port}` || origin === `https://${h}:${port}`);
+    if (!ok) return `拒絕跨站請求（Origin: ${origin}）。控制台只接受從本機自己開啟的頁面送出的請求。`;
+  }
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return undefined;
+
+  const ct = (header(req.headers, 'content-type') ?? '').split(';')[0]?.trim().toLowerCase();
+  if (ct !== 'application/json') {
+    return `這個請求必須用 content-type: application/json（收到 ${ct || '（無）'}）。`
+      + 'text/plain 不會觸發瀏覽器的預檢，等於讓任何網頁都能對本機控制台送出寫入請求。';
+  }
+  return undefined;
+}
+
+const LOOPBACK_ORIGINS = ['127.0.0.1', 'localhost', '[::1]'];
+
+function header(h: Record<string, string | string[] | undefined>, name: string): string | undefined {
+  const v = h[name];
+  return Array.isArray(v) ? v[0] : v;
 }

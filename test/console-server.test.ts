@@ -300,3 +300,55 @@ describe('控制台 — 人的裁決走 InboundRouter（不是第二套邏輯）
     assert.ok((capped.body.events as unknown[]).length <= 500);
   });
 });
+
+
+describe('控制台 — 跨站請求', () => {
+  /**
+   * 「只綁 loopback 所以連得到的就是坐在機器前面的人」——這個假設對**瀏覽器**不成立。
+   *
+   * 使用者瀏覽任何一個惡意網頁，那個網頁就能對 127.0.0.1:8787 發請求，
+   * 而這個介面可以改 MCP token、核准合併、停用專案（會連 worktree 與分支一起清掉）。
+   *
+   * `text/plain` 是 CORS 的「簡單」型別，不觸發 preflight，所以瀏覽器會直接送出去。
+   * 改這段之前實測是成功的。
+   */
+  let h: Harness;
+  before(async () => { h = await start(); });
+  after(async () => { await h.close(); });
+
+  const raw = (method: string, path: string, headers: Record<string, string>, body?: string) =>
+    fetch(h.base + path, { method, headers, ...(body ? { body } : {}) });
+
+  it('帶外部 Origin 的寫入請求 → 403', async () => {
+    const res = await raw('PUT', '/api/projects',
+      { 'content-type': 'application/json', origin: 'https://evil.example' },
+      JSON.stringify(project()));
+    assert.equal(res.status, 403);
+    assert.equal((await get(h, '/api/projects')).body.projects.length, 0, '不可以寫進去');
+  });
+
+  /** 這是最關鍵的一條：text/plain 不觸發預檢，是真正可用的攻擊路徑。 */
+  it('text/plain 的寫入請求 → 403（就算沒有 Origin）', async () => {
+    const res = await raw('PUT', '/api/projects', { 'content-type': 'text/plain' }, JSON.stringify(project()));
+    assert.equal(res.status, 403);
+    assert.match((await res.json() as { error: string }).error, /application\/json/);
+    assert.equal((await get(h, '/api/projects')).body.projects.length, 0);
+  });
+
+  it('沒有 content-type 的寫入請求 → 403', async () => {
+    const res = await raw('POST', '/api/projects/x/enabled', {}, '{"enabled":false}');
+    assert.equal(res.status, 403);
+  });
+
+  it('讀取不受影響（GET 沒有副作用）', async () => {
+    assert.equal((await raw('GET', '/api/state', {})).status, 200);
+  });
+
+  it('自己的頁面照常運作（同源 Origin ＋ json）', async () => {
+    const { port } = h.server.address();
+    const res = await raw('PUT', '/api/projects',
+      { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` },
+      JSON.stringify(project()));
+    assert.equal(res.status, 200, '不能把正常使用擋掉');
+  });
+});
