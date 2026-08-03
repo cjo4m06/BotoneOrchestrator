@@ -229,8 +229,21 @@ case "$CMD" in
     ;;
 
   logs)
-    # 跟著 profile 走：測試的日誌在 data/test/，不然會看到另一個 profile 的檔案
-    tail -n 40 -f "$REPO/$DATA_DIR/stderr.log"
+    # **看 stdout 不是 stderr。** daemon 的日誌全部走 stdout，stderr 只有真的爆掉時
+    # 才有東西（node 的 uncaught exception）。原本 tail stderr，結果是「什麼都看不到」，
+    # 而使用者會以為服務沒在跑。
+    #
+    # 正式模式的日誌是單行 JSON（給機器讀的），有 pino-pretty 就轉成人看得懂的格式。
+    # 兩個檔案一起跟：平常看 stdout，真的爆了才會有 stderr。
+    OUT="$REPO/$DATA_DIR/stdout.log"
+    ERR="$REPO/$DATA_DIR/stderr.log"
+    [ -f "$OUT" ] || die "找不到 $OUT（服務跑過嗎？先 ./scripts/launchd.sh status）"
+    PRETTY="$REPO/node_modules/.bin/pino-pretty"
+    if [ -x "$PRETTY" ]; then
+      tail -n 40 -f "$OUT" "$ERR" | "$PRETTY" --colorize --translateTime 'SYS:HH:MM:ss' --ignore 'pid,hostname'
+    else
+      tail -n 40 -f "$OUT" "$ERR"
+    fi
     ;;
 
   *)
