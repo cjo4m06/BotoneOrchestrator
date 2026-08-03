@@ -323,6 +323,14 @@ export class Orchestrator {
   private readonly sharedFeedback: boolean;
   /** 群組 → 核准憑證。**合併的唯一依據**，只由 GitHub approved 事件或人工裁決寫入。 */
   private readonly approvals = new Map<string, MergeApproval>();
+  /**
+   * repo → 進行中的背景規劃。
+   *
+   * **per-repo 而不是全域**：一個 repo 規劃十幾分鐘，不該擋住另一個 repo 的規劃。
+   * 這是行程內狀態，daemon 重啟就沒了——沒關係，重啟後那些任務還是 discovered，
+   * 下一輪 tick 會重新發動（規劃本身沒有副作用，重跑只是再花一次錢）。
+   */
+  private readonly planning = new Map<string, { promise: Promise<void>; startedAt: number }>();
   /** 已經問過人的群組（避免每輪都往 Slack 貼同一則核准請求）。 */
   private readonly askedApproval = new Set<string>();
   /** 群組 → 已 requeue 次數（防空轉）。**只是 ledger 的快取**，首次使用時從事件回讀。 */
@@ -382,42 +390,13 @@ export class Orchestrator {
 
     // 3) Plan：把 discovered 任務分群 → 建群（ready）+ 任務轉 queued
     //    先過靜置期閘門：任務板還在被編輯的專案，這輪一律不分群（避免半套任務→半成品 PR）。
+    //
+    //    **不 await。** 規劃 agent 要讀完整個 repo 才判斷得出誰會撞誰，實測 25 個任務
+    //    跑 13 分鐘。而 run() 是 `await tick()` 之後才 sleep——await 它就等於
+    //    這十幾分鐘內**一輪 tick 都不會發生**：開好的 PR 沒人去看審查結果、
+    //    核准過的沒人去合併、卡住的沒人重派。一件慢事拖垮全部。
     const discovered = this.quietGate(ledger.listTasksByState('discovered'));
-    if (discovered.length) {
-      const plan = await planner.plan(discovered);
-      // 依階段順序建群：階段 k 的群要等階段 k-1 全部結束（afterGroups）。
-      // 只連相鄰階段就夠——k-1 自己也在等 k-2，遞移關係成立。
-      //
-      // **階段順序必須按 repo 各自算。** 規劃是每個 repo 分開做的，階段編號只在該 repo
-      // 內部有意義；跨 repo 共用一份 previousStage 的話，A 專案的群會去等 B 專案的群。
-      // 實跑撞到：demo2 的第二階段群組 afterGroups 裡混進了一個 Baolu 的群組 id——
-      // 一個專案卡住就會拖死另一個，而且「只認 merged」之後那會是永久的。
-      const previousStageOf = new Map<string, string[]>();
-      for (const [stage, inStage] of groupByStage(plan.groups)) {
-        const createdOf = new Map<string, string[]>();
-        for (const pg of inStage) {
-          const g = ledger.createGroup({
-            repo: pg.repo,
-            branch: '',
-            taskIds: pg.taskIds,
-            footprint: pg.footprint,
-            // 同專案的前一階段 ＋ 跨批次要等的既有群組
-            afterGroups: [...new Set([...(previousStageOf.get(pg.repo) ?? []), ...(pg.afterExisting ?? [])])],
-          });
-          if (!g.branch) ledger.upsertGroup({ ...g, branch: branchFor(pg.repo, g.id) }); // 補分支名（需 id）
-          for (const tid of pg.taskIds) ledger.updateTaskState(tid, 'queued', { groupId: g.id });
-          createdOf.set(pg.repo, [...(createdOf.get(pg.repo) ?? []), g.id]);
-          log.info(
-            { group: g.id, stage, tasks: pg.taskIds.length, files: pg.footprint.slice(0, 8), rationale: pg.rationale },
-            '建群',
-          );
-        }
-        // 這一階段沒有該 repo 的群時，維持上一次的值——階段編號可能跳號
-        // （例如 repo A 有 stage 0/1/2，repo B 只有 stage 0/2），
-        // 直接覆寫成空的話 B 的 stage 2 就不會等 B 的 stage 0。
-        for (const [repo, ids] of createdOf) previousStageOf.set(repo, ids);
-      }
-    }
+    if (discovered.length) this.startPlanning(discovered, signal);
 
     // 4) Dispatch：派出 ready 群（併發 + 足跡序列化由 Dispatcher 控管）
     //    先看花費上限。超了就不派新的——但已經在跑的不動，那些錢已經花掉了。
@@ -604,6 +583,102 @@ export class Orchestrator {
     this.deps.log.warn({ key, usage: describeUsage(u) }, text);
     void this.notify(() => notifier?.notice?.(text), '花費通知');
   }
+
+  /**
+   * 發動背景規劃（不等它）。
+   *
+   * 三件事缺一不可：
+   *  (a) **旗標防重複發動**——規劃跑十幾分鐘，期間每一輪 tick 都會再看到同一批
+   *      discovered 任務。沒有旗標就會同時跑好幾個規劃，各自建出重複的群。
+   *  (b) **finally 一定要刪旗標**——漏了它，該 repo 從此永遠不再規劃，
+   *      而症狀是「什麼都不發生」，最難查的那一種。
+   *  (c) 鏈上多包一層 catch：存進 Map 的那個 promise 絕不能是 rejected，
+   *      否則沒人 await 它就變成 unhandledRejection。
+   */
+  private startPlanning(tasks: Task[], signal?: AbortSignal): void {
+    const byRepo = new Map<string, Task[]>();
+    for (const t of tasks) byRepo.set(t.repo, [...(byRepo.get(t.repo) ?? []), t]);
+
+    for (const [repo, list] of byRepo) {
+      if (this.planning.has(repo)) {
+        this.deps.log.debug({ repo, tasks: list.length }, '這個專案正在規劃中，本輪不重複發動');
+        continue;
+      }
+      const promise = this.runPlan(repo, list, signal)
+        .catch(() => {})           // runPlan 自己已經處理過錯誤；這層只是保證 promise 不 reject
+        .finally(() => this.planning.delete(repo));
+      this.planning.set(repo, { promise, startedAt: Date.now() });
+    }
+  }
+
+  /**
+   * 實際跑規劃並建群。
+   *
+   * 失敗一樣寫 `tick_failed`：使用者看得到失敗原因是硬需求，而消費端
+   * （控制台的紅色橫幅、Slack App Home）已經接在這個 kind 上。
+   */
+  private async runPlan(repo: string, tasks: Task[], signal?: AbortSignal): Promise<void> {
+    const { ledger, planner, log } = this.deps;
+    try {
+      const full = await planner.plan(tasks);
+      if (signal?.aborted) return void log.info({ repo }, '規劃完成時已收到中止訊號，不建群');
+
+      // 只收這個 repo 的群。規劃現在是 per-repo 發動的（一個 repo 跑十幾分鐘不該擋住
+      // 另一個），所以回傳裡出現別的 repo 就是不對——照收會重複建群。
+      const mine = full.groups.filter((g) => g.repo === repo);
+      if (mine.length !== full.groups.length) {
+        log.warn(
+          { repo, got: full.groups.length, kept: mine.length },
+          '規劃回傳了其他專案的群組，已忽略（這一輪只規劃這個專案）',
+        );
+      }
+      const plan = { ...full, groups: mine };
+
+      // 依階段順序建群：階段 k 的群要等階段 k-1 全部結束（afterGroups）。
+      // 只連相鄰階段就夠——k-1 自己也在等 k-2，遞移關係成立。
+      //
+      // 這裡只處理單一 repo（startPlanning 已按 repo 分開），所以 previousStage
+      // 不會跨 repo 污染——那是先前實跑撞過的問題：demo2 的第二階段群組
+      // afterGroups 裡混進了一個 Baolu 的群組 id，一個專案卡住就拖死另一個。
+      let previousStage: string[] = [];
+      for (const [stage, inStage] of groupByStage(plan.groups)) {
+        const created: string[] = [];
+        for (const pg of inStage) {
+          const g = ledger.createGroup({
+            repo: pg.repo,
+            branch: '',
+            taskIds: pg.taskIds,
+            footprint: pg.footprint,
+            // 同專案的前一階段 ＋ 跨批次要等的既有群組
+            afterGroups: [...new Set([...previousStage, ...(pg.afterExisting ?? [])])],
+          });
+          if (!g.branch) ledger.upsertGroup({ ...g, branch: branchFor(pg.repo, g.id) }); // 補分支名（需 id）
+          for (const tid of pg.taskIds) ledger.updateTaskState(tid, 'queued', { groupId: g.id });
+          created.push(g.id);
+          log.info(
+            { group: g.id, stage, tasks: pg.taskIds.length, files: pg.footprint.slice(0, 8), rationale: pg.rationale },
+            '建群',
+          );
+        }
+        // 這一階段沒有群時維持上一次的值——階段編號可能跳號
+        if (created.length > 0) previousStage = created;
+      }
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      log.error({ repo, err: why }, '背景規劃失敗（下一輪會重試）');
+      try {
+        ledger.logEvent('system', null, TICK_FAILED_EVENT, `規劃 ${repo} 失敗：${why}`);
+      } catch {
+        // ledger 也壞了就只剩 log，但不能讓它擴散出去
+      }
+    }
+  }
+
+  /** 等所有背景規劃收尾（停止流程用；測試也靠它取得決定性的時序）。 */
+  async settlePlanning(): Promise<void> {
+    await Promise.all([...this.planning.values()].map((p) => p.promise));
+  }
+
 
   /**
    * 靜置期閘門：只放行「任務板已經安靜夠久」的專案的任務。
@@ -1389,6 +1464,8 @@ export class Orchestrator {
       // 每輪重新取間隔：控制台改了輪詢週期，下一輪就生效（不必重啟）
       await sleep(this.currentInterval() * 1000, signal);
     }
+    // 背景規劃收尾：不等的話，停止之後它才建群，而那時候沒有人會去派它們
+    await this.settlePlanning();
     this.deps.log.info('主控迴圈停止');
   }
 

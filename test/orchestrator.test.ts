@@ -69,6 +69,30 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
   }
 }
 
+/**
+ * 跑到「這一輪該發生的事都發生了」為止。
+ *
+ * 規劃改成背景執行之後（見 orchestrator 的 startPlanning），`tick()` 回來時
+ * 規劃通常還沒跑完——建群發生在背景，派工要等**下一輪** tick。
+ * 這是刻意的取捨：規劃一次十幾分鐘，await 它就等於這段時間內
+ * 看審查、合併、重派全部停擺。多一輪（預設 30 秒）換掉十幾分鐘的全面停擺。
+ */
+async function tickAndPlan(o: { tick(s?: AbortSignal): Promise<void>; settlePlanning(): Promise<void> }): Promise<void> {
+  await o.tick();
+  await o.settlePlanning();
+}
+
+/**
+ * 跑到「新任務已經被規劃、建群、而且派出去了」為止。
+ *
+ * 需要兩輪：第一輪發動背景規劃（不等它），規劃完成時本輪的派工步驟早就過去了，
+ * 所以要下一輪才派得到。這一輪的延遲換掉的是「規劃期間十幾分鐘全面停擺」。
+ */
+async function tickUntilDispatched(o: { tick(s?: AbortSignal): Promise<void>; settlePlanning(): Promise<void> }): Promise<void> {
+  await tickAndPlan(o);
+  await o.tick();
+}
+
 describe('Orchestrator — 主控迴圈', () => {
   let tmp: TmpLedger;
   beforeEach(() => {
@@ -106,7 +130,7 @@ describe('Orchestrator — 主控迴圈', () => {
     const poller = fakePoller(tmp, [[{ id: 'T-1', docRefs: ['spec/ui.md#a'] }, { id: 'T-2', docRefs: ['spec/ui.md#b'] }]]);
     const { orch, dispatched } = build(poller);
 
-    await orch.tick();
+    await tickUntilDispatched(orch);
 
     const groups = tmp.ledger.listGroupsByState('ready');
     assert.equal(groups.length, 1);
@@ -131,7 +155,7 @@ describe('Orchestrator — 主控迴圈', () => {
     const poller = fakePoller(tmp, [[{ id: 'T-1', docRefs: ['spec/a.md#1'] }, { id: 'T-2', docRefs: ['spec/b.md#1'] }]]);
     const { orch, dispatched } = build(poller);
 
-    await orch.tick();
+    await tickUntilDispatched(orch);
 
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 2);
     assert.equal(dispatched.length, 2);
@@ -144,9 +168,9 @@ describe('Orchestrator — 主控迴圈', () => {
     ]);
     const { orch } = build(poller);
 
-    await orch.tick();
+    await tickAndPlan(orch);
     const first = tmp.ledger.listGroupsByState('ready');
-    await orch.tick();
+    await tickAndPlan(orch);
     const second = tmp.ledger.listGroupsByState('ready');
 
     assert.equal(poller.calls, 2);
@@ -162,8 +186,8 @@ describe('Orchestrator — 主控迴圈', () => {
     ]);
     const { orch } = build(poller);
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     const groups = tmp.ledger.listGroupsByState('ready');
     assert.equal(groups.length, 2);
@@ -175,7 +199,7 @@ describe('Orchestrator — 主控迴圈', () => {
     const poller = fakePoller(tmp, [[]]);
     const { orch, dispatched } = build(poller);
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 0);
     assert.deepEqual(dispatched, []);
@@ -196,14 +220,93 @@ describe('Orchestrator — 主控迴圈', () => {
     );
     const { orch } = build(poller, { dispatcher });
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     assert.equal(started.length, 1, '同一群不該被派兩次');
     pending.forEach((r) => r());
   });
 
-  it('planner 拋錯 → tick 向上拋（由 run() 兜住）', async () => {
+  /**
+   * B2 的核心：**規劃期間 tick 不可以停擺**。
+   *
+   * 實跑撞到：25 個任務的規劃跑 13 分鐘，而 run() 是 `await tick()` 之後才 sleep，
+   * 所以那十幾分鐘裡一輪 tick 都沒發生——開好的 PR 沒人去看審查結果、
+   * 核准過的沒人去合併、卡住的沒人重派。一件慢事拖垮全部。
+   */
+  it('規劃跑很久時，同一輪的看審查與合併照樣進行', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }]]);
+    let released: (() => void) | undefined;
+    const planner = {
+      // 規劃卡住不回來（模擬那 13 分鐘）
+      plan: () => new Promise<PlanResult>((r) => { released = () => r({ groups: [], schedule: [] }); }),
+    } as unknown as Planner;
+
+    const { orch } = build(poller, { planner });
+
+    // 用時限而不是單純 await：改回 `await planner.plan(...)` 的話這裡會**永遠掛住**，
+    // 而掛住的測試在 CI 上只會逾時，看不出是哪裡壞了。加時限讓它變成一句清楚的失敗。
+    await Promise.race([
+      orch.tick(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('tick 被規劃卡住了——規劃必須是背景執行')), 1500).unref?.()),
+    ]);
+
+    assert.ok(released, '規劃應該已經被發動');
+    released();
+    await orch.settlePlanning();
+  });
+
+  /** 規劃跑十幾分鐘，期間每一輪 tick 都會再看到同一批 discovered——不擋就會同時跑好幾個。 */
+  it('同一個專案的規劃不會被重複發動', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }], [], []]);
+    let calls = 0;
+    let release: (() => void) | undefined;
+    const planner = {
+      plan: () => { calls += 1; return new Promise<PlanResult>((r) => { release = () => r({ groups: [], schedule: [] }); }); },
+    } as unknown as Planner;
+
+    const { orch } = build(poller, { planner });
+    await orch.tick();
+    await orch.tick();
+    await orch.tick();
+
+    assert.equal(calls, 1, '規劃還在跑的時候，後面幾輪不該再發動一次');
+    release?.();
+    await orch.settlePlanning();
+  });
+
+  /** 漏掉 finally 的話，該專案從此永遠不再規劃——症狀是「什麼都不發生」，最難查的那種。 */
+  it('規劃結束後旗標要放掉，下一批任務才規劃得了', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }], [{ id: 'T-2' }]]);
+    let calls = 0;
+    const planner = { plan: async (): Promise<PlanResult> => { calls += 1; return { groups: [], schedule: [] }; } } as unknown as Planner;
+
+    const { orch } = build(poller, { planner });
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+
+    assert.equal(calls, 2, '第一次規劃結束後旗標沒放掉的話，第二批永遠不會被規劃');
+  });
+
+  /** 規劃失敗也要放掉旗標，否則一次失敗就讓該專案永久停擺。 */
+  it('規劃失敗後旗標一樣要放掉', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1' }], [{ id: 'T-2' }]]);
+    let calls = 0;
+    const planner = { plan: async (): Promise<PlanResult> => { calls += 1; throw new Error('炸了'); } } as unknown as Planner;
+
+    const { orch } = build(poller, { planner });
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+
+    assert.equal(calls, 2, '失敗之後要能再試，否則一次失敗＝永久停擺');
+  });
+
+  /**
+   * 規劃改成背景跑之後，它的失敗**不再從 tick 冒出來**——這是刻意的。
+   * 讓它冒出來的話，一次規劃失敗就會把同一輪的看審查、合併佇列全部跳過，
+   * 而那些跟規劃一點關係都沒有。改成寫 tick_failed，控制台紅色橫幅與 Slack 照樣看得到。
+   */
+  it('planner 拋錯 → 不拖垮 tick，但要留下看得見的失敗紀錄', async () => {
     const poller = fakePoller(tmp, [[{ id: 'T-1' }]]);
     const planner = {
       async plan(): Promise<PlanResult> {
@@ -212,7 +315,12 @@ describe('Orchestrator — 主控迴圈', () => {
     } as unknown as Planner;
     const { orch } = build(poller, { planner });
 
-    await assert.rejects(() => orch.tick(), /planner 爆炸/);
+    await assert.doesNotReject(() => orch.tick(), '規劃失敗不該讓整輪中止');
+    await orch.settlePlanning();
+
+    const e = tmp.ledger.latestEvent('system', null, 'tick_failed');
+    assert.ok(e, '失敗只留在 log 的話，控制台永遠看不出來出過事');
+    assert.match(e.detail ?? '', /planner 爆炸/, '要留下真正的原因');
   });
 
   it('run()：tick 拋錯只記錄，不中斷迴圈；abort 後乾淨結束', async () => {
@@ -451,7 +559,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       notifier: notif.notifier,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.fetched, [{ repoPath: PROJECT.repoPath, base: 'main' }], '合併前必須先抓最新 base');
     assert.deepEqual(m.guardCalls, [{ repoPath: PROJECT.repoPath, branch: g.branch, base: 'main' }], '不可只信 GitHub 的 mergeable');
@@ -474,7 +582,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       merge: m.deps,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.released, [{ repoPath: PROJECT.repoPath, base: 'main' }]);
   });
@@ -487,7 +595,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       merge: m.deps,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.released, [{ repoPath: PROJECT.repoPath, base: 'main' }]);
     assert.deepEqual(m.merges, [], '擋下就不該合併');
@@ -508,8 +616,8 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       reviewWatcher: fakeWatcher([[{ type: 'approved', group: g.id, approvedBy: 'bob' }]]),
     });
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'failed', '要進得了待辦清單');
     const why = tmp.ledger.listEvents().find((e) => e.refId === g.id && e.kind === 'merge_blocked')?.detail ?? '';
@@ -538,7 +646,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       gateway: gw.gateway,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [{ repo: 'acme/web', prNumber: 42, approvedBy: 'reviewer:bob' }]);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'merged');
@@ -551,11 +659,11 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const gw = fakeGateway();
     const { orch } = build({ merge: m.deps, gateway: gw.gateway });
 
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(m.merges, [], '沒有任何核准憑證就不合併');
 
     gw.decide({ groupId: g.id, approved: true, userId: 'U123' });
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [{ repo: 'acme/web', prNumber: 42, approvedBy: 'human:U123' }]);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'merged');
@@ -568,8 +676,8 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const gw = fakeGateway();
     const { orch } = build({ merge: m.deps, gateway: gw.gateway });
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [], '狀態是 merge_guard 不等於有人核准過');
     assert.deepEqual(m.guardCalls, []);
@@ -585,7 +693,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const dispatcher = { dispatch: () => 0, isRunning: () => true };
     const { orch } = build({ merge: m.deps, gateway: gw.gateway, dispatcher });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
     assert.deepEqual(gw.asks, [], '不可把別人手上的暫態當成待合併而騷擾人');
@@ -604,7 +712,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       notifier: notif.notifier,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested');
@@ -623,7 +731,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       feedback: store,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'failed');
@@ -642,7 +750,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       merge: m.deps,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [], '本地模式沒有 PR 可合併');
     assert.deepEqual(m.guardCalls, []);
@@ -661,8 +769,8 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       notifier: notif.notifier,
     });
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     assert.equal(m.merges.length, 1, '失敗後不可每輪重打外部合併 API');
     assert.notEqual(tmp.ledger.getGroup(g.id)?.state, 'merged');
@@ -680,7 +788,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       merge: m.deps,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
     assert.equal(tmp.ledger.getGroup('g_unknown')?.state, 'failed');
@@ -697,7 +805,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       merge: m.deps,
     });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges.map((x) => x.prNumber), [42], '幽靈事件不可讓後面的事件跟著掉');
   });
@@ -714,7 +822,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     };
     const { orch } = build({ reviewWatcher: watcher, merge: m.deps, gateway: gw.gateway, log: rec.logger });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.ok(rec.messages('warn').some((msg) => msg.includes('Review Watcher 失敗')));
     assert.equal(gw.asks.length, 1, '審查旁路掛掉不該讓合併佇列停擺');
@@ -727,13 +835,13 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const { orch } = build({ merge: m.deps, log: rec.logger });
 
     orch.recordMergeApproval(g.id, '   ');
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
     assert.ok(rec.messages('error').some((msg) => msg.includes('未指明核准來源')));
 
     orch.recordMergeApproval(g.id, 'cli:alice');
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(m.merges, [{ repo: 'acme/web', prNumber: 42, approvedBy: 'cli:alice' }]);
   });
 
@@ -746,7 +854,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
 
     gw.decide({ groupId: g.id, approved: true, userId: 'U1' });
     gw.decide({ groupId: g.id, approved: false, userId: 'U1' });
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [], '退回之後不可再拿舊憑證去合併');
     assert.equal(store.peek(g.id)?.source, 'human_reject');
@@ -805,7 +913,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     store.save({ groupId: g.id, comments: ['@bob: 加錯誤處理'], source: 'github_review' });
     const { orch, dispatched } = build({ feedback: store });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready');
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
@@ -821,11 +929,11 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
       reviewWatcher: fakeWatcher([[{ type: 'changes_requested', group: g.id, comments: ['@bob: 拆函式'] }]]),
     });
 
-    await orch.tick(); // 事件進來、意見落地（requeue 在 pollReviews 之前，本輪還不會派）
+    await tickAndPlan(orch); // 事件進來、意見落地（requeue 在 pollReviews 之前，本輪還不會派）
     assert.equal(dispatched.length, 0);
     assert.match(store.promptFor(g.id) ?? '', /拆函式/);
 
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
   });
 
@@ -838,9 +946,9 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
       reviewWatcher: fakeWatcher([[{ type: 'changes_requested', group: g.id, comments: ['改這裡'] }]]),
     });
 
-    await orch.tick();
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     assert.deepEqual(dispatched, []);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested');
@@ -852,7 +960,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_cr', 'changes_requested', ['T-1'], 13);
     const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.deepEqual(dispatched, []);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested');
@@ -864,7 +972,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_park', 'failed', ['T-1', 'T-2']);
     const { orch, dispatched } = build();
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready');
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
@@ -881,13 +989,13 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const rec = createRecordingLogger();
     const { orch, dispatched } = build({ log: rec.logger, feedback: new ReviewFeedbackStore() });
 
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested', '人還沒回覆 → 不動');
     assert.equal(dispatched.length, 0);
     assert.deepEqual(rec.messages('warn'), [], '等人是正常狀態，不該被當成「沒有意見可回灌」而警告');
 
     tmp.ledger.clearBlock('T-2', 'queued'); // InboundRouter 收到澄清答覆
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready', 'park 的群必須回得了派工佇列');
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
@@ -901,7 +1009,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_done', 'changes_requested', ['T-1']);
     const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready');
     assert.deepEqual(dispatched.map((d) => d.id), ['g_done']);
@@ -912,7 +1020,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_pr', 'changes_requested', ['T-1'], 21);
     const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested');
     assert.deepEqual(dispatched, []);
@@ -923,7 +1031,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_dead', 'failed', ['T-1']);
     const { orch, dispatched } = build();
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'failed');
     assert.deepEqual(dispatched, []);
@@ -934,7 +1042,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const g = seedGroup('g_stale', 'forming', ['T-1']);
     const { orch, dispatched } = build();
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready');
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
@@ -946,7 +1054,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const dispatcher = { dispatch: () => 0, isRunning: () => true };
     const { orch } = build({ dispatcher });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'forming');
   });
@@ -955,7 +1063,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     seedTask('T-orphan', 'g_gone', 'queued'); // 群組不存在
     const { orch, dispatched } = build();
 
-    await orch.tick();
+    await tickUntilDispatched(orch);
 
     // 同一輪：requeue 退回 discovered → planner 重新建群 → 派出
     assert.equal(tmp.ledger.getTask('T-orphan')?.state, 'queued', '重新分群後回到 queued');
@@ -977,7 +1085,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     );
     const { orch } = build({ dispatcher, log: rec.logger, maxRequeuePerGroup: 2 });
 
-    for (let i = 0; i < 5; i += 1) await orch.tick();
+    for (let i = 0; i < 5; i += 1) await tickAndPlan(orch);
 
     const requeues = rec.records.filter((r) => typeof r.msg === 'string' && r.msg.startsWith('♻️'));
     assert.equal(requeues.length, 2, '達上限就停手');
@@ -997,7 +1105,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const dispatcher = new Dispatcher(4, async (g) => { tmp.ledger.updateGroupState(g.id, 'failed'); }, createSilentLogger());
     const { orch } = build({ dispatcher, notifier: notif.notifier, maxRequeuePerGroup: 1 });
 
-    for (let i = 0; i < 4; i += 1) await orch.tick();
+    for (let i = 0; i < 4; i += 1) await tickAndPlan(orch);
 
     const events = tmp.ledger.listEvents({ scope: 'group', refId: 'g_loop', kind: 'requeue_exhausted' });
     assert.equal(events.length, 1, '要有稽核事件，而且每個群只寫一次（不可每輪洗版）');
@@ -1047,14 +1155,14 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     );
     const { orch } = build({ dispatcher, maxRequeuePerGroup: 1 });
 
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 1, '先撞上限停手');
 
     // InboundRouter 收到 Slack 的 retry 指令會寫這則事件 + 把任務放回 queued
     tmp.ledger.logEvent('task', 'T-1', 'control:retry', 'state=queued by=U1');
     tmp.ledger.updateTaskState('T-1', 'queued');
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 2, '人按了 retry 卻沒有任何反應＝上限本身變成新的黑洞');
     assert.equal(tmp.ledger.listEvents({ scope: 'group', refId: 'g_saved', kind: 'requeue_budget_reset' }).length, 1);
@@ -1117,7 +1225,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     // 第 1 次不等 → 立刻重派；第 2 次起要等 baseMs（測試設得夠長，跑 10 輪都不會到期）
     const { orch } = build({ dispatcher, depsBackoff: { baseMs: 60_000 } });
 
-    for (let i = 0; i < 10; i += 1) await orch.tick();
+    for (let i = 0; i < 10; i += 1) await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 1, '10 輪只該派一次；每輪都派＝實測的 worktree 建立/刪除 30 次');
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested', '退避中不可停在 ready（那就是 Dispatcher 的輸入）');
@@ -1130,12 +1238,12 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     const dispatcher = new Dispatcher(4, blockedRunner(dispatched), createSilentLogger());
     const { orch } = build({ dispatcher, depsBackoff: { baseMs: 20 } });
 
-    await orch.tick(); // 第 1 次：不等，直接重派
+    await tickAndPlan(orch); // 第 1 次：不等，直接重派
     assert.equal(dispatched.length, 1);
-    await orch.tick(); // 第 2 次：進入退避
+    await tickAndPlan(orch); // 第 2 次：進入退避
     assert.equal(dispatched.length, 1);
     await new Promise((r) => setTimeout(r, 30));
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 2, '退避到期後必須自己往前走，否則群組永久卡住');
   });
@@ -1147,7 +1255,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     const { orch } = build({ dispatcher, depsBackoff: { baseMs: 10, maxMs: 10_000 } });
 
     for (let i = 0; i < 6; i += 1) {
-      await orch.tick();
+      await tickAndPlan(orch);
       await new Promise((r) => setTimeout(r, 12)); // 只夠第一格退避到期
     }
 
@@ -1165,7 +1273,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     // 一般預算只有 1 次；等上游是合法長等待，不該被它砍掉
     const { orch } = build({ dispatcher, maxRequeuePerGroup: 1, maxDepsRequeuePerGroup: 5, depsBackoff: { baseMs: 0 } });
 
-    for (let i = 0; i < 4; i += 1) await orch.tick();
+    for (let i = 0; i < 4; i += 1) await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 4, '上游可能只是還在等人回答澄清，砍掉等於任務永久遺失');
   });
@@ -1179,7 +1287,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
       dispatcher, notifier: notif.notifier, maxDepsRequeuePerGroup: 2, depsBackoff: { baseMs: 0 },
     });
 
-    for (let i = 0; i < 6; i += 1) await orch.tick();
+    for (let i = 0; i < 6; i += 1) await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 2, '達上限就停手');
     const exhausted = tmp.ledger.listEvents({ scope: 'group', refId: g.id, kind: 'requeue_exhausted' });
@@ -1203,11 +1311,11 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     );
     const { orch } = build({ dispatcher, depsBackoff: { baseMs: 60_000 } });
 
-    await orch.tick(); // 第 1 次重派
-    await orch.tick(); // 群組在 GroupRunner 手上，沒有新的 deps 事件
+    await tickAndPlan(orch); // 第 1 次重派
+    await tickAndPlan(orch); // 群組在 GroupRunner 手上，沒有新的 deps 事件
     tmp.ledger.updateGroupState(g.id, 'changes_requested');
     tmp.ledger.clearBlock(`T-${g.id}`, 'queued'); // 上游完成／人回覆 → 任務可跑了
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(dispatched.length, 2, '任務已經可以跑了還被退避擋著＝誤殺');
   });
@@ -1264,9 +1372,9 @@ describe('Orchestrator — 群組狀態黑洞防護', () => {
     const rec = createRecordingLogger();
     const { orch } = build({ log: rec.logger });
 
-    await orch.tick();
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
 
     const warns = rec.records.filter((r) => typeof r.msg === 'string' && r.msg.includes('未接 ReviewWatcher'));
     assert.equal(warns.length, 2, '兩個群各點名一次');
@@ -1280,7 +1388,7 @@ describe('Orchestrator — 群組狀態黑洞防護', () => {
     const { orch } = build({ log: rec.logger });
 
     orch.recordMergeApproval(g.id, 'cli:alice');
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(rec.records.filter((r) => typeof r.msg === 'string' && r.msg.includes('未接 ReviewWatcher')).length, 0);
   });
@@ -1290,7 +1398,7 @@ describe('Orchestrator — 群組狀態黑洞防護', () => {
     const rec = createRecordingLogger();
     const { orch } = build({ log: rec.logger, reviewWatcher: fakeWatcher([[]]) });
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(rec.records.filter((r) => typeof r.msg === 'string' && r.msg.includes('未接 ReviewWatcher')).length, 0);
   });
@@ -1329,7 +1437,7 @@ describe('Orchestrator — 靜置期閘門', () => {
       15,
     );
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 0, '不該建群');
     assert.equal(dispatched.length, 0, '不該派工');
@@ -1339,7 +1447,7 @@ describe('Orchestrator — 靜置期閘門', () => {
   it('靜置期滿 → 下一輪自動放行（不需任何人介入）', async () => {
     const { orch } = build(fakePoller(tmp, [[{ id: 'T-1', sourceUpdatedAt: Date.now() - 20 * MIN }]]), 15);
 
-    await orch.tick();
+    await tickAndPlan(orch);
 
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 1);
     assert.equal(tmp.ledger.listTasksByState('discovered').length, 0);
@@ -1356,10 +1464,10 @@ describe('Orchestrator — 靜置期閘門', () => {
       15,
     );
 
-    await orch.tick(); // T-1 出現，太新 → 等
+    await tickAndPlan(orch); // T-1 出現，太新 → 等
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 0);
 
-    await orch.tick(); // T-2 出現，仍太新 → 還是等
+    await tickAndPlan(orch); // T-2 出現，仍太新 → 還是等
     assert.equal(tmp.ledger.listGroupsByState('ready').length, 0);
     assert.equal(tmp.ledger.listTasksByState('discovered').length, 2);
   });
@@ -1406,14 +1514,14 @@ describe('Orchestrator — 靜置期（真實 Poller + MCP 時間戳）', () => 
 
   it('MCP 說任務是 2 分鐘前建的 → 擋下', async () => {
     const { orch, dispatched } = orchWith(mcpWith(new Date(Date.now() - 2 * 60_000).toISOString()));
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 0);
     assert.equal(tmp.ledger.getTask('T-1')?.state, 'discovered');
   });
 
   it('MCP 說任務是昨天建的 → 立刻放行（重啟後不必空等 15 分鐘）', async () => {
     const { orch, dispatched } = orchWith(mcpWith(new Date(Date.now() - 24 * 60 * 60_000).toISOString()));
-    await orch.tick();
+    await tickUntilDispatched(orch);
     assert.equal(dispatched.length, 1);
     assert.equal(tmp.ledger.getTask('T-1')?.state, 'queued');
   });
@@ -1458,7 +1566,7 @@ describe('Orchestrator — 花費上限', () => {
   it('未超限 → 照常派工', async () => {
     seedReady('g1');
     const { orch, dispatched } = build(ok);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 1);
   });
 
@@ -1469,7 +1577,7 @@ describe('Orchestrator — 花費上限', () => {
   it('超過上限 → 不派新群組，並留下可查的事件', async () => {
     seedReady('g1');
     const { orch, dispatched } = build(over);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 0);
     assert.ok(tmp.ledger.hasEvent('system', null, 'budget_blocked'));
   });
@@ -1481,9 +1589,9 @@ describe('Orchestrator — 花費上限', () => {
   it('連續幾輪都超限，事件只記一次（不是每輪一筆）', async () => {
     seedReady('g1');
     const { orch, dispatched } = build(over);
-    await orch.tick();
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 0);
     const blocked = tmp.ledger.listEvents().filter((e) => e.kind === 'budget_blocked');
     assert.equal(blocked.length, 1, `budget_blocked 應該只有一筆，實際 ${blocked.length}`);
@@ -1492,7 +1600,7 @@ describe('Orchestrator — 花費上限', () => {
   it('越過警戒線仍然派工，但要通知', async () => {
     seedReady('g1');
     const { orch, dispatched, notices } = build(warn);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 1, '警戒不是煞車');
     assert.equal(notices.length, 1);
   });
@@ -1514,7 +1622,7 @@ describe('Orchestrator — 花費上限', () => {
   it('超限與警戒是不同的通知（都會各發一次）', async () => {
     seedReady('g1');
     const { orch, notices } = build(() => ({ ok: false, exceeded: [usage(1.1)], warning: [], all: [usage(1.1)] }));
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(notices.length, 1);
     assert.match(notices[0]!, /暫停派出新群組/);
   });
@@ -1524,7 +1632,7 @@ describe('Orchestrator — 花費上限', () => {
     seedReady('g1');
     const rec = createRecordingLogger();
     const { orch, dispatched } = build(() => { throw new Error('DB 忙碌'); }, { log: rec.logger });
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 1);
     assert.ok(rec.messages('warn').some((m) => m.includes('花費上限計算失敗')));
   });
@@ -1535,7 +1643,7 @@ describe('Orchestrator — 花費上限', () => {
       // 非同步 rejection：實跑時就是這個沒被接住，把整個 daemon 殺掉
       notifier: { event: () => {}, notice: async () => { throw new Error('Slack 掛了'); } },
     });
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 0, '通知失敗不該讓超限的群組被派出去');
   });
 
@@ -1550,7 +1658,7 @@ describe('Orchestrator — 花費上限', () => {
       log: createSilentLogger(),
       quietMinutesOf: () => 0,
     }, 0.01);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(dispatched.length, 1);
   });
 });
@@ -1718,7 +1826,7 @@ describe('Orchestrator — 待處理事項不會無聲卡住', () => {
   it('有待處理事項 → 發出摘要提醒', async () => {
     seedPending();
     const { orch, notices } = build(60_000);
-    await orch.tick();
+    await tickAndPlan(orch);
     const r = reminders(notices);
     assert.equal(r.length, 1);
     assert.match(r[0]!, /有 1 件事在等你處理/);
@@ -1729,9 +1837,9 @@ describe('Orchestrator — 待處理事項不會無聲卡住', () => {
   it('間隔內不重複提醒', async () => {
     seedPending();
     const { orch, notices } = build(60_000);
-    await orch.tick();
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
     assert.equal(reminders(notices).length, 1);
   });
 
@@ -1750,22 +1858,22 @@ describe('Orchestrator — 待處理事項不會無聲卡住', () => {
   it('間隔到了會再提醒一次（事情還沒處理就要繼續叫）', async () => {
     seedPending();
     const { orch, notices } = build(1); // 1ms：等同「間隔已過」
-    await orch.tick();
+    await tickAndPlan(orch);
     await new Promise((r) => setTimeout(r, 5));
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(reminders(notices).length, 2);
   });
 
   it('沒有待處理事項 → 完全不吵', async () => {
     const { orch, notices } = build(60_000);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(reminders(notices).length, 0);
   });
 
   it('設 0 = 關閉提醒', async () => {
     seedPending();
     const { orch, notices } = build(0);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(reminders(notices).length, 0);
   });
 
@@ -1841,14 +1949,14 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
   it('前置任務的 PR 還開著等審查 → 下游不派（MCP 說 done，但 base 裡沒有）', async () => {
     seed('in_review');
     const { orch, dispatched } = build();
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), [], '成果還沒進 base，不能開工');
   });
 
   it('前置群組已合併 → 放行', async () => {
     seed('merged');
     const { orch, dispatched } = build();
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g-down']);
   });
 
@@ -1869,7 +1977,7 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     tmp.ledger.updateTaskState('B', 'queued', { groupId: 'g1' });
 
     const { orch, dispatched } = build();
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g1']);
   });
 
@@ -1885,7 +1993,7 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     tmp.ledger.updateTaskState('T-x', 'queued', { groupId: 'gx' });
 
     const { orch, dispatched } = build();
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['gx']);
   });
 });
@@ -2009,7 +2117,7 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
   it('base 沒動 → 照常合併', async () => {
     seedApproved();
     const { orch, merges } = build(async () => 'sha-verified');
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(merges.length, 1);
     assert.equal(tmp.ledger.getGroup('g1')?.state, 'merged');
   });
@@ -2017,7 +2125,7 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
   it('base 被動過 → 本輪不合併，留下可查的事件（下一輪重跑守衛）', async () => {
     seedApproved();
     const { orch, merges } = build(async () => 'sha-someone-else-merged');
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(merges, [], '守衛驗的那個世界已經不存在，不能就這樣合併');
     assert.notEqual(tmp.ledger.getGroup('g1')?.state, 'merged');
     assert.equal(
@@ -2030,7 +2138,7 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
   it('讀不到 remote 狀態（離線／無 remote）→ 不亂擋', async () => {
     seedApproved();
     const { orch, merges } = build(async () => undefined);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.equal(merges.length, 1);
   });
 });
@@ -2072,22 +2180,22 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
 
   it('專案不可用 → 不派工，且狀態維持 ready（恢復後自動繼續）', async () => {
     const { orch, dispatched } = build(false);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched, []);
     assert.equal(tmp.ledger.getGroup('g1')?.state, 'ready', '絕不可以標 failed——那會燒掉重試預算');
   });
 
   it('專案可用 → 照常派工', async () => {
     const { orch, dispatched } = build(true);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g1']);
   });
 
   it('停用期間每輪都會撞到，但只吵一次', async () => {
     const { orch, rec } = build(false);
-    await orch.tick();
-    await orch.tick();
-    await orch.tick();
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
     assert.equal(rec.messages('warn').filter((m) => m.includes('專案目前不可用')).length, 1);
   });
 
@@ -2108,7 +2216,7 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
       id: 'g2', repo: 'acme/web', branch: 'orch/web/g2', taskIds: [],
       footprint: [], state: 'ready',
     } as unknown as Group);
-    await orch.tick();
+    await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g2']);
   });
 });
