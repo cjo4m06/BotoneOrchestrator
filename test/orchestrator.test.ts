@@ -2034,3 +2034,81 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
     assert.equal(merges.length, 1);
   });
 });
+
+/**
+ * 專案暫時不可用（使用者停用了、正在編輯、MCP 一時連不上）時，該專案的群組
+ * **只是不派工**，狀態完全不動——每一種原因都會自己好。
+ *
+ * 實跑撞到：使用者建立專案後停用去檢查設定，群組被派出去 → GroupRunner 找不到專案
+ * → 標 failed → 每 15 秒重派一次 → 3 次用完 requeue_exhausted。回來時
+ * 3 個群組（13 個任務）已經被系統自己判死，而成果是零。
+ */
+describe('Orchestrator — 專案不可用時暫不派工', () => {
+  let tmp: TmpLedger;
+  beforeEach(() => { tmp = createTmpLedger(); });
+  afterEach(() => tmp.cleanup());
+
+  function build(available: boolean) {
+    const dispatched: Group[] = [];
+    const rec = createRecordingLogger();
+    const orch = new Orchestrator(
+      {
+        poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
+        planner: new Planner(),
+        dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
+        ledger: tmp.ledger,
+        log: rec.logger,
+        quietMinutesOf: () => 0,
+        isProjectAvailable: () => available,
+      },
+      0.01,
+    );
+    tmp.ledger.upsertGroup({
+      id: 'g1', repo: 'acme/web', branch: 'orch/web/g1', taskIds: [],
+      footprint: ['src/a.ts'], state: 'ready',
+    } as unknown as Group);
+    return { orch, dispatched, rec };
+  }
+
+  it('專案不可用 → 不派工，且狀態維持 ready（恢復後自動繼續）', async () => {
+    const { orch, dispatched } = build(false);
+    await orch.tick();
+    assert.deepEqual(dispatched, []);
+    assert.equal(tmp.ledger.getGroup('g1')?.state, 'ready', '絕不可以標 failed——那會燒掉重試預算');
+  });
+
+  it('專案可用 → 照常派工', async () => {
+    const { orch, dispatched } = build(true);
+    await orch.tick();
+    assert.deepEqual(dispatched.map((g) => g.id), ['g1']);
+  });
+
+  it('停用期間每輪都會撞到，但只吵一次', async () => {
+    const { orch, rec } = build(false);
+    await orch.tick();
+    await orch.tick();
+    await orch.tick();
+    assert.equal(rec.messages('warn').filter((m) => m.includes('專案目前不可用')).length, 1);
+  });
+
+  it('未注入 isProjectAvailable → 一律視為可用（舊呼叫端不受影響）', async () => {
+    const dispatched: Group[] = [];
+    const orch = new Orchestrator(
+      {
+        poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
+        planner: new Planner(),
+        dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
+        ledger: tmp.ledger,
+        log: createSilentLogger(),
+        quietMinutesOf: () => 0,
+      },
+      0.01,
+    );
+    tmp.ledger.upsertGroup({
+      id: 'g2', repo: 'acme/web', branch: 'orch/web/g2', taskIds: [],
+      footprint: [], state: 'ready',
+    } as unknown as Group);
+    await orch.tick();
+    assert.deepEqual(dispatched.map((g) => g.id), ['g2']);
+  });
+});

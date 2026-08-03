@@ -26,7 +26,10 @@ export function migrateYamlIfPresent(store: ConfigStore, log: Logger, baseDir = 
   const raw = loadRawConfig(baseDir);
   store.saveSettings(raw.orchestrator as Record<string, unknown>);
   const ids: string[] = [];
-  for (const p of raw.projects) ids.push(store.upsertProject(p).id);
+  // 從 yaml 遷移進來的專案**維持啟用**：那是使用者早就在跑的設定，
+  // 不該因為換了儲存位置就被靜默關掉。（新專案預設停用是另一回事——
+  // 那是「還沒被檢查過」，這裡是「本來就在跑」。）
+  for (const p of raw.projects) ids.push(store.upsertProject(p, { enabled: true }).id);
   log.info(
     { projects: ids },
     '已把 config/*.yaml 匯入資料庫；之後請用控制台修改設定（yaml 已改名為 .imported，不再讀取）',

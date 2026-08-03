@@ -144,8 +144,12 @@ export class ConfigStore {
     const existing = this.db.prepare('SELECT enabled FROM projects WHERE id = ?').get(validated.id) as
       | { enabled: number }
       | undefined;
-    // 沒指定 enabled 時保留原值；全新專案預設啟用
-    const enabled = opts.enabled ?? (existing ? existing.enabled === 1 : true);
+    // 沒指定 enabled 時保留原值；**全新專案預設停用**。
+    //
+    // 建立完就直接開跑的話，使用者根本來不及檢查設定對不對——實跑撞到：
+    // 專案一存好就撈進 13 個任務、建了 3 個群組開始做，而那時驗收指令都還沒填。
+    // 先停用、看過設定再按「啟用」，是唯一能真正檢查的順序。
+    const enabled = opts.enabled ?? (existing ? existing.enabled === 1 : false);
     this.db
       .prepare(
         `INSERT INTO projects (id, repo, enabled, config, created_at, updated_at)

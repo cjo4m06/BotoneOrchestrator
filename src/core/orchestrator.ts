@@ -219,6 +219,11 @@ export interface OrchestratorDeps {
    */
   budget?: () => BudgetVerdict;
   /**
+   * 這個 repo 的專案現在可不可用（在 registry 裡）。
+   * 停用中／編輯中／MCP 連不上時回 false → 該專案的群組暫不派工，狀態完全不動。
+   */
+  isProjectAvailable?: (repo: string) => boolean;
+  /**
    * 待處理事項的提醒間隔（毫秒）。0／未給 = 不提醒。
    * 沒有它，錯過的那一則通知就等於那件事永遠沒有人會再提起。
    */
@@ -407,7 +412,10 @@ export class Orchestrator {
 
     // 4) Dispatch：派出 ready 群（併發 + 足跡序列化由 Dispatcher 控管）
     //    先看花費上限。超了就不派新的——但已經在跑的不動，那些錢已經花掉了。
-    const ready = ledger.listGroupsByState(DISPATCHABLE_GROUP_STATE).filter((g) => this.depsInBase(g));
+    const ready = ledger
+      .listGroupsByState(DISPATCHABLE_GROUP_STATE)
+      .filter((g) => this.projectAvailable(g))
+      .filter((g) => this.depsInBase(g));
     if (ready.length) {
       if (this.withinBudget(ready.length)) dispatcher.dispatch(ready);
     }
@@ -469,6 +477,26 @@ export class Orchestrator {
    *   · 超過上限   → 明確告訴人「停了、什麼時候會自己恢復」
    * 去重鍵寫在 ledger events，所以**跨重啟**也不會重複通知。
    */
+  /**
+   * 這個群組的專案現在可不可用。
+   *
+   * 專案被停用、正在編輯、或它的 MCP 一時連不上時，registry 裡就沒有它。
+   * 這時**不要派工**——派下去 GroupRunner 也只能立刻退回來，白跑一趟還洗版。
+   * 每一種原因都會自己好，所以只是不派，群組狀態完全不動。
+   *
+   * 未注入 isProjectAvailable 就一律視為可用（測試與舊呼叫端不受影響）。
+   */
+  private projectAvailable(group: Group): boolean {
+    const check = this.deps.isProjectAvailable;
+    if (!check || check(group.repo)) return true;
+    this.warnOnce(
+      `noproj:${group.repo}`,
+      { group: group.id, repo: group.repo },
+      '專案目前不可用（停用中／編輯中／MCP 連不上），暫不派工——恢復後會自動繼續',
+    );
+    return false;
+  }
+
   /**
    * 任務宣告的前置任務，成果是不是真的在 base 裡了。
    *

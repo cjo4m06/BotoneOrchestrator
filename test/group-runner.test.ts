@@ -1165,14 +1165,33 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     assert.ok(rec.messages('warn').some((m) => m.includes('worktree 清理失敗')));
   });
 
-  it('找不到專案 runtime → failed 且不建立 worktree', async () => {
+  /**
+   * 「查不到專案」有很多原因——使用者在控制台停用了它、正在編輯、MCP 一時連不上——
+   * **每一種都會自己好**。標 failed 會讓 Orchestrator 走重新派工的路，
+   * 而每 15 秒重試一次、連錯 3 次就永久停手：只要停用超過 45 秒，那一群就死了。
+   *
+   * 實跑撞到：使用者建立專案後停用去檢查設定，回來時 3 個群組（13 個任務）
+   * 已經 requeue_exhausted 停在那裡，成果是零——純粹被系統自己判死。
+   */
+  it('查不到專案 → 退回 ready 等下一輪（不標 failed、不建 worktree）', async () => {
     const group = seedGroup(['某任務']);
     const h = build({ resolveProject: () => undefined });
 
     await h.runner.run(group);
 
-    assert.equal(tmp.ledger.getGroup(group.id)?.state, 'failed');
+    assert.equal(tmp.ledger.getGroup(group.id)?.state, 'ready', '專案回來就要能自動繼續');
     assert.deepEqual(h.wt.created, []);
+  });
+
+  it('查不到專案時只吵一次（停用期間每 15 秒都會撞到，不能洗版）', async () => {
+    const group = seedGroup(['某任務']);
+    const h = build({ resolveProject: () => undefined });
+
+    await h.runner.run(group);
+    await h.runner.run(group);
+    await h.runner.run(group);
+
+    assert.equal(rec.messages('warn').filter((m) => m.includes('查不到專案')).length, 1);
   });
 });
 

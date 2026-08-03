@@ -97,13 +97,18 @@ describe('控制台 API', () => {
     assert.equal(((await get(h, '/api/settings')).body.effective as { pollIntervalSec: number }).pollIntervalSec, 9);
   });
 
-  it('專案：新增 → 列出 → 停用 → 刪除', async () => {
+  it('專案：新增（預設停用）→ 列出 → 啟用 → 停用 → 刪除', async () => {
     assert.equal((await send(h, 'PUT', '/api/projects', project())).status, 200);
 
     const list = await get(h, '/api/projects');
     const rows = list.body.projects as { enabled: boolean; effective: { id: string } }[];
     assert.deepEqual(rows.map((r) => r.effective.id), ['p1']);
-    assert.equal(rows[0]?.enabled, true);
+    // 新專案預設停用：控制台列得出來，但 daemon 不會撿它去做事，
+    // 讓使用者有機會先檢查驗收指令等設定（實跑撞過：一存好就開始做 13 個任務）
+    assert.equal(rows[0]?.enabled, false);
+
+    await send(h, 'POST', '/api/projects/p1/enabled', { enabled: true });
+    assert.equal(((await get(h, '/api/projects')).body.projects as { enabled: boolean }[])[0]?.enabled, true);
 
     await send(h, 'POST', '/api/projects/p1/enabled', { enabled: false });
     assert.equal(((await get(h, '/api/projects')).body.projects as { enabled: boolean }[])[0]?.enabled, false);

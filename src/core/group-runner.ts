@@ -615,12 +615,37 @@ export class GroupRunner {
     this.git = deps.git ?? defaultGit;
   }
 
+  /** 同一件事只吵一次（例如專案被停用期間，每 15 秒都會撞到同一個狀況）。 */
+  private readonly warnedOnce = new Set<string>();
+
+  private warnOnce(key: string, ctx: Record<string, unknown>, msg: string): void {
+    if (this.warnedOnce.has(key)) return;
+    this.warnedOnce.add(key);
+    this.deps.log.warn(ctx, msg);
+  }
+
   run = async (group: Group): Promise<void> => {
     const { ledger, log } = this.deps;
     const proj = this.deps.resolveProject(group.repo);
     if (!proj) {
-      log.error({ repo: group.repo }, '找不到專案 runtime，群組跳過');
-      ledger.updateGroupState(group.id, 'failed');
+      // **不可以標 failed。**
+      //
+      // 「查不到專案」有很多原因——使用者在控制台停用了它、正在編輯、MCP 一時連不上——
+      // 每一種都會自己好。標 failed 會讓 Orchestrator 走重新派工的路，
+      // 而每 15 秒重試一次、連錯 3 次就永久停手：只要停用超過 45 秒，那一群就死了。
+      //
+      // 實跑撞到：使用者建立專案後停用去檢查設定，回來時 3 個群組（13 個任務）
+      // 已經 requeue_exhausted 停在那裡，而且成果是零——純粹是被系統自己判死的。
+      //
+      // 退回 ready 等下一輪。專案回來就自動繼續，也不消耗任何重試預算。
+      // （崩潰對帳那邊本來就是這個原則：「不知道 repoPath 無法安全清理，更不能標 failed」，
+      //   這條路先前完全相反。）
+      this.warnOnce(
+        `noproj:${group.id}`,
+        { group: group.id, repo: group.repo },
+        '查不到專案（可能被停用或正在編輯），群組退回 ready 等下一輪，不消耗重試預算',
+      );
+      ledger.updateGroupState(group.id, 'ready');
       return;
     }
 

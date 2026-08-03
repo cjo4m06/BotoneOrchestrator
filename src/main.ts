@@ -1282,6 +1282,8 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       dispatcher,
       ledger,
       log,
+      // 專案被停用／正在編輯／MCP 連不上時就不派工（狀態不動，恢復後自動繼續）
+      isProjectAvailable: (repo) => registry.runtimeOf(repo) !== undefined,
       reviewWatcher,
       feedback,
       // 合併核准閘門（政策要求人工時發問）＋ 人在 Slack 的裁決 → 核准憑證

@@ -168,14 +168,29 @@ describe('ConfigStore — 設定的唯一事實源', () => {
     ...over,
   });
 
-  it('新增專案預設啟用，projects() 只回啟用中的', () => {
+  /**
+   * 建立完就直接開跑的話，使用者根本來不及檢查設定對不對。
+   * 實跑撞到：專案一存好就撈進 13 個任務、建了 3 個群組開始做，
+   * 而那時驗收指令都還沒填。先停用、看過設定再按「啟用」，才檢查得到。
+   */
+  it('新增專案預設**停用**，daemon 看不到（要人按啟用才跑）', () => {
     store.upsertProject(project());
+    assert.deepEqual(store.projects(), [], '沒按啟用之前不該被 daemon 撈到');
+    assert.equal(store.allProjects()[0]?.enabled, false, '控制台仍列得出來');
+    assert.equal(store.setProjectEnabled('p1', true), true);
     assert.deepEqual(store.projects().map((p) => p.id), ['p1']);
+  });
+
+  it('改設定不會把已啟用的專案關掉（沒指定 enabled 就保留原值）', () => {
+    store.upsertProject(project());
+    store.setProjectEnabled('p1', true);
+    store.upsertProject({ ...project(), baseBranch: 'dev' });
     assert.equal(store.allProjects()[0]?.enabled, true);
   });
 
   it('停用的專案 daemon 看不到，但控制台仍列得出來', () => {
     store.upsertProject(project());
+    store.setProjectEnabled('p1', true);
     assert.equal(store.setProjectEnabled('p1', false), true);
     assert.deepEqual(store.projects(), []);
     assert.equal(store.allProjects().length, 1);
