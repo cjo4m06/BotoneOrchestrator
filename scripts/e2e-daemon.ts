@@ -610,6 +610,10 @@ async function main(): Promise<void> {
     log.info({ tick: t }, `═══════════ tick ${t} ═══════════`);
 
     await orch.tick();
+    // 規劃是背景跑的（見 orchestrator 的 startPlanning）。這個腳本要驗的是
+    // 「一輪走完會發生什麼」，所以每輪都等它收尾——不等的話建群會落在下一輪，
+    // 而且腳本結束時 ledger 已經關掉，背景規劃會撞到 "database is not open"。
+    await orch.settlePlanning();
     const idle = await waitIdle(dispatcher, IDLE_TIMEOUT_MS);
     if (!idle) {
       note('tick 迴圈不卡住', false, `tick ${t}：dispatcher 在 ${IDLE_TIMEOUT_MS}ms 內沒有釋放 slot`);
