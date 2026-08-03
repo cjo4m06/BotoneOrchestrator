@@ -81,6 +81,15 @@ LAYER 3 · 隔離工作區   git worktree #1   worktree #2 ...  (每群獨立分
 
 ---
 
+**每一段都要在控制台看得見**（activity 表）。花時間最久的幾段——規劃 agent 讀完整個 repo
+再分群（實測單次 6 分鐘）、reviewer 審查、介面判斷者量版面、合併把關比對 diff——期間
+ledger 完全靜止：任務狀態沒變、群組狀態沒變、事件表沒有新列。沒有 activity 的話，
+畫面與「平台掛了」完全一樣（使用者實際回報：「我以為整個專案都在停擺」）。
+同理，整輪失敗要寫 `tick_failed` 事件——只寫 log 的話，「閒著」與「每輪都在同一個地方炸掉」
+在畫面上長得一模一樣。
+
+---
+
 ## 4. 任務層 / 群組層狀態機
 
 ```
@@ -281,6 +290,12 @@ interface AgentSession {                         // 一列 = 一個任務在一�
   rounds: number; costUsd: number;               // 多輪累加
   inputTokens: number; outputTokens: number; cacheReadTokens: number;
   models: string[]; status: 'active'|'done'|'parked'|'error';
+}
+interface Activity {                             // **活的**，不是稽核：開工寫一列、做完刪掉
+  id: string; kind: 'plan'|'poll'|'code'|'review_poll'|'merge';
+  repo?: string; refId?: string;                 // 對應的 task／group
+  title: string; detail?: string;                // 「規劃 14 個任務」／「第 3 輪：跑驗收關卡」
+  startedAt: number; heartbeatAt: number;        // 心跳分辨「跑很久」與「daemon 死了」
 }
 // 另: task_iterations(結果簽章歷史)、clarifications(thread_ts↔task↔問題)、events(audit)
 // 加欄位一律走 applyColumnMigrations（CREATE TABLE IF NOT EXISTS 不會讓既有表長出新欄位）

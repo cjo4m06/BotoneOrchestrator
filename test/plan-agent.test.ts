@@ -149,6 +149,19 @@ describe('buildPlanPrompt', () => {
     const p = buildPlanPrompt([task('T-9')], []);
     assert.doesNotMatch(p, /已經在進行/);
     assert.doesNotMatch(p, /跨批次的依賴用/);
+    // 沒有既有群組時，afterExisting 連提都不要提：欄位擺在範例裡卻沒有解釋，
+    // 規劃者會照字面理解成「這一群排在哪幾群後面」，把自家群代號填進去（實跑撞到）
+    assert.doesNotMatch(p, /afterExisting/, '沒有既有群組時不該出現這個欄位');
+    assert.match(p, /群與群之間的先後一律用/, '要明講先後只用 stages');
+  });
+
+  it('有既有群組時才解釋 afterExisting，並列出可填的 id', () => {
+    const p = buildPlanPrompt([task('T-1')], [
+      { id: 'g_abc123', state: 'pr_open', tasks: [{ id: 'T-0', title: '舊的' }], files: ['a.ts'] },
+    ]);
+    assert.match(p, /afterExisting/);
+    assert.match(p, /g_abc123/);
+    assert.match(p, /群與群之間的先後一律用/, '就算有既有群組，兄弟順序仍然只用 stages');
   });
 });
 
@@ -174,6 +187,114 @@ describe('parsePlanResponse — 跨批次依賴', () => {
       wrap({ groups: [{ id: 'A', taskIds: ['T-1'], files: [], why: '', afterExisting: ['g_不存在'] }], stages: [['A']] }),
       ['T-1'],
       ['g_abc123'],
+    );
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? '' : r.error, /afterExisting 指到不存在的群組/);
+  });
+
+  /**
+   * 實跑撞到的那一個：14 個任務分成 A…N 十幾群，規劃者用 afterExisting 表達
+   * 「這一群排在那一群後面」（那本來就是這個欄位名的字面意思）。
+   * 原本每次都被打回，重問又犯同樣的錯，一輪 tick 燒掉十幾分鐘後整個失敗，
+   * 下一輪從頭再來——專案永遠分不了群。
+   */
+  it('afterExisting 指到同一份計畫裡的群 → 折成階段順序，不是錯誤', () => {
+    const r = parsePlanResponse(
+      wrap({
+        groups: [
+          { id: 'A', taskIds: ['T-1'], files: [], why: '' },
+          { id: 'B', taskIds: ['T-2'], files: [], why: '', afterExisting: ['A'] },
+        ],
+        stages: [['A', 'B']], // 規劃者把兩群放同一階段，順序全靠 afterExisting 講
+      }),
+      ['T-1', 'T-2'],
+      [], // 這次一個既有群組也沒有——正是實跑的情境
+    );
+
+    assert.ok(r.ok, r.ok ? '' : r.error);
+    const stages = r.ok ? r.value.stages : [];
+    assert.deepEqual(stages, [['A'], ['B']], 'B 要被推到 A 後面的階段');
+    assert.deepEqual(r.ok ? r.value.groups[1]?.afterExisting : undefined, [], '兄弟參照不該留在 afterExisting 裡');
+    assert.ok(r.ok && r.notes.some((n) => n.includes('B')), '改了別人的計畫就要講出來');
+  });
+
+  it('多層兄弟依賴 → 一路往後推到底', () => {
+    const r = parsePlanResponse(
+      wrap({
+        groups: [
+          { id: 'A', taskIds: ['T-1'] },
+          { id: 'B', taskIds: ['T-2'], afterExisting: ['A'] },
+          { id: 'C', taskIds: ['T-3'], afterExisting: ['B'] },
+        ],
+        stages: [['A', 'B', 'C']],
+      }),
+      ['T-1', 'T-2', 'T-3'],
+    );
+    assert.ok(r.ok, r.ok ? '' : r.error);
+    assert.deepEqual(r.ok ? r.value.stages : [], [['A'], ['B'], ['C']]);
+  });
+
+  it('既有群組與兄弟混在一起 → 各歸各的', () => {
+    const r = parsePlanResponse(
+      wrap({
+        groups: [
+          { id: 'A', taskIds: ['T-1'] },
+          { id: 'B', taskIds: ['T-2'], afterExisting: ['A', 'g_abc123'] },
+        ],
+        stages: [['A', 'B']],
+      }),
+      ['T-1', 'T-2'],
+      ['g_abc123'],
+    );
+    assert.ok(r.ok, r.ok ? '' : r.error);
+    assert.deepEqual(r.ok ? r.value.groups[1]?.afterExisting : undefined, ['g_abc123'], '既有群組要留著');
+    assert.deepEqual(r.ok ? r.value.stages : [], [['A'], ['B']], '兄弟的部分變成階段');
+  });
+
+  /** 已經排對順序的就不要亂動——只往後推，不往前拉。 */
+  it('階段本來就正確 → 不動它', () => {
+    const r = parsePlanResponse(
+      wrap({
+        groups: [{ id: 'A', taskIds: ['T-1'] }, { id: 'B', taskIds: ['T-2'], afterExisting: ['A'] }],
+        stages: [['A'], ['B']],
+      }),
+      ['T-1', 'T-2'],
+    );
+    assert.ok(r.ok);
+    assert.deepEqual(r.ok ? r.value.stages : [], [['A'], ['B']]);
+    assert.deepEqual(r.ok ? r.notes : ['x'], [], '沒動就不該說動過');
+  });
+
+  /** A 等 B、B 等 A：規劃者自己講矛盾了，那不是我們能替它決定的。 */
+  it('兄弟依賴成環 → 退回重問', () => {
+    const r = parsePlanResponse(
+      wrap({
+        groups: [
+          { id: 'A', taskIds: ['T-1'], afterExisting: ['B'] },
+          { id: 'B', taskIds: ['T-2'], afterExisting: ['A'] },
+        ],
+        stages: [['A', 'B']],
+      }),
+      ['T-1', 'T-2'],
+    );
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? '' : r.error, /循環/);
+  });
+
+  it('自己等自己 → 忽略，不算錯', () => {
+    const r = parsePlanResponse(
+      wrap({ groups: [{ id: 'A', taskIds: ['T-1'], afterExisting: ['A'] }], stages: [['A']] }),
+      ['T-1'],
+    );
+    assert.ok(r.ok, r.ok ? '' : r.error);
+    assert.deepEqual(r.ok ? r.value.stages : [], [['A']]);
+  });
+
+  /** 編出來的 id 還是要退回——那才是真的不知道它在指什麼。 */
+  it('既不是既有群組也不是自家群代號 → 仍然重問', () => {
+    const r = parsePlanResponse(
+      wrap({ groups: [{ id: 'A', taskIds: ['T-1'], afterExisting: ['Z'] }], stages: [['A']] }),
+      ['T-1'],
     );
     assert.equal(r.ok, false);
     assert.match(r.ok ? '' : r.error, /afterExisting 指到不存在的群組/);

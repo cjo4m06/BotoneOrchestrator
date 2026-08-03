@@ -167,6 +167,13 @@ export interface RunTaskInput {
    * 「這次改了什麼」——沒有它，畫面上所有毛病都會被當成這次弄的。
    */
   baseRef?: string;
+  /**
+   * 回報現在在做哪一步（寫程式／跑驗收／審查中）給控制台。
+   *
+   * 任務狀態只有 in_progress / verifying 兩格，看不出「agent 在改第 3 輪」還是
+   * 「在跑 npm test」還是「reviewer 在審」——而這三件事的等待時間差很多。
+   */
+  onPhase?: (detail: string) => void;
 }
 
 /**
@@ -270,6 +277,7 @@ export class Worker {
       if (maxRounds > 0 && round > maxRounds) return this.parkRoundLimit(detail, maxRounds, feedback, threadTs);
       this.say(threadTs, { type: 'iterating', round }, detail);
 
+      input.onPhase?.(`第 ${round} 輪：agent 寫程式中`);
       const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
@@ -322,6 +330,7 @@ export class Worker {
 
       // 3c) DoD 關卡（實跑專案指令 + diff 非空）
       ledger.updateTaskState(task.id, 'verifying');
+      input.onPhase?.(`第 ${round} 輪：跑驗收關卡`);
       // 帶 task 提示：視覺關卡據此判斷要不要驗（category）與截圖歸檔位置
       const gate = await verifier.check({
         cwd,
@@ -340,6 +349,7 @@ export class Worker {
       //     結果覆寫成「本輪有效關卡報告」：reviewer 否決 → 本輪其實不算綠。
       let effective = gate;
       if (gate.green) {
+        input.onPhase?.(`第 ${round} 輪：關卡綠燈，reviewer 對規格審查中`);
         const review = await this.review(detail, docs, cwd, threadTs, reviewRejections);
         if (review.rejected) {
           reviewRejections += 1;

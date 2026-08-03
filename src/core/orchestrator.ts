@@ -22,6 +22,7 @@ import type { Logger } from '../observability/logger.js';
 import type { Notifier } from '../contracts.js';
 import type { VerifierConfig } from '../worker/verifier.js';
 import type { DiffStat, Group, GroupState, LifecycleEvent, MergeVerdict, Task, TaskDetail, PlannedGroup } from '../types.js';
+import { withActivity } from '../observability/activity.js';
 
 /**
  * ── 群組狀態語意：誰寫、誰讀（本檔是「調度器消費哪些狀態」的權威定義） ──────────
@@ -313,6 +314,9 @@ interface DepsWait {
  * 順序有意義：requeue 在 dispatch 之前，重新派工的群同一輪就能被派出；
  * merge 在 reviews 之後，本輪剛核准的群同一輪就能進合併管線。
  */
+/** tick 整輪失敗（控制台要看得到，不能只留在 log 裡）。 */
+export const TICK_FAILED_EVENT = 'tick_failed';
+
 export class Orchestrator {
   private readonly feedback: ReviewFeedbackStore;
   /** feedback 是否為外部共用實例——沒共用就不能把 changes_requested 派回去（沒人讀得到意見）。 */
@@ -369,7 +373,8 @@ export class Orchestrator {
     }
 
     // 1) Poll → 落地 discovered（去重）
-    const fresh = await poller.pollOnce();
+    const fresh = await withActivity(ledger, { id: 'tick:poll', kind: 'poll', title: '向任務板要新任務' },
+      () => poller.pollOnce());
     if (fresh.length) log.info({ count: fresh.length }, 'tick：新任務');
 
     // 2) Requeue：把可重新派工的群組/任務轉回 ready（必須在 plan/dispatch 之前）
@@ -425,10 +430,12 @@ export class Orchestrator {
     }
 
     // 5) 監看 PR 審查結果並消費事件（DESIGN §3 步驟 7）
-    await this.pollReviews();
+    await withActivity(ledger, { id: 'tick:reviews', kind: 'review_poll', title: '看 PR 上有沒有新的審查結果' },
+      () => this.pollReviews());
 
     // 6) 已核准的群組 → Merge Guard → 政策閘門 → 合併（DESIGN §3 步驟 8）
-    await this.processMergeQueue();
+    await withActivity(ledger, { id: 'tick:merge', kind: 'merge', title: '處理已核准、等著合併的群組' },
+      () => this.processMergeQueue());
 
     // 7) 待處理事項的定期提醒（錯過的那一則通知不該讓事情永遠卡住）
     this.remindPending();
@@ -1368,7 +1375,16 @@ export class Orchestrator {
       try {
         await this.tick(signal);
       } catch (e) {
-        this.deps.log.error({ err: e instanceof Error ? e.message : String(e) }, 'tick 發生錯誤（續下一輪）');
+        const why = e instanceof Error ? e.message : String(e);
+        this.deps.log.error({ err: why }, 'tick 發生錯誤（續下一輪）');
+        // **一定要留在 ledger 裡**。只寫 log 的話，控制台上完全看不出來出過事——
+        // 實跑撞到：規劃 agent 連續失敗，每輪燒掉十幾分鐘後整個 tick 中止，
+        // 而使用者看到的畫面完全靜止，只能猜平台是不是掛了。
+        try {
+          this.deps.ledger.logEvent('system', null, TICK_FAILED_EVENT, why);
+        } catch {
+          // ledger 也壞了的話就真的只剩 log 了，但不能因此讓主迴圈停掉
+        }
       }
       // 每輪重新取間隔：控制台改了輪詢週期，下一輪就生效（不必重啟）
       await sleep(this.currentInterval() * 1000, signal);

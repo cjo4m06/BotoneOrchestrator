@@ -1355,6 +1355,8 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。
         inFlightGroups: (repo) => inFlightGroupsOf(ledger, repo),
+        // 規劃一次要跑好幾分鐘，期間 ledger 完全靜止。沒有這個，控制台看起來就是停擺
+        activity: ledger,
         log,
       }),
       dispatcher,
@@ -1518,6 +1520,10 @@ export async function main(): Promise<void> {
 
   const ledger = new Ledger(boot.ledgerPath, log);
   ledger.init();
+  // 上一次是被 kill 掉還是當掉的話，activity 表裡會留著幾件永遠做不完的假工作。
+  // 開機時無條件清掉——這一刻確定沒有任何事情在進行。
+  const ghosts = ledger.clearStaleActivities(0);
+  if (ghosts > 0) log.info({ count: ghosts }, '清掉上次沒收乾淨的進行中項目');
   ledger.logEvent('system', null, 'boot', 'daemon 啟動');
 
   // 人機介面：未啟用/缺 token → createNotifier 自動降級 ConsoleGateway（永不 throw）。

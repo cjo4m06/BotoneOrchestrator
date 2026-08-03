@@ -41,6 +41,19 @@ export interface EventQuery {
   limit?: number;
 }
 
+/** 正在進行的一件事（activity 表的一列）。 */
+export interface Activity {
+  id: string;
+  kind: string;
+  repo?: string;
+  refId?: string;
+  title: string;
+  detail?: string;
+  startedAt: number;
+  heartbeatAt: number;
+}
+export type ActivityInput = Omit<Activity, 'startedAt' | 'heartbeatAt'>;
+
 /** 一次 agent 執行的紀錄（同一 session 多輪會累加）。 */
 export interface AgentSessionInput {
   taskId: string;
@@ -533,6 +546,72 @@ export class Ledger {
     if (changes > 0) return true;
     this.log.warn({ op, ...ctx }, `${op}：找不到目標，狀態未更新`);
     return false;
+  }
+
+  // ── Activity（現在誰在做什麼） ──
+  //
+  // 與 events 的差別：events 是「發生過什麼」（只增不刪），activity 是「正在做什麼」
+  // （做完就刪）。花時間最久的那幾件事——規劃、審查、視覺驗證、合併把關——
+  // 期間 ledger 完全靜止，控制台看起來就像停擺了。這張表就是給那段空白用的。
+
+  /** 開始一件事（同 id 重入直接覆蓋，不會長出兩列）。 */
+  startActivity(a: ActivityInput): void {
+    const now = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO activity (id, kind, repo, ref_id, title, detail, started_at, heartbeat_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           kind = excluded.kind, repo = excluded.repo, ref_id = excluded.ref_id,
+           title = excluded.title, detail = excluded.detail, heartbeat_at = excluded.heartbeat_at`,
+      )
+      .run(a.id, a.kind, a.repo ?? null, a.refId ?? null, a.title, a.detail ?? null, now, now);
+  }
+
+  /**
+   * 還活著（順便可以更新說明）。
+   *
+   * 沒有心跳的話，跑很久的工作與「daemon 被 kill 掉留下的殘列」在畫面上長得一模一樣，
+   * 而那正是使用者最需要分辨的兩件事。
+   */
+  touchActivity(id: string, detail?: string): void {
+    const sql = detail === undefined
+      ? 'UPDATE activity SET heartbeat_at = ? WHERE id = ?'
+      : 'UPDATE activity SET heartbeat_at = ?, detail = ? WHERE id = ?';
+    const params: (string | number)[] = detail === undefined ? [this.now(), id] : [this.now(), detail, id];
+    this.db.prepare(sql).run(...params);
+  }
+
+  endActivity(id: string): void {
+    this.db.prepare('DELETE FROM activity WHERE id = ?').run(id);
+  }
+
+  /** 進行中的事（新的排前面）。 */
+  listActivities(): Activity[] {
+    const rows = this.db.prepare('SELECT * FROM activity ORDER BY started_at DESC').all() as Row[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      kind: String(r.kind),
+      title: String(r.title),
+      startedAt: Number(r.started_at),
+      heartbeatAt: Number(r.heartbeat_at),
+      ...(r.repo != null ? { repo: String(r.repo) } : {}),
+      ...(r.ref_id != null ? { refId: String(r.ref_id) } : {}),
+      ...(r.detail != null ? { detail: String(r.detail) } : {}),
+    }));
+  }
+
+  /**
+   * 清掉殘列，回傳清掉幾筆。
+   *
+   * daemon 被 kill（或當掉）時不會有人來刪自己那幾列，重啟後畫面上就會永遠掛著
+   * 幾件「進行中」的假工作。啟動時無條件清一次（`maxAgeMs` 給 0），
+   * 執行期間則用心跳年齡清那些明明還在卻沒人餵的。
+   */
+  clearStaleActivities(maxAgeMs = 0): number {
+    const cutoff = this.now() - Math.max(0, maxAgeMs);
+    const r = this.db.prepare('DELETE FROM activity WHERE heartbeat_at <= ?').run(cutoff);
+    return Number(r.changes ?? 0);
   }
 
   // ── Events（稽核） ──

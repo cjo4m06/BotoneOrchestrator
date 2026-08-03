@@ -131,6 +131,27 @@ CREATE INDEX IF NOT EXISTS idx_events_ref ON events(ref_id);
 -- 查詢型態固定是 (ref_id, kind) 取最新一筆，故加複合索引；created_at 供保留策略掃描。
 CREATE INDEX IF NOT EXISTS idx_events_lookup ON events(ref_id, kind, id);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+
+-- 現在誰在做什麼。**這張表是活的，不是稽核紀錄**：工作開始寫一列、結束刪掉。
+--
+-- 為什麼需要一張表而不是只看任務狀態：花時間最久的那幾件事根本不對應任何狀態變化。
+-- 規劃 agent 讀完整個 repo 再分群要跑好幾分鐘、reviewer 在審、判斷者在開瀏覽器量版面、
+-- 合併把關在比對 diff——這些期間 ledger 完全靜止，控制台看起來就像平台停擺了
+-- （使用者實際回報：「我以為整個專案都在停擺」）。
+--
+-- 放 DB 而不是放記憶體，因為獨立控制台（npm run console）是**另一個行程**，
+-- 讀不到 daemon 的記憶體。同一個 SQLite 是兩邊唯一的共同介面。
+CREATE TABLE IF NOT EXISTS activity (
+  id           TEXT PRIMARY KEY,  -- 呼叫端給的穩定 id（同一件事重入時覆蓋，不會長出兩列）
+  kind         TEXT NOT NULL,     -- plan | poll | code | verify | review | judge | merge …
+  repo         TEXT,
+  ref_id       TEXT,              -- 對應的 task/group id（可空）
+  title        TEXT NOT NULL,     -- 給人看的一句話：「規劃 14 個任務的分群」
+  detail       TEXT,              -- 次要說明：第幾次嘗試、跑哪一關
+  started_at   INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL   -- 最後一次還活著的時間；daemon 被 kill 的殘留列靠它判死
+);
+CREATE INDEX IF NOT EXISTS idx_activity_started ON activity(started_at);
 `;
 
 /**

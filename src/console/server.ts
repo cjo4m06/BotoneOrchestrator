@@ -18,6 +18,8 @@ import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { ProjectConfig } from '../config/index.js';
 import type { PurgeResult } from '../core/project-purge.js';
+import { STALE_AFTER_MS } from '../observability/activity.js';
+import { TICK_FAILED_EVENT } from '../core/orchestrator.js';
 
 /**
  * 本機控制台。
@@ -274,6 +276,17 @@ export class ConsoleServer {
       groups: GROUP_STATES.flatMap((s) =>
         st.groupsByState[s].map((g) => ({ id: g.id, repo: g.repo, state: g.state, prUrl: g.prUrl ?? null })),
       ),
+      // 現在誰在做什麼。**這是唯一能回答「平台是不是掛了」的東西**——
+      // 規劃、審查、視覺驗證、合併把關期間 ledger 完全靜止，
+      // 沒有這塊的話畫面上什麼都不會動（使用者實際回報：「我以為整個專案都在停擺」）。
+      activities: ledger.listActivities().map((a) => ({
+        ...a,
+        // 心跳太舊 = daemon 沒了但沒人來收這一列。畫面要標出來，不能假裝它還在跑
+        stale: now - a.heartbeatAt > STALE_AFTER_MS,
+      })),
+      // 最近一次整輪失敗。畫面上一定要有——不然「什麼都沒在動」與
+      // 「每一輪都在同一個地方炸掉」長得一模一樣（實跑撞到規劃 agent 連續失敗）。
+      lastFailure: latestTickFailure(ledger, now),
       pending: collectPending(ledger),
       quietWaits: quietWaits(st),
       budget: budgetView(store.settings().budget, (since) => ledger.costSummary(since).costUsd, now),
@@ -426,3 +439,16 @@ function brief(t: { id: string; title: string; repo: string; block?: { reason: s
 }
 
 export type { CompleteTaskFn };
+
+
+/**
+ * 最近一小時內的整輪失敗（沒有就 null）。
+ *
+ * 為什麼要有時效：一小時前失敗過、現在已經正常了，還在畫面上掛紅字只會製造麻痺。
+ * 但**還在持續失敗**的情況下，每一輪都會寫新的一筆，所以它會一直亮著——那正是要的效果。
+ */
+function latestTickFailure(ledger: ConsoleDeps['ledger'], now: number): { at: number; detail: string } | null {
+  const e = ledger.latestEvent('system', null, TICK_FAILED_EVENT);
+  if (!e || now - e.createdAt > 60 * 60_000) return null;
+  return { at: e.createdAt, detail: e.detail ?? '（沒有細節）' };
+}

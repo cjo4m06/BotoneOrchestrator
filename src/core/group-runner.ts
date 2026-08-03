@@ -22,6 +22,7 @@ import type { VerifierConfig } from '../worker/verifier.js';
 import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { GateReport, Group, GroupState, MergeVerdict, PullRequest, Task, TaskDetail, TaskState } from '../types.js';
+import { withActivity } from '../observability/activity.js';
 
 /** 一個專案在執行期需要的東西（由 registry 解析）。 */
 /** 與 MergeGuard 相同的 git 執行方式（reject:false，讓呼叫端自己判 exitCode）。 */
@@ -794,13 +795,21 @@ export class GroupRunner {
       ran += 1;
       // 任務卡是 thread root：沒有它，之後所有事件與入站回覆都沒有 thread 可掛（§8）
       const threadTs = await this.ensureTaskThread(t, detail);
-      const outcome = await worker.runTask({
-        task: detail, cwd: wtPath, verifierConfig: proj.verifierConfig, threadTs, groupId: group.id,
-          ...(signal ? { signal } : {}),
-        // 給介面判斷者的比較基準：它要靠這個查出「這次改了什麼」，
-        // 才不會把整個頁面的既有毛病都算到這次頭上
-        baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,
-      });
+      // 包一層「現在在做什麼」：一個任務可能跑幾十分鐘，期間任務狀態只在
+      // in_progress／verifying 之間跳，看不出它到底在寫程式、跑測試、還是在被審。
+      const outcome = await withActivity(
+        ledger,
+        { id: `task:${t.id}`, kind: 'code', repo: group.repo, refId: t.id, title: `${t.id}　${t.title}`, detail: '準備中' },
+        (update) =>
+          worker.runTask({
+            task: detail, cwd: wtPath, verifierConfig: proj.verifierConfig, threadTs, groupId: group.id,
+              ...(signal ? { signal } : {}),
+            // 給介面判斷者的比較基準：它要靠這個查出「這次改了什麼」，
+            // 才不會把整個頁面的既有毛病都算到這次頭上
+            baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,
+            onPhase: update,
+          }),
+      );
       if (outcome.status !== 'done') {
         return this.handleUnfinished(group, taskId, outcome);
       }

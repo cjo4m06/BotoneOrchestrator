@@ -69,6 +69,18 @@
   .row .meta { color: var(--muted); font-size: 12.5px; margin-top: 3px; word-break: break-word; }
   .empty { padding: 26px 16px; color: var(--muted); text-align: center; font-size: 13px; }
 
+  .panel.failure { border-color: var(--bad); background: var(--bad-soft); }
+  .panel.failure .title { color: var(--bad); font-weight: 620; }
+  .panel.failure .meta { color: var(--fg); word-break: break-word; }
+
+  /* 會跳的點：這塊面板的重點是「證明它還活著」，靜態文字做不到這件事 */
+  .live { width: 7px; height: 7px; border-radius: 99px; background: var(--ok); flex: none; animation: pulse 1.6s ease-in-out infinite; }
+  .live.stale { background: var(--bad); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.75); } }
+  @media (prefers-reduced-motion: reduce) { .live { animation: none; } }
+  .act .title { display: flex; align-items: center; gap: 8px; }
+  .act .elapsed { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
   .tag { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--panel-2); white-space: nowrap; }
   .tag.ok { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
   .tag.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
@@ -181,7 +193,12 @@
 
 <main>
   <section id="tab-overview">
+    <div id="failure"></div>
     <div class="cards" id="cards"></div>
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-robot"/></svg>現在在做什麼</span><span id="actCount" class="tag">0</span></h2>
+      <div id="activity"></div>
+    </div>
     <div class="panel">
       <h2><span class="left"><svg class="i"><use href="#i-help"/></svg>等你處理</span><span id="pendingCount" class="tag">0</span></h2>
       <div id="pending"></div>
@@ -535,6 +552,27 @@ async function loadState() {
     card('coin', '累計花費', money(s.cost.total.costUsd), `${s.cost.total.sessions} 個 session`),
   ].join('');
 
+  // 每輪都在同一個地方炸掉，跟「閒著沒事」在畫面上長得一模一樣——所以要明講
+  $('failure').innerHTML = !s.lastFailure ? '' :
+    `<div class="panel failure"><div class="row"><div class="grow">
+      <div class="title">${icon('alert')} 上一輪執行失敗（${new Date(s.lastFailure.at).toLocaleTimeString('zh-TW')}）</div>
+      <div class="meta">${esc(s.lastFailure.detail)}</div>
+      <div class="meta">下一輪會自動再試。持續出現代表要有人處理。</div>
+    </div></div></div>`;
+
+  const acts = s.activities ?? [];
+  $('actCount').textContent = acts.length;
+  $('actCount').className = 'tag' + (acts.some((a) => a.stale) ? ' bad' : acts.length ? ' ok' : '');
+  $('activity').innerHTML = acts.length === 0
+    ? `<div class="empty">閒著（沒有任何工作在進行）</div>`
+    : acts.map((a) => `<div class="row act"><div class="grow">
+        <div class="title"><span class="live${a.stale ? ' stale' : ''}"></span>
+          <span class="tag ${ACT_KIND[a.kind]?.cls ?? 'info'}">${esc(ACT_KIND[a.kind]?.label ?? a.kind)}</span>
+          ${esc(a.title)}</div>
+        <div class="meta">${a.repo ? esc(shortRepo(a.repo)) + '　' : ''}${esc(a.detail ?? '')}${
+          a.stale ? '　<strong>（沒有心跳，daemon 可能已經不在了）</strong>' : ''}</div>
+      </div><div class="elapsed">${elapsed(s.now - a.startedAt)}</div></div>`).join('');
+
   $('pendingCount').textContent = s.pending.length;
   $('pendingCount').className = 'tag' + (s.pending.length > 0 ? ' warn' : ' ok');
   $('pending').innerHTML = s.pending.length === 0
@@ -556,6 +594,22 @@ async function loadState() {
       + gs.map((x) => `<tr><td><code>${esc(x.id)}</code></td><td>${esc(shortRepo(x.repo))}</td>
         <td><span class="tag info">${esc(x.state)}</span></td>
         <td>${x.prUrl ? `<a href="${esc(x.prUrl)}" target="_blank" rel="noreferrer">開啟</a>` : '—'}</td></tr>`).join('');
+}
+
+// 用人看得懂的詞，不是內部 kind。「review_poll」對使用者沒有意義
+const ACT_KIND = {
+  plan:        { label: '分群規劃', cls: 'info' },
+  poll:        { label: '輪詢', cls: '' },
+  code:        { label: '開發中', cls: 'ok' },
+  review_poll: { label: '看審查', cls: '' },
+  merge:       { label: '合併', cls: 'warn' },
+};
+
+function elapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m} 分 ${s % 60} 秒` : `${Math.floor(m / 60)} 時 ${m % 60} 分`;
 }
 
 const card = (ic, k, v, sub) =>

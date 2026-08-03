@@ -92,16 +92,29 @@ export class PlanAgent {
   /**
    * @throws 規劃失敗（呼叫不通、回應解析不出、內容不自洽）一律擲錯，由上層停下來報給人。
    */
-  async plan(tasks: Task[], repoPath: string, inFlight: InFlightGroup[] = []): Promise<PlanAgentResult> {
+  async plan(
+    tasks: Task[],
+    repoPath: string,
+    inFlight: InFlightGroup[] = [],
+    onProgress?: (detail: string) => void,
+  ): Promise<PlanAgentResult> {
     const attempts = 1 + Math.max(0, this.deps.retries ?? 1);
     let lastErr = '';
     for (let i = 1; i <= attempts; i += 1) {
+      // 重問這件事一定要看得到：一次嘗試就是好幾分鐘，畫面上沒有它的話，
+      // 一輪規劃跑十幾分鐘會被當成當機
+      onProgress?.(attempts > 1 && i > 1 ? `第 ${i}/${attempts} 次嘗試（上一次回應不合格）` : '讀 repo 判斷誰會動到同一批檔案');
       const prompt = buildPlanPrompt(tasks, inFlight, lastErr);
       const text = await this.runQuery(prompt, repoPath);
       const parsed = parsePlanResponse(text, tasks.map((t) => t.id), inFlight.map((g) => g.id));
       if (parsed.ok) {
         this.deps.log.info(
-          { groups: parsed.value.groups.length, stages: parsed.value.stages.map((s) => s.length) },
+          {
+            groups: parsed.value.groups.length,
+            stages: parsed.value.stages.map((s) => s.length),
+            // 修過的地方要講出來。無聲修改別人的計畫，出事時沒人查得到順序為什麼變了
+            ...(parsed.notes.length ? { 已調整: parsed.notes } : {}),
+          },
           '規劃 agent 完成分群與排序',
         );
         return parsed.value;
@@ -190,20 +203,29 @@ export function buildPlanPrompt(tasks: Task[], inFlight: InFlightGroup[] = [], p
         : ''),
   );
 
+  // 沒有既有群組時，afterExisting 連提都不要提。
+  // 它原本無論如何都出現在範例裡卻只在有既有群組時才解釋，於是規劃者照字面理解成
+  // 「這一群排在哪幾群後面」，把自己的群代號填進去——完全合理的誤解，是提示詞的錯。
+  // 群與群的先後本來就該用 stages 講，那是唯一需要的機制。
+  const hasExisting = inFlight.length > 0;
   p.push(
     `\n## 輸出格式（只輸出一個 JSON 程式碼區塊，不要其他文字）\n` +
       '```json\n' +
       `{\n` +
       `  "groups": [\n` +
       `    { "id": "A", "taskIds": ["T-1"], "files": ["src/views/Foo.vue"],\n` +
-      `      "why": "為什麼這幾個一組（給人看的）", "afterExisting": [] }\n` +
+      `      "why": "為什麼這幾個一組（給人看的）"${hasExisting ? ', "afterExisting": []' : ''} }\n` +
       `  ],\n` +
       `  "stages": [["A"], ["B", "C"]]\n` +
       `}\n` +
       '```\n' +
       `規則：每個任務**剛好**出現在一個群裡；每個群**剛好**出現在一個階段裡；` +
-      `stages 的順序就是執行順序，同一階段內並行。` +
-      `afterExisting 只能填上面列出的既有群組 id（沒有就給空陣列）。`,
+      `stages 的順序就是執行順序，同一階段內並行。\n` +
+      `**群與群之間的先後一律用 ${'`stages`'} 表達**——要 B 等 A，就把 A 放前面的階段、B 放後面的階段。`
+      + (hasExisting
+        ? `\n${'`afterExisting`'} 是另一件事：它只能填**上面列出的既有群組 id**`
+          + `（${inFlight.map((g) => g.id).join('、')}），用來等還沒合併的上一批。沒有要等就給空陣列。`
+        : ''),
   );
 
   if (previousError) {
@@ -213,7 +235,7 @@ export function buildPlanPrompt(tasks: Task[], inFlight: InFlightGroup[] = [], p
 }
 
 export type ParseResult =
-  | { ok: true; value: PlanAgentResult }
+  | { ok: true; value: PlanAgentResult; notes: string[] }
   | { ok: false; error: string };
 
 /**
@@ -256,19 +278,97 @@ export function parsePlanResponse(text: string, taskIds: string[], inFlightIds: 
   const ghost = staged.filter((id) => !groupIds.includes(id));
   if (ghost.length > 0) return { ok: false, error: `階段裡出現不存在的群：${uniq(ghost).join('、')}` };
 
-  // afterExisting 只能指向真實存在的既有群組。指錯一律當錯誤重問，不默默丟掉——
-  // 丟掉的話那個依賴就永遠不存在，而它正是「B 需要 A 的成果」這種最要命的關係。
-  const badAfter = uniq(value.groups.flatMap((g) => g.afterExisting).filter((id) => !inFlightIds.includes(id)));
-  if (badAfter.length > 0) {
+  // afterExisting 裡出現的 id 有三種：
+  //
+  //   1. 既有群組 id  → 跨批次依賴，原本就是這個欄位的用途
+  //   2. **這份計畫自己的群代號** → 規劃者想講「這一群要排在那一群後面」
+  //   3. 兩者都不是 → 真的是編出來的，重問
+  //
+  // 第 2 種原本被當成錯誤退回，那是設計錯誤。實跑撞到：14 個任務分成 A…N 十幾群時，
+  // 規劃者很自然會用 afterExisting 表達群與群的先後（那本來就是這個欄位名的字面意思），
+  // 於是每次都被打回、重問又犯同樣的錯，一輪 tick 燒掉十幾分鐘後整個失敗，
+  // 下一輪從頭再來——專案就這樣永遠分不了群。
+  //
+  // 它講的東西是完整而明確的，只是填錯欄位。把它折進階段順序即可：
+  // 依賴者往後推一階。往後推一定安全（判準 3 本來就說判斷不準就排到不同階段），
+  // 把明確講出來的順序丟掉才危險。
+  const ownIds = new Set(groupIds);
+  const known = new Set(inFlightIds);
+  const siblingEdges = new Map<string, string[]>();
+  const bogus: string[] = [];
+  for (const g of value.groups) {
+    const real: string[] = [];
+    for (const id of g.afterExisting) {
+      if (id === g.id) continue;                       // 自己等自己：無意義，直接忽略
+      if (known.has(id)) real.push(id);
+      else if (ownIds.has(id)) siblingEdges.set(g.id, [...(siblingEdges.get(g.id) ?? []), id]);
+      else bogus.push(id);
+    }
+    g.afterExisting = uniq(real);
+  }
+  if (bogus.length > 0) {
     return {
       ok: false,
       error:
-        `afterExisting 指到不存在的群組：${badAfter.join('、')}。`
-        + `只能填上面列出的既有群組 id${inFlightIds.length > 0 ? `（${inFlightIds.join('、')}）` : '（這次一個也沒有，請給空陣列）'}。`,
+        `afterExisting 指到不存在的群組：${uniq(bogus).join('、')}。`
+        + `只能填既有群組 id${inFlightIds.length > 0 ? `（${inFlightIds.join('、')}）` : '（這次一個也沒有）'}`
+        + `，或這份計畫裡的群代號（${groupIds.join('、')}）。`,
     };
   }
 
-  return { ok: true, value };
+  const notes: string[] = [];
+  if (siblingEdges.size > 0) {
+    const restaged = applySiblingOrder(value.stages, siblingEdges);
+    if (!restaged.ok) return { ok: false, error: restaged.error };
+    if (restaged.moved.length > 0) {
+      notes.push(`依 afterExisting 的群組先後把 ${restaged.moved.join('、')} 往後排了一階以上`);
+    }
+    value.stages = restaged.stages;
+  }
+
+  return { ok: true, value, notes };
+}
+
+/**
+ * 把「這一群要排在那一群後面」折進階段：依賴者的階段 = max(原本階段, 上游階段 + 1)。
+ *
+ * 只會往後推，不會往前拉——多等一輪的代價遠低於並行撞車。
+ * 有環代表規劃者自己講矛盾了（A 等 B、B 等 A），那不是我們能替它決定的，退回重問。
+ */
+export function applySiblingOrder(
+  stages: string[][],
+  edges: Map<string, string[]>,
+): { ok: true; stages: string[][]; moved: string[] } | { ok: false; error: string } {
+  const at = new Map<string, number>();
+  stages.forEach((ids, i) => ids.forEach((id) => at.set(id, i)));
+  const original = new Map(at);
+
+  // 反覆鬆弛到收斂。上限 = 群數，超過就是有環。
+  const total = at.size;
+  for (let pass = 0; pass <= total; pass += 1) {
+    let changed = false;
+    for (const [id, ups] of edges) {
+      const want = Math.max(...ups.map((u) => (at.get(u) ?? 0) + 1), at.get(id) ?? 0);
+      if (want !== at.get(id)) { at.set(id, want); changed = true; }
+    }
+    if (!changed) {
+      const moved = [...at].filter(([id, v]) => v !== original.get(id)).map(([id]) => id);
+      return { ok: true, stages: rebuildStages(at), moved };
+    }
+  }
+  return {
+    ok: false,
+    error:
+      `afterExisting 的群組先後關係有循環（${[...edges.keys()].join('、')} 之間），排不出順序。`
+      + '請確認沒有兩群互相等待。',
+  };
+}
+
+/** 依階段序號重建 stages；空的階段直接略過（階段編號只表達先後，不必連號）。 */
+function rebuildStages(at: Map<string, number>): string[][] {
+  const byIndex = new Map<number, string[]>();
+  for (const [id, i] of at) byIndex.set(i, [...(byIndex.get(i) ?? []), id]);
+  return [...byIndex.keys()].sort((a, b) => a - b).map((i) => byIndex.get(i)!);
 }
 
 /** 從回應裡挑出 JSON：優先 ```json 圍欄，其次第一個完整的大括號區塊。 */

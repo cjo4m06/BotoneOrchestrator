@@ -8,6 +8,7 @@ import {
   type Footprint,
   type FootprintScanInput,
 } from '../worker/footprint.js';
+import { withActivity, type ActivitySink } from '../observability/activity.js';
 
 /** FootprintScanner 的最小介面（測試注入假件用，不必扛真實 IO 依賴）。 */
 export interface FootprintScannerLike {
@@ -20,6 +21,8 @@ export interface PlanAgentLike {
     tasks: Task[],
     repoPath: string,
     inFlight: InFlightGroup[],
+    /** 回報進度給控制台（第幾次嘗試）。可不理會。 */
+    onProgress?: (detail: string) => void,
   ): Promise<{
     groups: { id: string; taskIds: string[]; files: string[]; why: string; afterExisting?: string[] }[];
     stages: string[][];
@@ -27,6 +30,11 @@ export interface PlanAgentLike {
 }
 
 export interface PlannerDeps {
+  /**
+   * 「現在在規劃」的登記口。規劃 agent 讀完整個 repo 再分群實測要跑好幾分鐘，
+   * 那段時間 ledger 完全靜止——沒有這個，控制台看起來就是停擺（使用者實際回報過）。
+   */
+  activity?: ActivitySink;
   /**
    * repo（"owner/name"）→ 本地 checkout 路徑。可選：回 undefined（或整個不注入）
    * 代表這個 repo 沒得掃，該 repo 全退回 docRef 代理足跡。
@@ -181,7 +189,19 @@ export class Planner {
         '規劃時告知 agent：這些群組的成果還沒進 base',
       );
     }
-    const plan = await this.deps.planAgent!.plan(tasks, repoPath, inFlight);
+    const plan = this.deps.activity
+      ? await withActivity(
+          this.deps.activity,
+          {
+            id: `plan:${repo}`,
+            kind: 'plan',
+            repo,
+            title: `規劃 ${tasks.length} 個任務要怎麼分群`,
+            detail: '讀 repo 判斷誰會動到同一批檔案',
+          },
+          (update) => this.deps.planAgent!.plan(tasks, repoPath, inFlight, update),
+        )
+      : await this.deps.planAgent!.plan(tasks, repoPath, inFlight);
 
     // 群代號 → 階段序號。parsePlanResponse 已保證每個群剛好出現在一個階段。
     const stageOf = new Map<string, number>();

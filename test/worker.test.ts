@@ -166,6 +166,25 @@ describe('Worker — 單任務監督迴圈', () => {
 
   const cfg = { verifierConfig: { test: 'exit 0' }, cwd: '/tmp/wt' };
 
+  /**
+   * 一個任務可能跑幾十分鐘，而任務狀態只有 in_progress／verifying 兩格。
+   * 「agent 在改第 3 輪」「在跑 npm test」「reviewer 在審」的等待時間差很多，
+   * 分不出來的話人只能盯著同一個狀態猜平台是不是掛了（使用者實際回報過）。
+   */
+  it('回報現在在哪一步（給控制台的「現在在做什麼」）', async () => {
+    const task = makeTask();
+    seed(task);
+    const { worker } = build({ verifier: fakeVerifier([red(), green()]), agent: fakeAgent([{}, {}]) });
+    const phases: string[] = [];
+
+    await worker.runTask({ task, ...cfg, onPhase: (d) => void phases.push(d) });
+
+    assert.ok(phases.some((p) => p.includes('agent 寫程式中')), '寫程式那段要看得到');
+    assert.ok(phases.some((p) => p.includes('跑驗收關卡')), '跑驗收那段要看得到');
+    // 輪次是「同一句話重複出現時」唯一看得出有在動的線索
+    assert.ok(phases.some((p) => p.startsWith('第 2 輪')), '第二輪要看得出來是第二輪');
+  });
+
   it('happy path：紅 → 回灌具體失敗 → 綠 → complete_task → done', async () => {
     const task = makeTask();
     seed(task);
