@@ -956,6 +956,46 @@ export class Ledger {
    *   - task 事件：任務已 done 才可清。
    *   - ledger 已查無對應 task/group 的、以及 system 事件：純稽核，逾期即可清。
    */
+  /**
+   * 還沒被分診的摩擦回報（新到舊）。
+   *
+   * ── 為什麼要在 SQL 排除，不能撈完再濾 ──
+   *
+   * 先前是 `listEvents(limit 200)` 拿最新 200 筆**原始列**，回到記憶體才濾掉已分診的。
+   * 已處理的那幾筆照樣各佔一個視窗名額——於是**越處理，視窗裡真正還開著的越少**，
+   * 而被擠到視窗外的未處理回報永遠進不來。
+   *
+   * 實測：先寫 1 筆從沒人碰過的老回報，再寫 200 筆並全部標成已解決 →
+   * 畫面顯示「沒有待處理的回報（已處理 200 則）」，而那筆老回報還躺在 DB 裡。
+   * 那是一個**假的全綠燈**：沒有錯誤、沒有 WARN，東西就是不見了。
+   */
+  listOpenFriction(kind: string, triagedKind: string, limit = 200): LedgerEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM events e
+          WHERE e.kind = @kind
+            AND NOT EXISTS (
+              SELECT 1 FROM events t
+               WHERE t.kind = @triagedKind AND t.ref_id = CAST(e.id AS TEXT)
+            )
+          ORDER BY e.id DESC LIMIT @limit`,
+      )
+      .all({ kind, triagedKind, limit }) as Row[];
+    return rows.map((r) => this.toEvent(r));
+  }
+
+  /** 已分診的筆數（畫面要看得出它在減少）。 */
+  countTriagedFriction(kind: string, triagedKind: string): number {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM events e
+          WHERE e.kind = @kind
+            AND EXISTS (SELECT 1 FROM events t WHERE t.kind = @triagedKind AND t.ref_id = CAST(e.id AS TEXT))`,
+      )
+      .get({ kind, triagedKind }) as { n?: number } | undefined;
+    return r?.n ?? 0;
+  }
+
   pruneEvents(cutoffMs: number): number {
     if (!Number.isFinite(cutoffMs)) {
       this.log.warn({ cutoffMs }, 'pruneEvents：cutoff 非有效數值，本次不清理');
@@ -966,7 +1006,16 @@ export class Ledger {
         `DELETE FROM events
           WHERE created_at < @cutoff
             AND NOT (scope = 'group' AND ref_id IN (SELECT id FROM groups WHERE state NOT IN ('merged','failed')))
-            AND NOT (scope = 'task'  AND ref_id IN (SELECT id FROM tasks  WHERE state <> 'done'))`,
+            AND NOT (scope = 'task'  AND ref_id IN (SELECT id FROM tasks  WHERE state <> 'done'))
+            -- **摩擦回報與它的分診紀錄不受保留策略管。**
+            --
+            -- 它們現在是一條**待辦佇列**，不是稽核噪音，而保留策略會從兩個方向弄壞它：
+            --   · 沒人處理過的回報：任務一 done（通常幾小時內）就失去保護，30 天後被刪。
+            --     畫面上 total 少一筆、triaged 不會加一——與「有人處理掉了」完全分不出來。
+            --   · 分診紀錄（scope='system'）逾期無條件刪，而回報在任務未 done 時卻被保護：
+            --     於是標過「不處理」的又跳回清單，當初那句必填的理由永久消失。
+            -- 兩者都小（實跑兩天 26 筆），留著的成本遠低於靜靜弄丟一件事。
+            AND kind NOT IN ('friction_report', 'friction_triaged')`,
       )
       .run({ cutoff: cutoffMs });
     if (res.changes > 0) this.log.info({ deleted: res.changes, cutoffMs }, '已清除逾期稽核事件');

@@ -100,8 +100,16 @@ describe('summarizeFriction', () => {
     assert.equal(s.total, 1);
   });
 
+  /**
+   * **輸入是新到舊**（`listEvents` 是 `ORDER BY id DESC`）。
+   *
+   * 這條測試原本餵的是舊→新，於是 `slice(-N).reverse()`（取尾端＝最舊的 N 筆）
+   * 剛好也會過——假件的方向與真實資料相反，把 bug 蓋掉了。實跑 26 筆時
+   * 畫面第一眼看到的是「第 1 筆」，而欄位叫 recent、CLI 標題寫著「最近」。
+   */
   it('最近的排前面（人最想看最新的）', () => {
-    const s = summarizeFriction([ev({ what: '舊', kind: 'other' }), ev({ what: '新', kind: 'other' })]);
+    const s = summarizeFriction([ev({ what: '新', kind: 'other' }), ev({ what: '舊', kind: 'other' })]);
     assert.equal(s.recent[0]?.what, '新');
+    assert.equal(s.recent[1]?.what, '舊');
   });
 });

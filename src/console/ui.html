@@ -594,8 +594,10 @@ document.addEventListener('click', async (ev) => {
       await navigator.clipboard.writeText(r.text);
       toast('卡片文字已複製，貼到任務板即可', 'ok');
     } catch {
-      // 沒有剪貼簿權限（非 https / 使用者拒絕）→ 攤出來讓人自己複製，不要靜靜地失敗
-      window.prompt('複製這段貼到任務板：', r.text);
+      // 沒有剪貼簿權限（切到別的分頁、使用者拒絕）→ 攤出來讓人自己複製。
+      // **回傳值一定要接**：使用者按取消代表他一個字都沒拿到，這時標成「已轉出」
+      // 那筆就這樣消失了（而清單沒有「看已處理」的入口，救不回來）。
+      if (window.prompt('複製這段貼到任務板：', r.text) === null) return;
     }
   }
   el.disabled = true;

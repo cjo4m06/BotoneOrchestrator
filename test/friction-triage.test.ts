@@ -10,6 +10,7 @@ import {
 } from '../src/worker/friction-triage.js';
 import { summarizeFriction, FRICTION_EVENT } from '../src/worker/friction.js';
 import type { LedgerEvent } from '../src/store/ledger.js';
+import { createTmpLedger } from './helpers/index.js';
 
 /**
  * 分診：把「看得見」補成「處理得掉」。
@@ -143,5 +144,80 @@ describe('toTaskCardText：轉成任務板的文字', () => {
   it('缺欄位不會產生「undefined」這種字串', () => {
     const t = toTaskCardText({ what: '只有一句話' });
     assert.doesNotMatch(t, /undefined/);
+  });
+});
+
+/**
+ * 對抗式稽核（2026-08-04）找出來的四個洞。每一個都會讓回報**靜靜消失或永遠消不掉**，
+ * 而那正是這個功能存在的理由——所以它們的回歸測試放在這裡，不放在別處。
+ */
+describe('稽核找出來的洞（回歸）', () => {
+  function freshLedger(t: { after(fn: () => void): void }) {
+    const h = createTmpLedger();
+    t.after(() => h.cleanup());
+    h.ledger.upsertDiscoveredTask({
+      id: 'T', payloadHash: 'h', repo: 'o/r', category: 'dev',
+      title: 't', description: '', dependencies: [], docRefs: [],
+    });
+    return h.ledger;
+  }
+
+  it('**已分診的不佔視窗名額**——否則越處理，未處理的老回報越進不來', (t) => {
+    const l = freshLedger(t);
+    l.logEvent('task', 'T', FRICTION_EVENT, JSON.stringify({ kind: 'other', what: '從來沒人碰過的老回報' }));
+    for (let i = 0; i < 200; i += 1) {
+      l.logEvent('task', 'T', FRICTION_EVENT, JSON.stringify({ kind: 'other', what: `新 ${i}` }));
+    }
+    for (const e of l.listEvents({ scope: 'task', kind: FRICTION_EVENT, limit: 500 })) {
+      if (e.detail?.includes('新 ')) l.logEvent('system', String(e.id), FRICTION_TRIAGED, JSON.stringify({ action: 'resolved' }));
+    }
+
+    const open = l.listOpenFriction(FRICTION_EVENT, FRICTION_TRIAGED, 200);
+
+    assert.equal(open.length, 1, '視窗要留給還沒處理的');
+    assert.match(open[0]!.detail ?? '', /老回報/,
+      '先撈 200 筆再過濾的話，這筆會被已處理的擠出視窗——畫面顯示「沒有待處理的回報」，'
+      + '而它還躺在 DB 裡。那是一個假的全綠燈：沒有錯誤、沒有 WARN，東西就是不見了');
+    assert.equal(l.countTriagedFriction(FRICTION_EVENT, FRICTION_TRIAGED), 200);
+  });
+
+  it('新到舊：第一眼看到的是最新的那筆，不是最舊的', (t) => {
+    const l = freshLedger(t);
+    for (let i = 1; i <= 26; i += 1) {
+      l.logEvent('task', 'T', FRICTION_EVENT, JSON.stringify({ kind: 'other', what: `第 ${i} 筆` }));
+    }
+    const rows = l.listOpenFriction(FRICTION_EVENT, FRICTION_TRIAGED, 200)
+      .map((e) => ({ id: e.id, taskId: e.refId ?? '', ...(e.detail ? { detail: e.detail } : {}) }));
+
+    const s = summarizeFriction(rows, 20, new Map());
+
+    assert.match(s.recent[0]?.what ?? '', /第 26 筆/, '欄位叫 recent、CLI 標題寫「最近」，就不該給最舊的');
+    assert.match(s.groups[0]?.items[0]?.what ?? '', /第 26 筆/, '同一類裡也要最新的排前面');
+  });
+
+  it('**保留策略不可以吃掉沒人處理過的回報**（會與「有人處理掉了」分不出來）', (t) => {
+    const l = freshLedger(t);
+    l.logEvent('task', 'T', FRICTION_EVENT, JSON.stringify({ kind: 'other', what: '沒人碰過' }));
+    l.updateTaskState('T', 'done'); // 任務 done 之後就失去 scope='task' 的保護
+
+    const deleted = l.pruneEvents(Date.now() + 86_400_000); // cutoff 拉到未來 = 全部逾期
+
+    assert.equal(l.listOpenFriction(FRICTION_EVENT, FRICTION_TRIAGED, 200).length, 1,
+      `回報被 prune 掉了（本次清了 ${deleted} 筆）。畫面上 total 少一筆、triaged 不會加一——`
+      + '人完全看不出是「被清掉」還是「有人處理掉了」');
+  });
+
+  it('**分診紀錄也不可以被吃掉**（否則標過「不處理」的又跳回來，理由還消失了）', (t) => {
+    const l = freshLedger(t);
+    l.logEvent('task', 'T', FRICTION_EVENT, JSON.stringify({ kind: 'other', what: 'x' }));
+    const id = l.listEvents({ scope: 'task', kind: FRICTION_EVENT, limit: 10 })[0]!.id;
+    l.logEvent('system', String(id), FRICTION_TRIAGED, JSON.stringify({ action: 'wont_fix', note: '有替代路徑' }));
+
+    l.pruneEvents(Date.now() + 86_400_000);
+
+    const t2 = triagedMap(l.listEvents({ scope: 'system', kind: FRICTION_TRIAGED, limit: 10 }));
+    assert.equal(t2.get(id)?.note, '有替代路徑',
+      '分診紀錄（scope=system）逾期無條件刪、回報卻被保護 → 那筆回報原封不動跳回清單，'
+      + '而當初「為什麼不處理」那句必填的理由永久消失');
   });
 });

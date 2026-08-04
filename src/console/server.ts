@@ -174,9 +174,15 @@ export class ConsoleServer {
     if (path === '/api/friction' && m === 'GET') {
       // agent 回報的系統摩擦。唯讀——這裡不做任何自動處置，
       // 因為那些是自我回報，可能對也可能只是它不想做某件事。
-      // 預設只回**未分診的**——處理過的東西繼續佔版面，清單就永遠不會變短。
-      const triaged = triagedMap(ledger.listEvents({ scope: 'system', kind: FRICTION_TRIAGED, limit: 500 }));
-      return this.json(res, 200, summarizeFriction(frictionInput(ledger), 200, triaged));
+      // **在 SQL 就排除已分診的**（見 Ledger.listOpenFriction）：撈完再濾的話，
+      // 已處理的那幾筆照樣佔著視窗名額，越處理越把未處理的老回報擠出視窗。
+      const open = ledger.listOpenFriction(FRICTION_EVENT, FRICTION_TRIAGED, 200);
+      const summary = summarizeFriction(
+        open.map((e) => ({ id: e.id, taskId: e.refId ?? '(unknown)', ...(e.detail ? { detail: e.detail } : {}) })),
+        200,
+        new Map(),
+      );
+      return this.json(res, 200, { ...summary, triaged: ledger.countTriagedFriction(FRICTION_EVENT, FRICTION_TRIAGED) });
     }
 
     if (path === '/api/friction/card' && m === 'GET') {

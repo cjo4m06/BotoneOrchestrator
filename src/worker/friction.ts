@@ -191,8 +191,10 @@ export function summarizeFriction(
   for (const { rep } of open) byKind[rep.kind] = (byKind[rep.kind] ?? 0) + 1;
 
   const grouped = new Map<string, FrictionItem[]>();
-  // 新到舊：同一類裡最近發生的排前面（舊的那筆多半已經在別處被處理了）
-  for (const x of [...open].reverse()) {
+  // **輸入已經是新到舊**（listEvents 是 ORDER BY id DESC）。先前這裡又 reverse 一次，
+  // 結果同一類裡排在最前面的是**最舊的那筆**——而舊的多半早就在別處被處理掉了，
+  // 人第一眼看到的是已經不重要的東西。
+  for (const x of open) {
     grouped.set(x.rep.kind, [...(grouped.get(x.rep.kind) ?? []), toItem(x)]);
   }
 
@@ -203,6 +205,8 @@ export function summarizeFriction(
     groups: [...grouped.entries()]
       .map(([kind, items]) => ({ kind, count: items.length, items }))
       .sort((a, b) => b.count - a.count),
-    recent: open.slice(-recentLimit).reverse().map(toItem),
+    // 同上：輸入是新到舊，要取的是**前** N 筆。
+    // 先前是 slice(-N)＝取尾端＝最舊的 N 筆，而欄位名叫 recent、CLI 標題寫著「最近」。
+    recent: open.slice(0, recentLimit).map(toItem),
   };
 }
