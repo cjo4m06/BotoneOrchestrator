@@ -17,6 +17,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempts       INTEGER NOT NULL DEFAULT 0,
   last_error     TEXT,
   source_updated_at INTEGER,                  -- MCP 端最後活動時間（靜置期用）
+  -- 本任務**首次認領**時的 HEAD，DoD「diff 非空」關卡的基準。first-write-wins。
+  -- 每輪重抓會讓重跑的任務把自己上一輪的 commit 算進基準 → 判「本輪無變更」（實跑撞過）。
+  task_start_sha TEXT,
+  -- 記下基準是「在哪條分支上」抓的。沿用前要比對——群分支被刪掉重開之後，
+  -- 舊 sha 可能還解得開（所以 commitExists 擋不住）但已經太舊，
+  -- 拿它當基準會讓 diff 含進別的任務的成果，關卡就變成橡皮圖章。
+  task_start_branch TEXT,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
 );
@@ -32,6 +39,11 @@ CREATE TABLE IF NOT EXISTS groups (
   footprint   TEXT NOT NULL DEFAULT '[]',
   rationale  TEXT NOT NULL DEFAULT '',  -- 規劃 agent 說明「為什麼這幾個一組」；給下游 agent 當起手線索
   after_groups TEXT NOT NULL DEFAULT '[]',
+  -- 這一群「從哪裡開工」的 base commit。**first-write-wins，永不重算。**
+  -- 與 check_runs.verified_base_sha 語意相反（那個是「這次驗證對著哪顆 base」，每次重算）：
+  -- 一旦有人把後者寫進這裡，擋「人在 GitHub 上自己按合併」的那道防線就變成自己跟自己比。
+  -- 存的是 40 位 sha 不是 ref 名字——存 'origin/main' 等於欄位裡放一個會飄的東西。
+  base_sha    TEXT,
   state       TEXT NOT NULL,
   pr_url      TEXT,
   pr_number   INTEGER,
@@ -260,6 +272,10 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
   { table: 'agent_sessions', column: 'repo', ddl: 'ALTER TABLE agent_sessions ADD COLUMN repo TEXT' },
   // 規劃 agent 判斷「這幾個任務為什麼是一組」的理由——先前只寫 log 就丟掉了
   { table: 'groups', column: 'rationale', ddl: "ALTER TABLE groups ADD COLUMN rationale TEXT NOT NULL DEFAULT ''" },
+  // 開工基準 sha：first-write-wins、永不重算（見 SCHEMA 裡的說明）
+  { table: 'groups', column: 'base_sha', ddl: 'ALTER TABLE groups ADD COLUMN base_sha TEXT' },
+  { table: 'tasks', column: 'task_start_sha', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_sha TEXT' },
+  { table: 'tasks', column: 'task_start_branch', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_branch TEXT' },
 ];
 
 export interface MigratableDb {

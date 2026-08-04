@@ -690,3 +690,57 @@ test('停用專案不留孤兒：刪任務／群組要級聯刪掉交接單', (t
     '孤兒單會永遠掛在「等你處理」上，指向一個已經不存在的東西',
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 開工基準 sha：first-write-wins
+//
+// 這兩個欄位存在的理由是「我們從哪裡分岔出來」是一個**不會變的事實**。
+// 先前它每次都被重新推導，而重新推導正是那個 bug 的成因
+// （任務重跑時基準含進自己上一輪的 commit → 判「本輪無變更」）。
+// ─────────────────────────────────────────────────────────────────────
+
+test('base_sha：first-write-wins，第二次派工不覆寫', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+  const g = ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+
+  assert.equal(ledger.setGroupBaseSha(g.id, 'a'.repeat(40)), true);
+  assert.equal(ledger.setGroupBaseSha(g.id, 'b'.repeat(40)), false, '第二次要被擋掉');
+  assert.equal(ledger.getGroup(g.id)?.baseSha, 'a'.repeat(40));
+});
+
+test('base_sha：upsertGroup（每次派工都會跑）不得把基準洗掉', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+  const g = ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+  ledger.setGroupBaseSha(g.id, 'c'.repeat(40));
+
+  // 模擬 requeue：同一群再 upsert 一次
+  ledger.upsertGroup({ ...ledger.getGroup(g.id)!, state: 'ready' });
+
+  assert.equal(ledger.getGroup(g.id)?.baseSha, 'c'.repeat(40), 'requeue 不該讓基準飄掉');
+});
+
+test('task_start_sha：first-write-wins，而且分支要一起記下來', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+
+  assert.equal(ledger.setTaskStartSha('T-1', 'd'.repeat(40), 'orch/g1'), true);
+  assert.equal(ledger.setTaskStartSha('T-1', 'e'.repeat(40), 'orch/g2'), false);
+
+  const t1 = ledger.getTask('T-1');
+  assert.equal(t1?.taskStartSha, 'd'.repeat(40));
+  assert.equal(t1?.taskStartBranch, 'orch/g1', '沒有分支就擋不住「群分支刪掉重開之後 sha 還解得開但太舊」');
+});
+
+test('開工基準只收 40 位 sha——寫 ref 名字進去會擲錯（那是會飄的東西）', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+  const g = ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+
+  assert.throws(() => ledger.setGroupBaseSha(g.id, 'origin/main'), /40 位 commit sha/);
+  assert.throws(() => ledger.setTaskStartSha('T-1', 'HEAD'), /40 位 commit sha/);
+  assert.throws(() => ledger.setGroupBaseSha(g.id, 'abc123'), /40 位 commit sha/, '短 sha 也不行——之後要拿來比對');
+
+  assert.equal(ledger.getGroup(g.id)?.baseSha, undefined, '擲錯就不該留下半個值');
+});

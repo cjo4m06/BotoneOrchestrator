@@ -602,6 +602,13 @@ export class Worker {
         log.warn({ cwd, err: e instanceof Error ? e.message : String(e) }, '取 HEAD 失敗');
       }
       if (baseRef) {
+        // **欄位是新家，事件只留當稽核軌跡。** 欄位的 first-write-wins 在 SQL 裡，
+        // 所以「已經有值就不覆寫」是原子的——不像事件要靠讀出來再自己判斷。
+        //
+        // 先判斷格式再寫：欄位只收 40 位 sha（寫 ref 名字進去會擲錯，見 ledger 的
+        // assertCommitSha）。gitHeadRef 正常會回 sha 或空樹 sha，但它也可能因為
+        // 環境異常回別的東西——那時記帳失敗不該讓整個任務倒，退回只寫事件。
+        if (/^[0-9a-f]{40}$/.test(baseRef)) ledger.setTaskStartSha(taskId, baseRef, branch);
         ledger.logEvent('task', taskId, DIFF_BASE_EVENT, JSON.stringify({ sha: baseRef, branch: branch ?? null }));
       }
     }
@@ -652,21 +659,33 @@ export class Worker {
     exists: (cwd: string, sha: string) => Promise<boolean>,
   ): Promise<string | undefined> {
     const { log, ledger } = this.deps;
-    const raw = ledger.latestEvent('task', taskId, DIFF_BASE_EVENT)?.detail;
-    if (!raw) return undefined;
 
-    let sha: string | undefined;
-    let storedBranch: string | null | undefined;
-    try {
-      const parsed = JSON.parse(raw) as { sha?: unknown; branch?: unknown };
-      if (typeof parsed.sha === 'string') sha = parsed.sha;
-      if (typeof parsed.branch === 'string' || parsed.branch === null) storedBranch = parsed.branch;
-    } catch {
-      // 舊格式（純 sha 字串）也接受——升級時不要讓既有任務全部退回重抓
-      sha = raw.trim() || undefined;
+    // **先讀欄位（新家），讀不到才退回事件。**
+    // 既有的 in-flight 任務只有事件，那一輪會走舊路徑，然後呼叫端把欄位補上；
+    // 部署後第一輪的 log 裡會看到這條退路被走到，那是預期的。
+    const row = ledger.getTask(taskId);
+    let sha = row?.taskStartSha;
+    // 欄位有 sha 就一定也有分支的記錄（同一次寫入），沒有記到就是 null（detached）
+    let storedBranch: string | null | undefined = sha ? (row?.taskStartBranch ?? null) : undefined;
+
+    if (!sha) {
+      const raw = ledger.latestEvent('task', taskId, DIFF_BASE_EVENT)?.detail;
+      if (!raw) return undefined;
+      try {
+        const parsed = JSON.parse(raw) as { sha?: unknown; branch?: unknown };
+        if (typeof parsed.sha === 'string') sha = parsed.sha;
+        if (typeof parsed.branch === 'string' || parsed.branch === null) storedBranch = parsed.branch;
+      } catch {
+        // 更舊的格式（純 sha 字串）也接受——升級時不要讓既有任務全部退回重抓
+        sha = raw.trim() || undefined;
+      }
+      if (!sha) return undefined;
     }
-    if (!sha) return undefined;
 
+    // 這兩道驗證對「欄位」與「事件」都要跑：存下來的 sha 會變成孤兒
+    // （worktree 砍掉重建、群分支刪掉重開、任務被搬到別群）。
+    // 沿用一個孤兒 sha 有兩種壞法——解不開就擲錯（整道關卡靜靜停用），
+    // 或解得開但太舊（diff 含別的任務的成果，關卡變成橡皮圖章）。
     if (storedBranch !== undefined && storedBranch !== (branch ?? null)) {
       log.info({ taskId, storedBranch, branch }, 'diff 基準記錄的分支已不同 → 重抓基準');
       return undefined;

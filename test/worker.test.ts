@@ -712,6 +712,47 @@ describe('Worker — 單任務監督迴圈', () => {
       );
     });
 
+    // 上面那些測試用的是 'head-1' 這種假 sha，走不進欄位那條路（欄位只收 40 位 sha）。
+    // 這一條專門證明**欄位本身**生效：只寫欄位、不寫事件，基準仍要被沿用。
+    it('基準沿用讀的是 tasks.task_start_sha 欄位（不是只靠 events）', async () => {
+      const task = makeTask();
+      seed(task);
+      const stored = 'a'.repeat(40);
+      tmp.ledger.setTaskStartSha(task.id, stored, 'orch/proj/g1');
+
+      const verifier = recordingVerifier([green()]);
+      let headCalls = 0;
+      const { worker } = build({
+        verifier,
+        headRef: async () => { headCalls += 1; return 'b'.repeat(40); },
+        currentBranch: async () => 'orch/proj/g1',
+        commitExists: async () => true,
+      });
+
+      await worker.runTask({ task, ...cfg });
+
+      assert.equal(verifier.configs[0]?.diff?.baseRef, stored, '應該用欄位裡的值，不是重抓的 HEAD');
+      assert.equal(headCalls, 0, '欄位有值就不該再付一次 rev-parse');
+    });
+
+    it('欄位的分支與現在不同 → 重抓（群分支刪掉重開，舊 sha 可能還解得開但太舊）', async () => {
+      const task = makeTask();
+      seed(task);
+      tmp.ledger.setTaskStartSha(task.id, 'a'.repeat(40), 'orch/proj/g1');
+
+      const verifier = recordingVerifier([green()]);
+      const { worker } = build({
+        verifier,
+        headRef: async () => 'c'.repeat(40),
+        currentBranch: async () => 'orch/proj/g2',
+        commitExists: async () => true,
+      });
+
+      await worker.runTask({ task, ...cfg });
+
+      assert.equal(verifier.configs[0]?.diff?.baseRef, 'c'.repeat(40), '分支不同就要重抓');
+    });
+
     it('端到端（真 Verifier + 真 git）：任務重跑時，agent 上一輪自己 commit 的成果仍算數', async () => {
       const repo = createTmpGitRepo({ files: { 'a.txt': 'v1\n' } });
       try {

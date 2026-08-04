@@ -688,6 +688,7 @@ export class GroupRunner {
       ledger.logEvent('group', group.id, 'base_stale', fresh.caveat);
       log.warn({ group: group.id, base: proj.baseBranch, caveat: fresh.caveat }, '開工的 base 不保證是最新的');
     }
+    await this.rememberBaseSha(group, proj, fresh);
 
     let wt: { path: string };
     try {
@@ -761,6 +762,38 @@ export class GroupRunner {
       const why = e instanceof Error ? e.message : String(e);
       this.deps.log.warn({ group: groupId, err: why }, 'base 新鮮度檢查失敗，改用本地 base');
       return { ref: proj.baseBranch, fetched: false, caveat: `新鮮度檢查失敗（${why}），基於本地狀態` };
+    }
+  }
+
+  /**
+   * 記下這一群「從哪裡開工」——**只有第一次會寫進去**。
+   *
+   * ── 為什麼要 rev-parse ──
+   *
+   * `freshBase` 回的是 `BaseFreshness.ref`，那是一個**名字**（`origin/main`），不是 commit。
+   * 直接存名字等於欄位裡放一個會飄的東西：三天後再讀它，指到的是三天後的 main，
+   * 而這個欄位存在的全部意義就是「我們從哪裡分岔出來」這個**不會變的事實**。
+   * 這正是它要修的那個 bug 的形狀（基準每次重新推導 → 每次得到不同答案）。
+   *
+   * ── 為什麼要 first-write-wins ──
+   *
+   * `run()` 每次派工都會進來一次（requeue、park 復活、崩潰重排）。沒有這個條件，
+   * 第二次派工就會把基準改成「現在的 base」，所有以它為準的比較全部偏移。
+   * 條件在 SQL 裡（`WHERE base_sha IS NULL`），所以是原子的。
+   *
+   * 解不開 ref 就不寫，只留 warn：這是記帳，不該讓派工停下來。
+   */
+  private async rememberBaseSha(group: Group, proj: ProjectRuntime, fresh: BaseFreshness): Promise<void> {
+    const { ledger, log } = this.deps;
+    if (ledger.getGroup(group.id)?.baseSha) return; // 已經有了就不必付一次 rev-parse
+    const r = await gitExec(proj.repoPath, ['rev-parse', fresh.ref]);
+    const sha = r.exitCode === 0 ? r.stdout.trim() : '';
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      log.warn({ group: group.id, ref: fresh.ref, out: sha.slice(0, 80) }, '解不開開工 base 的 sha，這一群不記基準');
+      return;
+    }
+    if (ledger.setGroupBaseSha(group.id, sha)) {
+      log.info({ group: group.id, ref: fresh.ref, baseSha: sha.slice(0, 8) }, '記下這一群的開工基準（之後不再重算）');
     }
   }
 

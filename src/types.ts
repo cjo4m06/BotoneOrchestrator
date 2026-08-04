@@ -38,6 +38,18 @@ export interface Task {
    * MCP 沒給時間戳就是 undefined，退回用 ledger 的發現時間 createdAt。
    */
   sourceUpdatedAt?: number;
+  /**
+   * 本任務**首次認領**時的 HEAD——DoD「diff 非空」關卡的基準。
+   *
+   * **first-write-wins，永不重算。** 一個任務會被重跑（retry、澄清答覆後續做、
+   * 重啟對帳重排），而 agent 上一輪很可能已經自己 commit 了；每輪重抓 HEAD 的話，
+   * 第二輪的基準就是「含它自己上一輪產出的那個 commit」→ diff 為空 → 判「本輪無變更」。
+   * 實跑撞到：agent 說「實作已完整存在於本分支 HEAD（為本任務前一輪產出），
+   * 但 no-changes 關卡以『本輪起始 HEAD』為基準，因此判定本輪無變更」。
+   */
+  taskStartSha?: string;
+  /** 基準是在哪條分支上抓的（沿用前要比對，見 task_start_branch 的說明）。 */
+  taskStartBranch?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -54,6 +66,15 @@ export interface Group {
    * 「雖然檔案不同，但先後有意義」（依賴、或規劃者判斷很可能會撞）。
    */
   afterGroups: string[];
+  /**
+   * 這一群「從哪裡開工」的 base commit（40 位 sha）。**first-write-wins，永不重算。**
+   *
+   * 與 `check_runs.verified_base_sha` 語意**相反**，命名刻意分家：
+   * 這個是「我們從哪裡分岔出來」，那個是「這次驗證對著哪一顆 base」（每次重算）。
+   * 後者是唯一擋「人在 GitHub 上自己按合併之後 base 就變了」的防線——
+   * 一旦有人把它寫進這個永不重算的欄位，那條防線就變成自己跟自己比。
+   */
+  baseSha?: string;
   /**
    * 規劃 agent 說明「為什麼這幾個任務是一組」。
    *

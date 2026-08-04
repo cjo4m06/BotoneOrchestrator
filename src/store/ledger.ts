@@ -156,6 +156,22 @@ export interface HandoffRow extends Omit<HandoffInput, 'blocking'> {
   consumedAt?: number;
 }
 
+/**
+ * 開工基準只收 40 位 commit sha。
+ *
+ * **擲錯是刻意的**（與 openHandoff 同一種破例）：把 ref 名字（`origin/main`）寫進一個
+ * 「永不重算」的欄位，等於在裡面放一個會飄的東西——三天後再讀它指到的是三天後的 main，
+ * 而這個欄位存在的全部意義就是「我們從哪裡分岔出來」這個不會變的事實。
+ * 那正是它要修的那個 bug 的形狀，所以要在寫程式階段就爆掉，不是變成一行看不見的 WARN。
+ *
+ * 呼叫端若是從 `git rev-parse` 拿到的（可能失敗、可能回空字串），要自己先判斷再呼叫。
+ */
+function assertCommitSha(sha: string, what: string): void {
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`${what}必須是 40 位 commit sha，收到的是 ${JSON.stringify(sha.slice(0, 60))}`);
+  }
+}
+
 function toCheckRun(r: Row): CheckRunRow {
   return {
     id: r.id as number,
@@ -921,9 +937,47 @@ export class Ledger {
       attempts: r.attempts as number,
       lastError: (r.last_error as string) ?? undefined,
       sourceUpdatedAt: (r.source_updated_at as number) ?? undefined,
+      taskStartSha: (r.task_start_sha as string) ?? undefined,
+      taskStartBranch: (r.task_start_branch as string) ?? undefined,
       createdAt: r.created_at as number,
       updatedAt: r.updated_at as number,
     };
+  }
+
+  // ── 開工基準 sha（first-write-wins，永不重算） ──────────────────────
+
+  /**
+   * 寫下這一群的開工基準。**只有還沒有值時才寫得進去**——條件放在 SQL 裡，
+   * 所以「已經有值就不覆寫」是原子的，不是「先讀再判斷再寫」那種會有競態的寫法。
+   *
+   * 為什麼一定要 first-write-wins：`GroupRunner.run()` **每次派工都會跑一次**
+   * （requeue、park 復活、崩潰重排都會再進來），而它是唯一算得出 base 的地方。
+   * 沒有這個條件，第二次派工就會把基準改成「現在的 base」，於是所有以它為準的比較
+   * （diff 關卡、審查者的 diff、新舊問題分辨、合併者算 base 多了什麼）全部偏移。
+   *
+   * @returns 是否真的寫進去了（false = 已經有值，沿用舊的）
+   */
+  setGroupBaseSha(id: string, sha: string): boolean {
+    assertCommitSha(sha, `群組 ${id} 的開工基準`);
+    const r = this.db
+      .prepare('UPDATE groups SET base_sha = @sha WHERE id = @id AND base_sha IS NULL')
+      .run({ id, sha });
+    return r.changes > 0;
+  }
+
+  /**
+   * 寫下這個任務的開工基準（DoD「diff 非空」關卡用）。同樣 first-write-wins。
+   * @returns 是否真的寫進去了
+   */
+  setTaskStartSha(id: string, sha: string, branch?: string): boolean {
+    assertCommitSha(sha, `任務 ${id} 的開工基準`);
+    const r = this.db
+      .prepare(
+        'UPDATE tasks SET task_start_sha = @sha, task_start_branch = @branch' +
+          ' WHERE id = @id AND task_start_sha IS NULL',
+      )
+      .run({ id, sha, branch: branch ?? null });
+    return r.changes > 0;
   }
 
   // ── check_runs：關卡執行的流水帳（純記帳、零解讀） ──────────────────
@@ -1125,6 +1179,7 @@ export class Ledger {
       footprint: JSON.parse((r.footprint as string) ?? '[]'),
       rationale: (r.rationale as string) ?? '',
       afterGroups: JSON.parse((r.after_groups as string) ?? '[]'),
+      baseSha: (r.base_sha as string) ?? undefined,
       state: r.state as GroupState,
       prUrl: (r.pr_url as string) ?? undefined,
       prNumber: (r.pr_number as number) ?? undefined,
