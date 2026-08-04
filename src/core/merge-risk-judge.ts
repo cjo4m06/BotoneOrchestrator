@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
+import { serversFor, toolsFor } from '../worker/capabilities.js';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Logger } from '../observability/logger.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
@@ -69,7 +70,7 @@ const VerdictSchema = z.union([
 ]);
 
 /** 判斷者只能看，不能動。跟其他判斷者同一個原則：判斷交給 agent，邊界由程式守住。 */
-export const RISK_JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', 'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame', ...DOCS_TOOLS];
+export const RISK_JUDGE_TOOLS = toolsFor('risk_judge');
 
 const SYSTEM_PROMPT =
   '你是合併前的最後一道人工判斷。你的唯一問題是：**這個改動要是做錯了，救得回來嗎？**'
@@ -138,8 +139,12 @@ export class MergeRiskJudge {
     // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
     const docsSource = repo ? this.deps.docs?.(repo) : undefined;
     const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
-
     const gitServer = createGitInspectServer({ cwd, baseRef, log: this.deps.log });
+    const { servers, missing } = serversFor('risk_judge', {
+      git: () => gitServer,
+      ...(docsServer ? { docs: () => docsServer } : {}),
+    });
+    if (missing.length > 0) this.deps.log.warn({ role: 'risk_judge', missing }, '⚠️ 宣告了能力但沒接上材料');
     const q: RiskQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -151,7 +156,7 @@ export class MergeRiskJudge {
             permissionMode: 'acceptEdits', // 工具已限制唯讀
             allowedTools: RISK_JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
-            mcpServers: { git: gitServer, ...(docsServer ? { docs: docsServer } : {}) } as never,
+            mcpServers: servers as never,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
             // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。判斷者只看不動。
             hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: RISK_JUDGE_TOOLS })] }] },

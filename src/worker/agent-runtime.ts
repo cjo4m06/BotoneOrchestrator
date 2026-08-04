@@ -1,4 +1,5 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { toolsFor, serversFor } from './capabilities.js';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
@@ -191,7 +192,7 @@ const DENIED_BROWSER_TOOLS = new Set([
  * 這裡只能列舉（SDK 不吃萬用字元），所以列出目前已知的全部瀏覽器工具，
  * 扣掉黑名單。漏列的新工具**不會**被擋——強制那一層是黑名單。
  */
-const BROWSER_TOOLS = [
+export const BROWSER_TOOLS = [
   'mcp__playwright__browser_navigate',
   'mcp__playwright__browser_navigate_back',
   'mcp__playwright__browser_snapshot',
@@ -241,23 +242,14 @@ export const READONLY_BROWSER_TOOLS = BROWSER_TOOLS.filter(
 );
 
 // 允許 agent 使用的工具（allow-list）。ask_human / report_no_change 為自訂 in-process 工具。
-export const ALLOWED_TOOLS = [
-  'Read',
-  'Write',
-  'Edit',
-  'Bash',
-  'Glob',
-  'Grep',
-  'mcp__ask__ask_human',
-  'mcp__ask__report_no_change',
-  // 「這個系統擋到我了」的回報出口。不影響任務結果，純粹留紀錄——
-  // 今天好幾個真 bug 是從 agent 順口說的話裡撿到的，那些不該只靠碰巧被讀到。
-  'mcp__ask__report_friction',
-  // 規格文件：讓 agent 自己找。程式只能照 docRef 字串比對，對不上就整份讀不到
-  // （實跑：docType 單複數不一致，每個帶 issue 規格的任務都是沒看過規格就做的）。
-  ...DOCS_TOOLS,
-  ...BROWSER_TOOLS,
-];
+/**
+ * 寫程式的 agent 的工具清單。
+ *
+ * **內容不寫在這裡**——「誰拿得到什麼」的唯一事實源是 capabilities.ts 的
+ * `ROLE_CAPABILITIES`。這個 repo 被「能力一份、接線五份」咬過六次，
+ * 每次都是某個建構點手寫的清單漏了一項，而症狀只有一行 WARN。
+ */
+export const ALLOWED_TOOLS = toolsFor('coder', { full: BROWSER_TOOLS });
 
 /**
  * 瀏覽器 MCP 的啟動設定。未指定輸出根目錄就回 undefined（＝不掛瀏覽器）——
@@ -459,6 +451,15 @@ export class AgentRuntime {
     const docsSource = this.deps.docs?.(input.task.repo);
     const docsServer = docsSource ? createDocsServer(docsSource, this.log) : undefined;
     const browser = browserServerConfig(this.deps.browserOutputRoot, input.task.id);
+    // 能力清單在 capabilities.ts；這裡只備材料。宣告了卻沒材料 → missing，大聲講。
+    const { servers, missing } = serversFor('coder', {
+      ask: () => askServer,
+      ...(docsServer ? { docs: () => docsServer } : {}),
+      ...(browser ? { browser: () => browser } : {}),
+    });
+    if (missing.length > 0) {
+      this.log.warn({ role: 'coder', taskId: input.task.id, missing }, '⚠️ 寫程式的 agent 宣告了能力但沒接上材料——它會拿到工具名卻叫不動');
+    }
     const stopState = { blocks: 0 };
     const toolsUsed = new Map<string, number>();
 
@@ -480,11 +481,7 @@ export class AgentRuntime {
         cwd: input.cwd,
         resume: input.resumeSessionId,
         permissionMode: 'acceptEdits',
-        mcpServers: {
-          ask: askServer,
-          ...(docsServer ? { docs: docsServer } : {}),
-          ...(browser ? { playwright: browser } : {}),
-        },
+        mcpServers: servers as never,
         allowedTools: ALLOWED_TOOLS,
         // 深度防禦：即使指令層紅線被繞過（先寫腳本再執行），agent 也拿不到 GitHub 認證
         env: buildAgentEnv(process.env, this.deps.envOverrides?.() ?? {}),

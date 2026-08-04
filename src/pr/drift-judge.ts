@@ -1,5 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
+import { serversFor, toolsFor } from '../worker/capabilities.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
@@ -92,7 +93,7 @@ export interface DriftJudgeDeps {
 /** 判斷者只讀不寫：它的職責是判斷，不是順手把問題改掉。 */
 // Bash 一定要留：語意飄移判斷要跑 git 查詢與 grep 才看得出「改的東西有沒有超出任務範圍」。
 // 它跑在 readonly policy 底下，只能執行查詢類指令（見 reviewer.ts 同一段說明）。
-const JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS];
+const JUDGE_TOOLS = toolsFor('drift_judge');
 
 const SYSTEM_PROMPT =
   '你在判斷兩份各自正確的變更合併之後，產品行為會不會自相矛盾。' +
@@ -140,6 +141,8 @@ export class DriftJudge {
     // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
     const docsSource = repo ? this.deps.docs?.(repo) : undefined;
     const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
+    const { servers, missing } = serversFor('drift_judge', { ...(docsServer ? { docs: () => docsServer } : {}) });
+    if (missing.length > 0) this.deps.log.warn({ role: 'drift_judge', missing }, '⚠️ 宣告了能力但沒接上材料');
 
     const q: DriftQueryFn =
       this.deps.queryFn ??
@@ -150,7 +153,7 @@ export class DriftJudge {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制唯讀
-            ...(docsServer ? { mcpServers: { docs: docsServer } as never } : {}),
+            ...(Object.keys(servers).length > 0 ? { mcpServers: servers as never } : {}),
             allowedTools: JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力

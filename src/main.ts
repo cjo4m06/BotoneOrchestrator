@@ -1441,7 +1441,14 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
     ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, docs: docsSourceOf, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
-    reviewer: new Reviewer({ log, usage: ledger, docs: docsSourceOf, ...(models.reviewer ? { model: models.reviewer } : {}) }),
+    // **審查者要有自己的瀏覽器暫存區。** 先前它的工具清單一直列著唯讀瀏覽器，
+    // 但 server 從來沒被掛上——「自己開瀏覽器看畫面」在清單上成立、實際叫不動，
+    // 而放行書填「沒看」完全合法，閘門照樣綠燈。key 用 review-<taskId>，多群同審不互相覆蓋。
+    reviewer: new Reviewer({
+      log, usage: ledger, docs: docsSourceOf,
+      browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
+      ...(models.reviewer ? { model: models.reviewer } : {}),
+    }),
     // agent 宣告「無需改動」時的處置（預設全 ask：交人確認，不自動結案）
     noChangePolicy: config.orchestrator.noChange,
     // 審查意見回灌：與 Orchestrator／ReviewWatcher 共用同一個實例

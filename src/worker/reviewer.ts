@@ -1,5 +1,8 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
+import { createGitInspectServer } from './git-inspect.js';
+import { browserServerConfig } from './agent-runtime.js';
+import { serversFor, toolsFor } from './capabilities.js';
 import { execa } from 'execa';
 import { createHash } from 'node:crypto';
 import type { Logger } from '../observability/logger.js';
@@ -144,6 +147,14 @@ export interface ReviewerDeps {
   collectDiff?: (cwd: string, baseRef: string) => Promise<string>;
   /** 是否具備 Claude 認證。預設看環境變數。 */
   hasAuth?: () => boolean;
+  /**
+   * 瀏覽器暫存／截圖的根目錄。**未注入 → 審查者沒有瀏覽器**。
+   *
+   * 一定要在 worktree 之外：它的截圖若寫進 worktree 會被算進 git diff，
+   * 既污染 PR 也讓「diff 非空」的 DoD 判定失真。
+   * key 用 `review-<taskId>`：多群同時審查時各自一個暫存區，不會互相覆蓋。
+   */
+  browserOutputRoot?: string;
 }
 
 const DEFAULT_MAX_DIFF_CHARS = 60_000;
@@ -154,15 +165,7 @@ const DEFAULT_MAX_DIFF_CHARS = 60_000;
 //
 // 先前這份清單只交給 SDK 的 allowedTools，而那個對工具不具強制力，所以少列 Bash 沒有後果；
 // 改成由 PreToolUse hook 強制之後，少列就等於**默默拿掉它一直在用的能力**（實跑撞到）。
-const REVIEWER_TOOLS = [
-  'Read', 'Glob', 'Grep', 'Bash',
-  ...DOCS_TOOLS,
-  // 唯讀 git：要分得出「這次弄的」與「本來就有的」，否則會把既有瑕疵算到這次頭上
-  'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame',
-  // **審查者自己開瀏覽器看畫面**（介面判斷者併進來了）。
-  // 要不要看、看哪幾條路由由它拿實際 diff 決定——那比「卡片類別字面等於 design」準得多。
-  ...READONLY_BROWSER_TOOLS,
-];
+const REVIEWER_TOOLS = toolsFor('reviewer', { readonly: READONLY_BROWSER_TOOLS });
 
 export class Reviewer {
   constructor(private deps: ReviewerDeps) {}
@@ -213,6 +216,9 @@ export class Reviewer {
         repo: task.repo,
         ...(opts.groupId ? { groupId: opts.groupId } : {}),
         ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
+        // 唯讀 git 要有基準才分得出「這次弄的」與「本來就有的」。
+        // 上面已經擋掉 undefined 的情況（取不到基準就不審），所以這裡一定有值。
+        ...(opts.baseRef ? { baseRef: opts.baseRef } : {}),
       });
     } catch (e) {
       this.deps.log.warn({ taskId: task.id, err: msg(e) }, 'reviewer 呼叫失敗，略過（不阻斷流程）');
@@ -235,12 +241,33 @@ export class Reviewer {
   private async runQuery(
     prompt: string,
     cwd: string,
-    ctx?: { taskId?: string; repo?: string; groupId?: string; resume?: string },
+    ctx?: { taskId?: string; repo?: string; groupId?: string; resume?: string; baseRef?: string },
   ): Promise<string> {
     // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
     // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
     const docsSource = ctx?.repo ? this.deps.docs?.(ctx?.repo) : undefined;
     const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
+    // ── 這兩個 server 先前**從來沒被掛上** ──
+    //
+    // REVIEWER_TOOLS 一直列著 `mcp__git__*` 與唯讀瀏覽器工具，但 runQuery 只掛 docs。
+    // 於是「審查者自己開瀏覽器看畫面」（第 12 片）在清單上成立、實際叫不動——
+    // 而放行書的 uiChecked 填「沒看：沒有瀏覽器工具」完全合法，閘門照樣綠燈。
+    // 這正是 capabilities.ts 那份清單要擋的第六次。
+    // baseRef 一定有：check() 在取不到基準時就 skip 了，走不到這裡。
+    const gitServer = ctx?.baseRef
+      ? createGitInspectServer({ cwd, baseRef: ctx.baseRef, log: this.deps.log })
+      : undefined;
+    const browserServer = this.deps.browserOutputRoot
+      ? browserServerConfig(this.deps.browserOutputRoot, `review-${ctx?.taskId ?? 'unknown'}`)
+      : undefined;
+    const { servers, missing } = serversFor('reviewer', {
+      ...(docsServer ? { docs: () => docsServer } : {}),
+      ...(gitServer ? { git: () => gitServer } : {}),
+      ...(browserServer ? { browser: () => browserServer } : {}),
+    });
+    if (missing.length > 0) {
+      this.deps.log.warn({ role: 'reviewer', missing }, '⚠️ 審查者宣告了能力但沒接上材料——它會拿到工具名卻叫不動');
+    }
     const q: ReviewQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -251,7 +278,7 @@ export class Reviewer {
             cwd: args.cwd,
             ...(args.resume ? { resume: args.resume } : {}),
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
-            ...(docsServer ? { mcpServers: { docs: docsServer } as never } : {}),
+            ...(Object.keys(servers).length > 0 ? { mcpServers: servers as never } : {}),
             allowedTools: REVIEWER_TOOLS,
             systemPrompt: REVIEWER_SYSTEM_PROMPT,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力

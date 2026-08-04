@@ -220,20 +220,9 @@ test('每個唯讀角色都把 PreToolUse hook 接到 query 上', () => {
  *
  * 而它們的職責就是「去查證」，沒有 Bash 等於瞎了。
  */
-test('要查證的角色都必須有 Bash', () => {
-  const roles = [
-    ['src/worker/reviewer.ts', 'REVIEWER_TOOLS', 'reviewer（要跑 git diff／grep 核對規格）'],
-    ['src/pr/drift-judge.ts', 'JUDGE_TOOLS', '語意飄移判斷者（要看改動有沒有超出範圍）'],
-    ['src/core/merge-risk-judge.ts', 'RISK_JUDGE_TOOLS', '合併風險判斷者'],
-    ['src/core/plan-agent.ts', 'PLAN_TOOLS', '規劃 agent（find/grep 批次查詢）'],
-  ] as const;
+// 「要查證的角色都必須有 Bash」搬到 test/capabilities.test.ts：
+// 它現在是對**單一清單**的斷言，不是一個角色一條 grep（加角色不必記得加測試）。
 
-  for (const [file, constName, who] of roles) {
-    const src = readFileSync(file, 'utf8');
-    const line = new RegExp(`${constName}[^=]*=\\s*\\[([^\\]]*)\\]`, 's').exec(src)?.[1] ?? '';
-    assert.match(line, /'Bash'/, `${who} 的工具清單少了 Bash —— 它跑在 readonly policy 底下，只能執行查詢類指令，不給等於讓它瞎了`);
-  }
-});
 
 // 「介面判斷者」（ui-judge.ts）連同整套截圖量測堆疊已於第 15 片退場。
 // 畫面改由審查者自己開瀏覽器判斷，它拿的是 READONLY_BROWSER_TOOLS——

@@ -1,6 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
 import { createFrictionServer, type FrictionSink } from '../worker/friction-server.js';
+import { serversFor, toolsFor } from '../worker/capabilities.js';
 import { z } from 'zod';
 import type { Task } from '../types.js';
 import type { Logger } from '../observability/logger.js';
@@ -104,7 +105,7 @@ export interface PlanAgentDeps {
 }
 
 /** 規劃 agent 只讀不寫：它的職責是判斷，不是動手改東西。 */
-const PLAN_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS, 'mcp__friction__report_friction'];
+const PLAN_TOOLS = toolsFor('planner');
 
 
 /**
@@ -191,9 +192,17 @@ export class PlanAgent {
     //（coder 一次只做一張，結構上看不到）。先前它一個出口都沒有——撞到只能硬分完群，
     // 矛盾原封不動傳給 coder，變成合併時才炸開。
     // taskId 用 repo 當鍵：這一步還沒有任務歸屬，回報是針對整批的。
-    const frictionServer = this.deps.frictionSink
-      ? createFrictionServer(this.deps.frictionSink, this.deps.log, `plan:${repo ?? 'unknown'}`, 'planner')
-      : undefined;
+    // 能力清單是 ROLE_CAPABILITIES 那一份，這裡只負責把材料備好。
+    // 宣告了能力卻沒材料 → missing，大聲講出來（前五次事故就是死在這種靜默）。
+    const { servers, missing } = serversFor('planner', {
+      ...(docsServer ? { docs: () => docsServer } : {}),
+      ...(this.deps.frictionSink
+        ? { friction: () => createFrictionServer(this.deps.frictionSink!, this.deps.log, `plan:${repo ?? 'unknown'}`, 'planner') }
+        : {}),
+    });
+    if (missing.length > 0) {
+      this.deps.log.warn({ role: 'planner', missing }, '⚠️ 規劃者宣告了能力但沒有接上材料——它會拿到工具名卻叫不動');
+    }
 
     const q: PlanQueryFn =
       this.deps.queryFn ??
@@ -204,9 +213,7 @@ export class PlanAgent {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 邊界由下面的 hook 守，這裡只為避免非互動環境卡在權限詢問
-            ...(docsServer || frictionServer
-              ? { mcpServers: { ...(docsServer ? { docs: docsServer } : {}), ...(frictionServer ? { friction: frictionServer } : {}) } as never }
-              : {}),
+            ...(Object.keys(servers).length > 0 ? { mcpServers: servers as never } : {}),
             allowedTools: PLAN_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             // **真正的邊界在這裡。** allowedTools 對工具不具強制力（見 PLAN_TOOLS 的說明）
