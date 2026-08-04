@@ -18,6 +18,8 @@
 //      判定為 unrecoverable 的群組保留 worktree 與分支，讓人有現場可搶救。
 
 import { execa } from 'execa';
+import type { HandoffInput } from '../store/ledger.js';
+import { openStuckGroupHandoff } from './handoff.js';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import type { Group, GroupState, Task, TaskBrief, TaskState } from '../types.js';
@@ -32,6 +34,8 @@ import { GROUP_ABORTED_EVENT } from './group-runner.js';
  * prune* 為可選能力：Ledger 尚未提供時自動略過保留策略（優雅降級，不影響對帳）。
  */
 export interface ReconcilerLedger {
+  /** 停手交人時要開交接單——停手與說話是同一個寫入動作（見 core/handoff.ts）。 */
+  openHandoff(input: HandoffInput): string;
   getTask(id: string): Task | undefined;
   listTasksByState(state: TaskState): Task[];
   listGroupsByState(state: GroupState): Group[];
@@ -416,7 +420,12 @@ export class Reconciler {
         ? '崩潰於 Merge Guard 進行中：成果已 commit 於分支，但沒有「只重跑守衛」的自動入口，需人工續跑'
         : '審查要求修改：目前沒有自動回頭改的路徑，需人工處理';
     // 刻意不改群組狀態：維持非終態才能讓孤兒清掃認得它、保住 worktree 現場
-    if (!dryRun) ledger.logEvent('group', group.id, 'reconcile_needs_human', detail);
+    if (!dryRun) {
+      ledger.logEvent('group', group.id, 'reconcile_needs_human', detail);
+      // 「沒有自動路徑」與「重試用完」是不同的處境（後者按重試還有意義，前者沒有），
+      // 但兩者都要出現在清單上——先前兩者都靠推論，而推論漏了 changes_requested。
+      openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why: detail });
+    }
     report.groupsNeedsHuman += 1;
     report.actions.push({ scope: 'group', ref: group.id, decision: 'needs_human', detail });
     log.error({ group: group.id, state: group.state, branch: group.branch }, '群組需人工介入（成果保留，系統不動手）');

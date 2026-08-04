@@ -2,6 +2,7 @@
 // 執行：npx tsx --test test/reconciler.test.ts
 
 import { test, describe } from 'node:test';
+import type { HandoffInput } from '../src/store/ledger.js';
 import assert from 'node:assert/strict';
 import pino from 'pino';
 import {
@@ -45,8 +46,15 @@ class FakeLedger implements ReconcilerLedger {
   readonly tasks = new Map<string, Task>();
   readonly groups = new Map<string, Group>();
   readonly events: { kind: string; detail?: string }[] = [];
+  /** 開過哪些交接單——「停手交人」一定要同時說話，這裡驗得到。 */
+  readonly handoffs: HandoffInput[] = [];
   /** 假時鐘：狀態異動時寫進 updatedAt（保留期判斷會用到）。 */
   clockMs = Date.now();
+
+  openHandoff(input: HandoffInput): string {
+    this.handoffs.push(input);
+    return `h_${this.handoffs.length}`;
+  }
 
   constructor(tasks: Task[] = [], groups: Group[] = []) {
     for (const t of tasks) this.tasks.set(t.id, t);

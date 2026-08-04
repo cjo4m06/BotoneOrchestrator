@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 import { SCHEMA, applyColumnMigrations } from './schema.js';
 import type { Task, TaskState, Group, GroupState, BlockReason } from '../types.js';
 import type { Logger } from '../observability/logger.js';
+import { HANDOFF_ACTIONS, handoffKindOfBlock } from '../core/handoff.js';
 
 type Row = Record<string, unknown>;
 
@@ -453,8 +454,54 @@ export class Ledger {
       .prepare(`UPDATE tasks SET state='blocked', block_reason=@reason, block_detail=@detail, updated_at=@ts WHERE id=@id`)
       .run({ id, reason, detail: detail ?? null, ts: this.now() });
     const ok = this.affected(res.changes, 'setBlock', { id, reason });
-    if (ok) this.emitTaskChanged(id);
+    if (ok) {
+      this.openBlockHandoff(id, reason, detail ?? '');
+      this.emitTaskChanged(id);
+    }
     return ok;
+  }
+
+  /**
+   * 受阻的同時開一張交接單。**這是「停手與說話是同一個寫入動作」的字面實作。**
+   *
+   * 為什麼放在 ledger 而不是每個呼叫端各自記得：`setBlock` 全 repo 有 9 個呼叫點
+   * （worker 6 個、notifier 3 個）。要每個都記得配一次開單，就是「接線只接一半」
+   * 的完美溫床——而這整套要修的正是那個病（實跑：兩個群在等人、
+   * 控制台顯示「沒有需要你處理的事項」）。放在這裡之後，**漏不掉**。
+   *
+   * `deps` 不開單：那是自動等待（上游還沒做完），不是要人處理的事。
+   * 寫成單會把待處理清單灌爆，人就再也分不出哪幾件真的需要自己動手。
+   *
+   * 去重：同一個任務、同一種 kind 已經有未處理的單就不再開——
+   * 受阻會在每一輪重複寫入，不去重的話清單上會長出一整排一樣的東西。
+   */
+  private openBlockHandoff(taskId: string, reason: BlockReason, detail: string): void {
+    const kind = handoffKindOfBlock(reason, detail);
+    if (!kind) return;
+    try {
+      const dup = this.listHandoffs({ taskId, kind, unconsumedOnly: true, limit: 1 });
+      if (dup.length > 0) return;
+      const t = this.getTask(taskId);
+      this.openHandoff({
+        taskId,
+        ...(t?.groupId ? { groupId: t.groupId } : {}),
+        fromRole: 'coder',
+        toRole: 'human',
+        kind,
+        title: t?.title ?? taskId,
+        // body 不可為空。detail 空的時候用標題兜底——開不出單比「開一張沒有說明的單」
+        // 更糟：前者是靜默，後者至少看得見。
+        body: detail.trim() || (t?.title ?? taskId),
+        options: HANDOFF_ACTIONS[kind],
+      });
+    } catch (e) {
+      // 開單失敗絕不能讓 setBlock 之後的流程倒；但一定要留 warn，
+      // 靜默失敗會讓「清單上沒有」看起來像「沒事發生」。
+      this.log.warn(
+        { taskId, kind, err: e instanceof Error ? e.message : String(e) },
+        '開交接單失敗（任務照樣受阻，但清單上會看不到）',
+      );
+    }
   }
 
   /** @returns 是否真的更新到該任務（找不到 → warn + false）。 */

@@ -12,6 +12,7 @@ import { readDiffStat, type PolicyInput } from '../policy/policy-engine.js';
 import type { MergeRiskVerdict } from './merge-risk-judge.js';
 import { gitDiffHash } from '../git/status.js';
 import type { CheckContext } from '../worker/check-recorder.js';
+import { openMergeApprovalHandoff, openStuckGroupHandoff } from './handoff.js';
 import { resolveBaseFreshness } from '../git/base-freshness.js';
 import { syncTaskCard } from './card-status.js';
 import { gitHeadRef, taskHintOf } from '../worker/verifier.js';
@@ -1058,6 +1059,16 @@ export class GroupRunner {
         this.cards(details, 'awaiting_merge', group.id);
         // 文字通知只是「告知」；真正讓需求成立的是**有按鈕可按**的核准請求（見 askMergeApproval）
         this.askMergeApproval(group, details, reasons);
+        // **這一條先前完全不掛任何事件**——merge_approval 是從群組狀態 in_review 推出來的，
+        // 而它是三個介面上唯一的核准入口。清單換成查詢式之後漏掉這個產生端，
+        // 所有需要核准的群會永遠停在 in_review，沒有錯誤、沒有 log。
+        openMergeApprovalHandoff(this.deps.ledger, log, {
+          groupId: group.id,
+          title: `群組 ${group.id}（${group.taskIds.length} 個任務）等你核准合併`,
+          why: reasons.join('；'),
+          taskIds: group.taskIds,
+          ...(group.prUrl ? { prUrl: group.prUrl } : {}),
+        });
         this.deps.ledger.updateGroupState(group.id, 'in_review');
         return SUCCESS;
       }

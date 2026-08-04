@@ -11,6 +11,23 @@ import {
 import { DEFAULT_QUIET_MINUTES, splitByQuietPeriod } from './quiet-period.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from './merge-credential.js';
 import { collectPending, type PendingItem } from './pending.js';
+import { openStuckGroupHandoff } from './handoff.js';
+
+/**
+ * 還有哪幾群在等這一群進 base。
+ *
+ * 這個數字直接代表「修好這一群能解開多少後續工作」——沒有它，人看到的只是一則
+ * 孤立的失敗，不知道背後還有一整條鏈停在那裡（實跑：一群卡住、16 個任務堵著）。
+ */
+function blockedByGroup(ledger: { listGroupsByState(s: GroupState): Group[] }, groupId: string): string[] {
+  const out: string[] = [];
+  for (const st of ['ready', 'forming'] as const) {
+    for (const g of ledger.listGroupsByState(st)) {
+      if (g.afterGroups.includes(groupId)) out.push(g.id);
+    }
+  }
+  return out;
+}
 
 /** 待處理事項提醒的節流事件（寫在 ledger ⇒ 重啟不會每次啟動都吵一次）。 */
 const PENDING_REMINDER_EVENT = 'pending_reminder';
@@ -877,6 +894,14 @@ export class Orchestrator {
       ? `群組等上游依賴已重試 ${max} 次仍無法開工，請確認依賴的任務是否真的會完成`
       : `群組重新派工已達上限（${max} 次），停手交人處理`;
     ledger.logEvent('group', group.id, REQUEUE_EXHAUSTED_EVENT, `${detail}｜停在 ${group.state}`);
+    // 停手與說話是同一個動作。先前這裡只寫事件，而待處理清單靠「狀態＋事件」推論——
+    // 群組停在 changes_requested（不是 failed）時整個被漏掉，16 個任務堵著而清單是空的。
+    openStuckGroupHandoff(ledger, log, {
+      groupId: group.id,
+      repo: group.repo,
+      why: `重新派工已達上限：${detail}（停在 ${group.state}）`,
+      waitingGroups: blockedByGroup(ledger, group.id),
+    });
     log.error({ group: group.id, kind, max, state: group.state }, `⛔ ${detail}`);
     this.notifyGroup(group.id, {
       type: 'problem',
