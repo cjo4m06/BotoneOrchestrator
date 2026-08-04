@@ -649,3 +649,63 @@ describe('MergeGuard — 留下驗證時的 base commit', () => {
     );
   });
 });
+
+/**
+ * PR #54 那一題的回歸測試。
+ *
+ * 實跑（2026-08-04）：PR #54 只新增 6 個檔（AvatarCropModal），被一個完全無關的
+ * 後端測試（schedule-engine.test.ts）擋下。程式只跑一次測試、紅了就斷定
+ * semantic_drift（＝這一群造成的），回灌給 agent 修三輪——它根本改不到那個檔。
+ * 重試預算用完，16 個任務堵住，最後使用者手動合併。
+ *
+ * 現在紅燈時會先做實驗：**base 自己也紅嗎？** 那一題的答案就在證據裡。
+ */
+describe('紅燈的歸咎：先做實驗，不直接斷定是這一群造成的', () => {
+  it('base 上也紅 → 證據裡看得到（不是只回一句「語意飄移」）', async () => {
+    const repo = createTmpGitRepo({ files: { 'a.txt': 'base\n' }, branch: 'main', message: 'base' });
+    try {
+      repo.git('checkout', '--quiet', '-b', 'feat/innocent');
+      repo.commit({ 'new-file.txt': '只新增檔案，動不到任何既有邏輯\n' }, 'feat: 新增元件');
+      repo.git('checkout', '--quiet', 'main');
+
+      // 這個關卡在**任何** commit 上都紅（模擬「base 本來就壞了 / 測試不穩定」）
+      const alwaysRed = { async check() { return { green: false, checks: [{ name: 'test', ok: false, detail: '❌ schedule-engine 紅了' }], signature: 'x' }; } };
+      const guard = new MergeGuard(alwaysRed, createSilentLogger(), {
+        experimentBudget: { runsLeft: 3, msLeft: 60_000 },
+      });
+
+      const verdict = await guard.attempt({
+        repoPath: repo.path, branch: 'feat/innocent', base: 'main', verifierConfig: { test: 'x' },
+      });
+
+      assert.equal(verdict.ok, false);
+      const detail = verdict.ok === false ? verdict.detail : '';
+      assert.match(detail, /歸咎實驗/, '要附上實驗證據，而不是只丟一句判決');
+      assert.match(detail, /不含本群的 base 上/, '第一個實驗就是在問「base 自己紅不紅」');
+      assert.match(detail, /同一個合併後狀態再跑一次/, '第二個實驗問「這個紅穩不穩定」');
+      // **不下結論**：程式只擺事實，「所以這是誰的錯」由讀的人判斷
+      assert.equal(/所以這不是本群|測試不穩定，可以放行/.test(detail), false);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('沒給配額 → 不跑實驗，行為與先前相同（額外證據不是必要條件）', async () => {
+    const repo = createTmpGitRepo({ files: { 'a.txt': 'base\n' }, branch: 'main', message: 'base' });
+    try {
+      repo.git('checkout', '--quiet', '-b', 'feat/x');
+      repo.commit({ 'n.txt': 'x\n' }, 'feat');
+      repo.git('checkout', '--quiet', 'main');
+      const red = { async check() { return { green: false, checks: [{ name: 'test', ok: false, detail: 'red' }], signature: 'x' }; } };
+
+      const verdict = await new MergeGuard(red, createSilentLogger()).attempt({
+        repoPath: repo.path, branch: 'feat/x', base: 'main', verifierConfig: { test: 'x' },
+      });
+
+      assert.equal(verdict.ok, false);
+      assert.equal(/歸咎實驗/.test(verdict.ok === false ? verdict.detail : ''), false);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});

@@ -26,6 +26,14 @@ export interface PrBodyInput {
   assumptions?: string[]; // agent 記錄的可逆預設
   screenshots?: string[]; // 截圖路徑或 URL（M4 視覺任務）
   rationale?: string; // planner 分群理由
+  /**
+   * 人工放行的紅燈（定案③）。有值就代表**這個 PR 帶著一個已知的失敗上線**。
+   *
+   * 這一段刻意放在最前面、用最大的字級（H2 ＋ ⚠）：它是整份 PR 裡唯一一件
+   * 「審查者不主動找就不會知道、但一定要知道」的事。塞進「假設與待確認」的話，
+   * 它會跟其他八條但書並排，看起來像例行公事。
+   */
+  knownRed?: { note: string; verdict: string };
 }
 
 const TBD = '（待補）';
@@ -58,6 +66,21 @@ export function generatePrBody(input: PrBodyInput): string {
     if (body?.trim()) sec(title, body);
     else if (!hasNarrative) sec(title, undefined);
   };
+
+  if (input.knownRed) {
+    sec(
+      '⚠ 帶著一個已知的失敗合併 (Known Red)',
+      [
+        `**人工放行理由**：${input.knownRed.note.trim()}`,
+        '',
+        '被放行的判決全文：',
+        '',
+        '```',
+        input.knownRed.verdict.trim() || '（沒有留下判決內容）',
+        '```',
+      ].join('\n'),
+    );
+  }
 
   optionalSec('做了什麼 (What)', n.what);
   optionalSec('怎麼做 (How)', n.how);

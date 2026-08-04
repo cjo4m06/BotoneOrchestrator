@@ -53,7 +53,13 @@ export const HANDOFF_ACTIONS: Record<HandoffKind, string[]> = {
   // 人必須去任務板改回「待辦」，在這邊按重試永遠沒用（實跑：使用者按了 4 次）。
   reclaim_blocked: [],
   merge_approval: ['approve', 'deny'],
-  stuck_group: ['retry'],
+  // 「重試」＝再跑一次；「照樣落地」＝我知道這個紅，但它不是這一群造成的（定案③）。
+  //
+  // 為什麼需要第二顆：系統**沒有修 base 的權力**。裁定「這是 base 的測試本來就不穩」
+  // 之後，這一群依然落不了地——會累積一批「已裁定非我方責任、但卡著」的群，
+  // 堵住的張數與誤判時一模一樣，只是這次系統是對的。
+  // 按下去時實驗證據與 check_runs 會被記進 PR 內文與 ledger，留下痕跡。
+  stuck_group: ['retry', 'land-anyway'],
   review_feedback: [],
   delivery: [],
 };

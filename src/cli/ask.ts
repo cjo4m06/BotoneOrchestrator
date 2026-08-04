@@ -108,7 +108,7 @@ function oneLine(s: string, max = 160): string {
 export interface AskAction {
   item: PendingItem;
   /** 標準化後的動作；freeText 代表「這是澄清的答案」。 */
-  verb: 'answer' | 'confirm' | 'reject' | 'approve' | 'deny' | 'retry' | 'abort' | 'pause';
+  verb: 'answer' | 'confirm' | 'reject' | 'approve' | 'deny' | 'retry' | 'abort' | 'pause' | 'land-anyway';
   answer?: string;
 }
 
@@ -136,7 +136,7 @@ export function resolveAction(items: PendingItem[], target: string, rest: string
     return { item, verb: 'answer', answer: item.suggestion };
   }
 
-  const known = ['confirm', 'reject', 'approve', 'deny', 'retry', 'abort', 'pause'] as const;
+  const known = ['confirm', 'reject', 'approve', 'deny', 'retry', 'abort', 'pause', 'land-anyway'] as const;
   const verb = known.find((k) => k === raw);
   if (verb) {
     if (!item.actions.includes(verb)) {
@@ -152,6 +152,10 @@ export function resolveAction(items: PendingItem[], target: string, rest: string
   const [head, ...tail] = raw.split(/\s+/);
   if (head === 'deny' && tail.length > 0 && item.actions.includes('deny')) {
     return { item, verb: 'deny', answer: tail.join(' ') };
+  }
+  // `land-anyway <為什麼這個紅不是這一群造成的>`。同樣只在支援時才攔截。
+  if (head === 'land-anyway' && tail.length > 0 && item.actions.includes('land-anyway')) {
+    return { item, verb: 'land-anyway', answer: tail.join(' ') };
   }
 
   // 其餘視為澄清答案
@@ -169,6 +173,8 @@ export interface ApplyDeps {
     handleMergeDecision(d: { groupId: string; approved: boolean; userId?: string }): void;
     /** 把 failed 的群組放回待派工。沒有它的話 stuck_group 的 retry 是空操作。 */
     reviveGroup?(input: { groupId: string; userId?: string }): Promise<boolean>;
+    /** 定案③：帶著一個已知的、非本群造成的紅落地。 */
+    landAnyway?(input: { groupId: string; userId?: string; note: string }): Promise<boolean>;
   };
   /**
    * 回報動作後的實際狀態。InboundRouter 吞掉自己的錯誤（Slack 回呼不能 throw），
@@ -219,6 +225,26 @@ export async function applyAction(action: AskAction, deps: ApplyDeps): Promise<s
       return action.answer
         ? `✅ 已退回群組 ${item.id}，意見已交給 agent：${action.answer}`
         : `⚠️ 已退回群組 ${item.id}，但沒有附意見 — agent 不知道要改什麼，很可能原樣再送一次。\n   下次請用：npm run ask -- ${item.id} deny <要改什麼>`;
+    case 'land-anyway':
+      // 定案③：「我知道這個紅，但它不是這一群造成的，照樣落地」。
+      //
+      // 為什麼要有這顆：系統**沒有修 base 的權力**。裁定「這是 base 的測試本來就不穩」
+      // 之後這一群依然落不了地——會累積一批「已裁定非我方責任、但卡著」的群，
+      // 堵住的張數與誤判時一模一樣，只是這次系統是對的。
+      //
+      // 這是**人的決定**（要不要帶著一個已知的紅上線），系統的職責是把證據攤在面前、
+      // 按完之後留下痕跡，不是替人決定、也不是無限期堵著等人自己想起來。
+      if (item.kind !== 'stuck_group') return `⚠️ 「照樣落地」只適用於卡住的群組`;
+      {
+        const ok = await router.landAnyway?.({
+          groupId: item.id,
+          userId: CLI_USER,
+          note: action.answer ?? '（未附說明）',
+        });
+        return ok
+          ? `✅ 群組 ${item.id} 已標記「知道這個紅、照樣落地」，理由與實驗證據已記進 ledger 與 PR 內文`
+          : `⚠️ 這個環境沒有接上「照樣落地」（需要 daemon 在同一行程）`;
+      }
     case 'retry':
       // **群組層級的失敗要用群組層級的復活。**
       //

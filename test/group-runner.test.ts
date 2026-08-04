@@ -561,19 +561,19 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
    * 但 rebase 衝突正是 agent 修得動的問題——系統本來就有「把失敗事實回灌給 agent」
    * 的迴圈（DoD 紅燈、reviewer 退回都走它），只是 Merge Guard 這條沒接上去。
    */
-  describe('Merge Guard 擋下 → 帶著原因交回 agent 修', () => {
-    function feedbackSpy() {
-      const saved: { groupId: string; comments: string[]; source: string }[] = [];
-      return {
-        saved,
-        store: {
-          peek: () => undefined,
-          take: () => undefined,
-          save: (i: { groupId: string; comments: string[]; source: string }) => void saved.push(i),
-        },
-      };
-    }
+  function feedbackSpy() {
+    const saved: { groupId: string; comments: string[]; source: string }[] = [];
+    return {
+      saved,
+      store: {
+        peek: () => undefined,
+        take: () => undefined,
+        save: (i: { groupId: string; comments: string[]; source: string }) => void saved.push(i),
+      },
+    };
+  }
 
+  describe('Merge Guard 擋下 → 帶著原因交回 agent 修', () => {
     it('rebase 衝突 → 轉 changes_requested 並存下意見，不再標 failed', async () => {
       const group = seedGroup(['會衝突的改動']);
       const fb = feedbackSpy();
@@ -615,6 +615,74 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
       assert.match(fb.saved[0]!.comments[0]!, /實際失敗的是哪一項/);
       assert.equal(/哪個函式／元件／型別被改了/.test(fb.saved[0]!.comments[0]!), false, '不該預設是依賴被改掉');
       assert.match(fb.saved[0]!.comments[0]!, /3 個案例失敗/, '原始輸出要一起帶給 agent');
+    });
+  });
+
+  /**
+   * 定案③：人按過「照樣落地」之後，同一個紅不再擋這一群。
+   *
+   * 這條路的存在理由是實跑（2026-08-04）：PR #54 只新增 6 個檔（AvatarCropModal），
+   * 被一個完全無關的後端測試（schedule-engine）擋下——agent 根本改不到那個檔，
+   * 三輪必然修不好，16 個任務堵住。系統**沒有修 base 的權力**，所以除非有這顆按鈕，
+   * 「已裁定非我方責任」的群跟誤判時一樣落不了地。
+   */
+  describe('人已表態「知道這個紅、照樣落地」', () => {
+    it('合併後測試紅 ＋ 有放行 → PR 照開，而且內文誠實寫著它是紅的', async () => {
+      const group = seedGroup(['裁切視窗']);
+      tmp.ledger.grantKnownRedWaiver(group.id, 'base 上的 schedule-engine 本來就會偶爾紅', 'kchen');
+      const h = build({
+        guard: fakeGuard({ ok: false, reason: 'post_merge_red', detail: 'FAIL src/schedule-engine.test.ts' }),
+        allowLocalMerge: true,
+      });
+
+      await h.runner.run(group);
+
+      assert.notEqual(tmp.ledger.getGroup(group.id)?.state, 'changes_requested', '放行過就不該再交回 agent 修');
+      assert.ok(h.pr.prs.length > 0, 'PR 要開得出來，否則這顆按鈕沒有意義');
+      const body = h.pr.prs[0]!.body;
+      assert.match(body, /Known Red/, '帶著紅上線這件事必須寫在 PR 最前面');
+      assert.match(body, /schedule-engine 本來就會偶爾紅/, '人的理由要留下來');
+      assert.match(body, /❌ 紅燈，由人工放行/, '**驗證清單不准把它印成綠的**——那份 PR 會在說謊');
+      assert.equal(
+        tmp.ledger.takeKnownRedWaiver(group.id),
+        undefined,
+        '放行是一次性的：用掉之後這一群要恢復正常把關',
+      );
+    });
+
+    it('衝突 ＋ 有放行 → **照樣擋下**（衝突是這一群自己造成的，不在放行範圍）', async () => {
+      const group = seedGroup(['會衝突的改動']);
+      tmp.ledger.grantKnownRedWaiver(group.id, '我知道 base 的測試不穩', 'kchen');
+      const fb = feedbackSpy();
+      const h = build({
+        guard: fakeGuard({ ok: false, reason: 'code_conflict', detail: 'CONFLICT in src/App.vue' }),
+        allowLocalMerge: true,
+        feedback: fb.store,
+      });
+
+      await h.runner.run(group);
+
+      assert.equal(tmp.ledger.getGroup(group.id)?.state, 'changes_requested', '衝突要交回 agent 解，不能靠放行繞過');
+      assert.equal(h.pr.prs.length, 0);
+      assert.ok(
+        tmp.ledger.takeKnownRedWaiver(group.id),
+        '不在範圍內的判決不該把人的放行吃掉——那張還要留給真正的那個紅',
+      );
+    });
+
+    it('沒有放行 → 合併後測試紅照常交回 agent（放行不是預設行為）', async () => {
+      const group = seedGroup(['某任務']);
+      const fb = feedbackSpy();
+      const h = build({
+        guard: fakeGuard({ ok: false, reason: 'post_merge_red', detail: 'FAIL something' }),
+        allowLocalMerge: true,
+        feedback: fb.store,
+      });
+
+      await h.runner.run(group);
+
+      assert.equal(tmp.ledger.getGroup(group.id)?.state, 'changes_requested');
+      assert.equal(h.pr.prs.length, 0);
     });
   });
 

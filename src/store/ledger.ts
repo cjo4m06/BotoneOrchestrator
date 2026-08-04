@@ -30,6 +30,10 @@ export interface LedgerEvent {
   createdAt: number;
 }
 
+/** 「知道這個紅、照樣落地」的兩個事件 kind（成對出現，代表一次用掉一張）。 */
+export const KNOWN_RED_GRANTED = 'landed_with_known_red';
+export const KNOWN_RED_USED = 'known_red_waiver_used';
+
 /** listEvents 的過濾條件；全部可省略（省略 = 不過濾）。 */
 export interface EventQuery {
   scope?: EventScope;
@@ -1369,6 +1373,43 @@ export class Ledger {
     if (q.toRole) { where.push('to_role = @toRole'); params.toRole = q.toRole; }
     const r = this.db.prepare(`UPDATE handoffs SET consumed_at = @ts WHERE ${where.join(' AND ')}`).run(params);
     return r.changes;
+  }
+
+  // ── 「知道這個紅、照樣落地」的一次性放行（定案③） ──
+
+  /**
+   * 人在控制台／CLI 按下「照樣落地」時記一筆。回傳這筆放行的事件 id。
+   *
+   * **理由是必填的**：事後查「當時憑什麼帶著紅上線」只剩這一行字。
+   */
+  grantKnownRedWaiver(groupId: string, note: string, by: string): number {
+    const detail = note.trim();
+    if (detail === '') throw new Error('放行理由不可為空（事後查證只剩這一行字）');
+    this.logEvent('group', groupId, KNOWN_RED_GRANTED, `由 ${by} 放行：${detail}`);
+    return this.latestEvent('group', groupId, KNOWN_RED_GRANTED)?.id ?? 0;
+  }
+
+  /**
+   * 取用一次放行：有未用過的就回傳理由並**當場標成用過**，沒有就回 undefined。
+   *
+   * ── 為什麼一定要「一次性」 ──
+   *
+   * 放行是對**當下這份程式碼＋當下那個紅**的判斷。如果它常駐，這一群之後每一次
+   * 重跑都會自動吞掉紅燈——包括後來 agent 真的改壞的那個紅。人以為自己放行了一次，
+   * 實際上是永久關掉了這一群的守衛。
+   *
+   * 用事件 id 比大小來判斷「用過沒」：id 是自增的，同毫秒寫入時 created_at 會相同，
+   * 只有 id 保證得了先後。整個過程在同一個交易裡，重啟或並行都不會用掉兩次。
+   */
+  takeKnownRedWaiver(groupId: string): string | undefined {
+    return this.db.transaction((): string | undefined => {
+      const granted = this.latestEvent('group', groupId, KNOWN_RED_GRANTED);
+      if (!granted) return undefined;
+      const used = this.latestEvent('group', groupId, KNOWN_RED_USED);
+      if (used && used.id > granted.id) return undefined; // 這張已經用掉了
+      this.logEvent('group', groupId, KNOWN_RED_USED, granted.detail ?? '');
+      return granted.detail ?? '';
+    })();
   }
 
   private toGroup(r: Row): Group {

@@ -361,6 +361,16 @@ export class ConsoleServer {
         await router.handleControl({ type: action, taskId: id, userId: 'console' });
         return { ok: true };
       }
+      case 'land-anyway': {
+        // 定案③：人看完證據後表態「我知道這個紅，但它不是這一群造成的」。
+        // 理由是**必填**——沒有理由的放行事後查不出當時憑什麼放，跟沒記一樣。
+        const note = String(input.text ?? '').trim();
+        if (!note) return { ok: false, error: '請說明為什麼可以帶著這個紅落地（會記進 PR 內文與 ledger）' };
+        const landed = await router.landAnyway({ groupId: id, userId: 'console', note });
+        return landed
+          ? { ok: true, detail: '已記錄理由，群組回到待派工' }
+          : { ok: false, error: '無法落地這個群組（可能已被清掉）' };
+      }
       case 'abort':
       case 'pause':
         await router.handleControl({ type: action, taskId: id, userId: 'console' });

@@ -1,5 +1,7 @@
 import { execa } from 'execa';
+import type { CheckRunInput } from '../store/ledger.js';
 import { createMergeTree } from './merge-verify.js';
+import { runExperiment, formatExperiments, type ExperimentBudget, type ExperimentResult } from './blame.js';
 import { resolveBaseFreshness, type BaseFreshness } from '../git/base-freshness.js';
 import type { VerifierLike } from '../contracts.js';
 import type { VerifierConfig } from '../worker/verifier.js';
@@ -34,6 +36,13 @@ export interface GitExecResult {
 export type GitRunner = (repoPath: string, args: string[], opts?: { timeoutMs?: number }) => Promise<GitExecResult>;
 
 export interface MergeGuardOptions {
+  /**
+   * 歸咎實驗的配額。未給 → 不跑實驗（紅燈只回報原始輸出，行為與先前相同）。
+   * 用完時 runExperiment 會明講，不靜默降級。
+   */
+  experimentBudget?: ExperimentBudget;
+  /** 實驗的記帳出口（每次都要進 check_runs，那是事後查證的唯一依據）。 */
+  recordCheck?: (input: CheckRunInput) => void;
   /**
    * 驗收樹建好之後的準備工作（node_modules、本機設定檔）。
    * **一定要接**：沒有依賴就跑關卡，紅的是環境不是程式碼，而 agent 會去修一個沒壞的東西。
@@ -166,8 +175,25 @@ export class MergeGuard {
         ...(input.task ? { task: input.task } : {}),
       });
       if (!gate.green) {
-        this.log.warn({ branch, base: freshness.ref }, 'Merge Guard：併上最新 base 後建置/測試紅');
-        return { ok: false, reason: 'semantic_drift', detail: withCaveat(freshness, failSummary(gate)) };
+        // **紅了不代表是這一群造成的。**
+        //
+        // 實跑（2026-08-04）：PR #54 只新增 6 個檔，被一個完全無關的後端測試擋下，
+        // 判成 semantic_drift 回灌給 agent 修三輪——它根本改不到那個檔。16 個任務堵住。
+        //
+        // 所以先做兩個實驗，把「是誰造成的」變成有證據可判的事：
+        //   1. 同一顆 base 上（不含本群）跑幾次 → base 本來就紅嗎？
+        //   2. 同一個合併後狀態再跑一次 → 這個紅穩定嗎？
+        // 實驗**只產生事實**，結論由讀的人下（見 pr/blame.ts）。
+        const evidence = await this.gatherBlameEvidence(input, freshness.ref, tree.path);
+        this.log.warn(
+          { branch, base: freshness.ref, experiments: evidence.length },
+          'Merge Guard：併上最新 base 後建置/測試紅，已跑實驗釐清歸咎',
+        );
+        return {
+          ok: false,
+          reason: 'semantic_drift',
+          detail: withCaveat(freshness, failSummary(gate)) + (evidence.length ? `\n\n── 歸咎實驗 ──${formatExperiments(evidence)}` : ''),
+        };
       }
 
       // 4) 事實層都綠了 → 判斷層：兩邊的意圖有沒有打架。
@@ -187,6 +213,58 @@ export class MergeGuard {
       // 拋棄式的東西一定要收掉——留著會累積在磁碟上，而且下一輪撞名就是一整群報銷
       await tree.dispose();
     }
+  }
+
+  /**
+   * 紅燈時跑兩個實驗，回傳原始事實。
+   *
+   * **這裡不下結論。** 不比對輸出內容、不算相似度、不判斷「像不像同一個失敗」——
+   * 那些都是猜，換一個測試框架就全錯而且沒有人會知道。只回報 exit code 與全文，
+   * 讓讀得懂的人（合併者 agent、或人）自己判斷。
+   *
+   * 沒接實驗器就回空陣列：這是額外的證據，不是必要條件。
+   */
+  private async gatherBlameEvidence(
+    input: MergeGuardInput,
+    baseRef: string,
+    treePath: string,
+  ): Promise<ExperimentResult[]> {
+    const budget = this.opts.experimentBudget;
+    if (!budget || budget.runsLeft <= 0) return [];
+    const runCheck = async (cwd: string): Promise<{ exitCode?: number; output: string }> => {
+      const g = await this.verifier.check({ cwd, config: input.verifierConfig });
+      return { exitCode: g.green ? 0 : 1, output: failSummary(g) };
+    };
+    const out: ExperimentResult[] = [];
+    try {
+      // 實驗 1：**base 自己**紅不紅（不含本群的任何東西）。
+      // 這一個就能答出 PR #54 那題——base 上也紅，那就不是這一群造成的。
+      out.push(
+        await runExperiment({
+          repoPath: input.repoPath,
+          branch: baseRef, // 直接拿 base 當「分支」：樹會 detach 到它，併自己是 no-op
+          spec: { ref: baseRef, times: 2, question: '不含本群的 base 上，同一組關卡紅不紅' },
+          runCheck,
+          budget,
+          log: this.log,
+          git: (cwd, args) => this.git(cwd, args),
+          ...(this.opts.prepareTree ? { prepare: this.opts.prepareTree } : {}),
+          ...(input.repo ? { repo: input.repo } : {}),
+          ...(this.opts.recordCheck ? { record: this.opts.recordCheck } : {}),
+        }),
+      );
+      // 實驗 2：同一個合併後狀態再跑一次——這個紅穩不穩定。
+      // 樹已經在手上，直接重跑，不必再建一棵。
+      const again = await runCheck(treePath);
+      out.push({
+        spec: { ref: 'merged', times: 1, question: '同一個合併後狀態再跑一次，結果一樣嗎' },
+        runs: [{ attempt: 1, ...(again.exitCode === undefined ? {} : { exitCode: again.exitCode }), output: again.output, startedAt: 0, endedAt: 0 }],
+      });
+      budget.runsLeft -= 1;
+    } catch (e) {
+      this.log.warn({ err: e instanceof Error ? e.message : String(e) }, '歸咎實驗失敗，只回報原始紅燈');
+    }
+    return out;
   }
 
   /**

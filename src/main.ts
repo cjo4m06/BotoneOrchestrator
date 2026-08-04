@@ -1441,6 +1441,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     // **抽成具名工廠而不是每個角色各寫一份**：commit e2820a9 就是只接給寫程式的 agent，
     // 審查者的工作是「規格逐條 vs diff」卻不能搜規格。一份來源、四個角色一起接，
     // 下次加角色時漏掉會很明顯。
+    recordCheck: (i) => createCheckRecorder({ ledger, log }).record(i),
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
     makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
       ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),

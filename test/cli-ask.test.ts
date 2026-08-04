@@ -57,7 +57,9 @@ describe('CLI ask — 本機互動入口', () => {
 
       assert.equal(stuck.length, 1);
       assert.match(stuck[0]!.detail, /CONFLICT in a\.ts/);
-      assert.deepEqual(stuck[0]!.actions, ['retry']);
+      // 定案③加上「照樣落地」：系統沒有修 base 的權力，裁定「非本群造成」之後
+      // 沒有這顆的話，這一群跟誤判時一樣落不了地。
+      assert.deepEqual(stuck[0]!.actions, ['retry', 'land-anyway']);
     });
 
     // **這一條是這整套的核心保證**：呼叫端忘了給理由也絕不會讓群組消失。

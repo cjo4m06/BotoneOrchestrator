@@ -155,6 +155,15 @@ export interface InboundLedger {
   recordClarificationAnswer?(taskId: string, threadTs: string, answer: string): void;
   /** 可選：查最近一則事件（用來取回 agent 的 no_change 宣告內容做稽核／摘要）。 */
   latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
+  /**
+   * 可選：把交接單標成已處理。
+   *
+   * **人按了按鈕就等於處理過了**——不標的話那張單會永遠掛在「等你處理」上，
+   * 而人會一直看到自己剛剛才按過的東西，最後不再相信那份清單。
+   */
+  consumeHandoffsFor?(q: { groupId?: string; taskId?: string; kind?: string; toRole?: string }): number;
+  /** 可選：記一次「知道這個紅、照樣落地」的放行（一次性，見 Ledger.takeKnownRedWaiver）。 */
+  grantKnownRedWaiver?(groupId: string, note: string, by: string): number;
 }
 
 /** 合併核准裁決（結構對映 slack/gateway.ts 的 MergeDecision，避免反向相依 Slack 模組）。 */
@@ -312,6 +321,47 @@ export class InboundRouter {
     ledger.updateGroupState(input.groupId, 'ready');
     ledger.logEvent('group', input.groupId, 'group_revived', `由 ${input.userId ?? 'unknown'} 手動復活`);
     log.info({ groupId: input.groupId, userId: input.userId }, '♻️ 群組已復活，回到待派工');
+    return true;
+  }
+
+  /**
+   * 「我知道這個紅，但它不是這一群造成的，照樣落地」（定案③）。
+   *
+   * ── 為什麼需要這顆按鈕 ──
+   *
+   * 系統**沒有修 base 的權力**。合併者做完實驗、裁定「這是 base 的測試本來就不穩」
+   * 之後，這一群依然落不了地——會累積一批「已裁定非我方責任、但卡著」的群，
+   * 堵住的張數與誤判時一模一樣，只是這次系統是對的。
+   *
+   * 這是**人的決定**（要不要帶著一個已知的紅上線）。系統的職責是把證據攤在面前、
+   * 按完之後留下痕跡，不是替人決定、也不是無限期堵著等人自己想起來。
+   *
+   * 「留下痕跡」具體是：理由寫進 ledger（PR 內文會引用），
+   * 而且**那張交接單被標成已處理**——否則它會永遠掛在「等你處理」上。
+   */
+  async landAnyway(input: { groupId: string; userId?: string; note: string }): Promise<boolean> {
+    const { ledger, log } = this.deps;
+    const g = ledger.getGroup?.(input.groupId);
+    if (!g) {
+      log.warn({ groupId: input.groupId }, '要落地的群組不存在');
+      return false;
+    }
+    const note = input.note.trim();
+    if (note === '') {
+      log.warn({ groupId: input.groupId }, '「照樣落地」沒有附理由，拒絕');
+      return false;
+    }
+    // 記在 ledger 的是**一次性放行**，不是永久豁免：守衛下一輪紅的時候會把它用掉，
+    // 用掉之後這一群就恢復正常把關。詳見 Ledger.takeKnownRedWaiver 的說明。
+    if (!ledger.grantKnownRedWaiver) {
+      log.warn({ groupId: input.groupId }, '這個 ledger 沒有放行機制，「照樣落地」無效');
+      return false;
+    }
+    ledger.grantKnownRedWaiver(input.groupId, note, input.userId ?? 'unknown');
+    // 回到待派工：收尾流程（開 PR / 合併）會重跑，而人已經表態接受那個紅
+    ledger.updateGroupState(input.groupId, 'ready');
+    ledger.consumeHandoffsFor?.({ groupId: input.groupId, toRole: 'human', kind: 'stuck_group' });
+    log.warn({ groupId: input.groupId, userId: input.userId, note }, '⚠️ 人已表態：帶著已知的紅落地（一次性，用掉就恢復把關）');
     return true;
   }
 

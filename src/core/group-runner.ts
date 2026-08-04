@@ -12,6 +12,7 @@ import { readDiffStat, type PolicyInput } from '../policy/policy-engine.js';
 import type { MergeRiskVerdict } from './merge-risk-judge.js';
 import { gitDiffHash } from '../git/status.js';
 import type { CheckContext } from '../worker/check-recorder.js';
+import type { CheckRunInput } from '../store/ledger.js';
 import { openMergeApprovalHandoff, openStuckGroupHandoff } from './handoff.js';
 import { resolveBaseFreshness } from '../git/base-freshness.js';
 import { syncTaskCard } from './card-status.js';
@@ -176,6 +177,11 @@ export interface GroupRunnerDeps {
    * 誰要求跑的）——沒有它，check_runs 記了也查不出這一列屬於誰。
    */
   makeVerifier: (ctx?: CheckContext) => VerifierLike;
+  /**
+   * 記一次關卡執行（check_runs）。合併路徑用它記歸咎實驗——
+   * 「同一條分支九分鐘前才通過同一道關卡」這種證據只有這張表查得到。
+   */
+  recordCheck?: (input: CheckRunInput) => void;
   progressRounds: number;
   notifier: Notifier;
   /**
@@ -976,6 +982,11 @@ export class GroupRunner {
       };
       // 驗收樹要有 node_modules 與本機設定檔才跑得動關卡。
       // 沒有的話紅的是**環境**不是程式碼——而 agent 會被派去修一個根本沒壞的東西。
+      // 歸咎實驗的配額。**每一群獨立**——一群跑爆不該影響下一群。
+      // 用完時 runExperiment 會在文字裡明講「配額已用完，請就現有證據判斷」，
+      // 不會靜默降級成「沒查」（那會被下游當成「查過沒事」）。
+      guardOptions.experimentBudget = { runsLeft: 3, msLeft: 10 * 60_000 };
+      if (this.deps.recordCheck) guardOptions.recordCheck = this.deps.recordCheck;
       guardOptions.prepareTree = async (treePath: string) => {
         await prepareNodeModules(proj.repoPath, treePath, log, this.deps.nodeModulesEnv);
         await prepareLocalFiles(proj.repoPath, treePath, log, proj.localFiles);
@@ -993,7 +1004,32 @@ export class GroupRunner {
         // 重跑 DoD 時的任務資訊。用 taskHintOf 一次組好，不要自己拼欄位。
         ...(details[0] ? { task: taskHintOf(details[0], proj) } : {}),
       });
-      if (!verdict.ok) {
+      // ── 人已表態「知道這個紅、照樣落地」（定案③） ──
+      //
+      // 系統沒有修 base 的權力。合併者做完實驗、裁定「這個紅在 base 上本來就會發生」
+      // 之後，這一群依然落不了地——會累積一批「已裁定非我方責任、但卡著」的群。
+      // 這顆放行是人看完證據後的決定，程式的職責只是**認得它、用掉它、記下來**。
+      //
+      // 只對 tests_red / post_merge_red 生效。code_conflict、semantic_drift、
+      // precondition_failed 講的都是**這一群自己**的問題（衝突是這群改的、飄移是這群做的、
+      // 前置失敗代表根本沒驗到）——把它們也放行等於關掉守衛，那不是人按那顆按鈕的意思。
+      const WAIVABLE = new Set(['tests_red', 'post_merge_red']);
+      let waived: string | undefined;
+      if (!verdict.ok && WAIVABLE.has(verdict.reason)) {
+        waived = ledger.takeKnownRedWaiver?.(group.id);
+        if (waived !== undefined) {
+          const summary = `人工放行的已知紅燈（${verdict.reason}）：${waived}`;
+          caveats.push(summary);
+          ledger.logEvent(
+            'group', group.id, 'merge_guard_waived',
+            `${summary}\n\n── 被放行的判決全文 ──\n${stripAnsi(verdict.detail ?? '')}`,
+          );
+          log.warn({ group: group.id, reason: verdict.reason }, '⚠️ Merge Guard 紅燈被人工放行（一次性，這張已用掉）');
+          this.notify(details, { type: 'problem', detail: `⚠ 帶著已知的紅落地：${waived}` });
+        }
+      }
+
+      if (!verdict.ok && waived === undefined) {
         log.warn({ group: group.id, reason: verdict.reason }, 'Merge Guard 擋下');
         ledger.logEvent('group', group.id, 'merge_guard_blocked', `${verdict.reason}: ${stripAnsi(verdict.detail ?? '')}`);
 
@@ -1043,7 +1079,12 @@ export class GroupRunner {
       );
 
       // PR 內文（敘事來自 agent 總結，機器事實由調度器補）
-      const body = this.buildBody(details, recorder, diff, proj, wtPath, caveats);
+      const body = this.buildBody(
+        details, recorder, diff, proj, wtPath, caveats,
+        ...(waived !== undefined && !verdict.ok
+          ? [{ note: waived, verdict: stripAnsi(verdict.detail ?? '') }] as const
+          : []),
+      );
 
       // 記在區域變數：`group` 是進入函式時的快照，updateGroupState 不會回寫它的 prNumber，
       // 後面「已開 PR 就不本地合併」的判斷若讀 group.prNumber 會永遠是 undefined（踩過）。
@@ -1404,6 +1445,7 @@ export class GroupRunner {
     proj: ProjectRuntime,
     wtPath: string,
     caveats: string[] = [],
+    knownRed?: { note: string; verdict: string },
   ): string {
     const summaries: AgentSummary[] = details.flatMap((d) => {
       const text = recorder.get(d.id);
@@ -1436,15 +1478,20 @@ export class GroupRunner {
       verification: [
         { name: '每任務 DoD 全綠', ok: true },
         {
-          name: caveats.length
-            ? `Merge Guard（rebase 後重測）— ⚠ 有但書：${caveats.join('；')}`
-            : 'Merge Guard（rebase 後重測）',
-          ok: true,
+          // **被放行的紅燈不可以印成 ✅。** 審查者掃一眼驗證清單就要看得出
+          // 「這一項其實是紅的，只是有人按了放行」，否則這份 PR 在說謊。
+          name: knownRed
+            ? 'Merge Guard（併上最新 base 重測）— ❌ 紅燈，由人工放行（見上方 Known Red）'
+            : caveats.length
+              ? `Merge Guard（併上最新 base 重測）— ⚠ 有但書：${caveats.join('；')}`
+              : 'Merge Guard（併上最新 base 重測）',
+          ok: !knownRed,
         },
       ],
       // 但書＝「這個綠燈成立的前提」，放進「假設與待確認」讓審查者一定看得到
       assumptions: [...assumptions, ...caveats.map((c) => `⚠ ${c}`)],
       ...(remote.length ? { screenshots: remote } : {}),
+      ...(knownRed ? { knownRed } : {}),
     });
   }
 
