@@ -255,6 +255,25 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS idx_handoffs_inbox ON handoffs(to_role, consumed_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_handoffs_group ON handoffs(group_id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
+
+-- 不可逆動作的冪等鍵。
+--
+-- 合併 PR、刪分支、complete_task 這三件事**做第二次的後果與第一次不同**：
+-- 合併一個已合併的 PR 會失敗（還好），但 complete_task 一張已結案的卡會被任務板拒絕，
+-- 而那個拒絕在呼叫端看起來與「這張卡不存在」一模一樣——於是群組被判 failed。
+--
+-- 重放會發生：daemon 崩在「動作已送出、ledger 還沒寫」之間，重啟後對帳會再走一次。
+-- 先前靠「查狀態再決定」，但那是 read-then-write，兩個 tick 撞在一起就會雙送。
+--
+-- PRIMARY KEY 上的 INSERT OR IGNORE 是原子的：拿到 changes=1 的那一方才是第一次。
+CREATE TABLE IF NOT EXISTS irreversible_actions (
+  key        TEXT PRIMARY KEY,   -- 例：merge:owner/repo#42:<baseSha>
+  kind       TEXT NOT NULL,      -- merge_pr | delete_branch | complete_task
+  ref_id     TEXT,               -- group/task id（查得回是誰做的）
+  detail     TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_irrev_ref ON irreversible_actions(ref_id);
 `;
 
 /**

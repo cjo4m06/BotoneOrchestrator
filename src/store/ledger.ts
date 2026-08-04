@@ -1219,6 +1219,50 @@ export class Ledger {
     return doomed.map((r) => (r.output_path as string) ?? '').filter((p) => p !== '');
   }
 
+  // ── 不可逆動作的冪等 ────────────────────────────────────────────────
+
+  /**
+   * 宣告「我要做這個不可逆動作」。**只有第一個呼叫者拿得到 true。**
+   *
+   * 為什麼不是「先查狀態再決定」：那是 read-then-write，兩個 tick 撞在一起就會雙送。
+   * `INSERT OR IGNORE` 在 PRIMARY KEY 上是原子的——拿到 changes=1 的那一方才是第一次。
+   *
+   * 重放**會**發生：daemon 崩在「動作已送出、ledger 還沒寫」之間，重啟後對帳會再走一次。
+   * 而做第二次的後果與第一次不同——尤其 `complete_task`：任務板拒絕一張已結案的卡，
+   * 那個拒絕在呼叫端看起來與「這張卡不存在」一模一樣，於是整群被判 failed。
+   *
+   * **鍵要含「這一次的識別」**（例如合併驗的是哪顆 base sha）：同一個 PR 在 base 前進
+   * 之後再合併一次是合法的，不該被上一次的紀錄擋住。
+   */
+  claimIrreversible(key: string, kind: string, refId?: string, detail?: string): boolean {
+    const r = this.db
+      .prepare(
+        'INSERT OR IGNORE INTO irreversible_actions (key, kind, ref_id, detail, created_at)' +
+          ' VALUES (@key, @kind, @refId, @detail, @ts)',
+      )
+      .run({ key, kind, refId: refId ?? null, detail: detail ?? null, ts: this.now() });
+    if (r.changes === 0) {
+      this.log.warn({ key, kind, refId }, '不可逆動作已經做過了，這次跳過（重放）');
+      return false;
+    }
+    return true;
+  }
+
+  /** 這個不可逆動作做過了沒（唯讀查詢，不宣告）。 */
+  hasIrreversible(key: string): boolean {
+    return this.db.prepare('SELECT 1 FROM irreversible_actions WHERE key = ?').get(key) !== undefined;
+  }
+
+  /**
+   * 放棄宣告（動作**確定沒有送出**時才呼叫）。
+   *
+   * 例如：拿到鍵之後、真正呼叫 gh 之前就發現前置條件不成立。不放掉的話那個鍵會
+   * 永久擋住之後所有的重試——而那是一個「什麼都沒做卻再也做不了」的死結。
+   */
+  releaseIrreversible(key: string): void {
+    this.db.prepare('DELETE FROM irreversible_actions WHERE key = ?').run(key);
+  }
+
   // ── handoffs：交接單 ────────────────────────────────────────────────
 
   /**

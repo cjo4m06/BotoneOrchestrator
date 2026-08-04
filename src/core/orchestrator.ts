@@ -1380,6 +1380,15 @@ export class Orchestrator {
     // 該擋的沒擋、不該擋的亂擋。要判「這個改動可不可逆」得看得懂那個 repo，
     // 所以那個判斷移到 GroupRunner 的合併風險判斷者（agent，看得到實際內容），
     // 而且只在「自動合併」開著、根本沒有人要看的時候才需要。
+    // **冪等鍵**：合併 PR ＋ 刪分支是一個不可逆動作。重放會發生
+    // （daemon 崩在「gh 已送出、ledger 還沒寫」之間，重啟後對帳會再走一次）。
+    // 鍵含 baseSha：同一個 PR 在 base 前進之後再合併一次是合法的，
+    // 不該被上一次的紀錄擋住。
+    const mergeKey = `merge:${group.repo}#${group.prNumber}:${verdict.baseSha ?? 'nobase'}`;
+    if (!ledger.claimIrreversible(mergeKey, 'merge_pr', group.id, `approvedBy=${approval.approvedBy}`)) {
+      log.warn({ group: group.id, pr: group.prNumber }, '這個 PR 的合併已經送出過了，跳過（重放）');
+      return;
+    }
     const res = await m.pr.merge({
       repo: group.repo,
       prNumber: group.prNumber,
@@ -1391,6 +1400,9 @@ export class Orchestrator {
       cwd: proj.repoPath,
     });
     if (!res.ok) {
+      // 動作**確定沒有生效**才放掉鍵。不放的話這個鍵會永久擋住之後所有重試——
+      // 那是一個「什麼都沒做卻再也做不了」的死結。
+      ledger.releaseIrreversible(mergeKey);
       // 合併失敗（權限、分支保護、競態…）：憑證作廢，下一輪會重新問人，不會靜默重試
       this.clearApproval(group.id, 'merge_failed');
       ledger.logEvent('group', group.id, 'merge_failed', res.detail);

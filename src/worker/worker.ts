@@ -428,8 +428,20 @@ export class Worker {
           detail.category === 'bug'
             ? (this.deps.buildFixReport ?? defaultFixReport)(detail, r.resultText)
             : undefined;
+        // **冪等鍵**：`complete_task` 在任務板上不可逆，而重放會發生
+        // （daemon 崩在「MCP 已送出、ledger 還沒寫」之間，重啟後對帳會再走一次）。
+        // 做第二次的後果與第一次不同：任務板拒絕一張已結案的卡，而那個拒絕在這裡
+        // 看起來與「這張卡不存在」一模一樣——於是整群被判 failed。
+        const doneKey = `complete:${task.id}`;
+        if (!ledger.claimIrreversible(doneKey, 'complete_task', task.id)) {
+          log.warn({ taskId: task.id }, 'complete_task 已經送出過了，直接視為完成（重放）');
+          ledger.updateTaskState(task.id, 'done');
+          return { status: 'done' };
+        }
         const done = await mcp.completeTask(task.id, summary ? { summary } : undefined);
         if (!done.ok) {
+          // 確定沒生效才放掉鍵——不放的話這張卡再也結不了案
+          ledger.releaseIrreversible(doneKey);
           ledger.updateTaskState(task.id, 'verifying', { lastError: `complete_task 失敗：${done.detail}` });
           return { status: 'error', detail: `complete_task 失敗：${done.detail}` };
         }
