@@ -48,6 +48,25 @@ describe('規格工具：每一個角色都要接到', () => {
     });
   }
 
+  // 審查者吸收了介面判斷的職責——它要自己開瀏覽器看畫面。
+  // 漏掉這組工具的症狀是：它照樣會被要求填 uiChecked，但**沒有能力去看**，
+  // 於是每次都只能寫「沒看」，而那看起來完全合法。
+  it('審查者有瀏覽器工具（它要自己去看畫面，不是靠別人餵截圖）', () => {
+    const src = readFileSync('src/worker/reviewer.ts', 'utf8');
+    assert.match(
+      src,
+      /\.\.\.READONLY_BROWSER_TOOLS/,
+      '審查者的工具清單缺瀏覽器——它會被要求填 uiChecked 卻沒有能力去看',
+    );
+  });
+
+  it('審查者有唯讀 git（分不出新舊就會把既有瑕疵算到這次頭上）', () => {
+    const src = readFileSync('src/worker/reviewer.ts', 'utf8');
+    for (const t of ['git_changed_files', 'git_diff', 'git_blame']) {
+      assert.match(src, new RegExp(`mcp__git__${t}`), `審查者缺 ${t}`);
+    }
+  });
+
   it('main 把同一份 docs 來源接給所有角色（不是每個角色各寫一份）', () => {
     const main = readFileSync('src/main.ts', 'utf8');
     const wired = (main.match(/docs: docsSourceOf/g) ?? []).length;

@@ -62,7 +62,7 @@ describe('buildReviewPrompt', () => {
 
 describe('parseReviewResponse', () => {
   it('解析 ```json 圍欄內的 pass', () => {
-    const v = parseReviewResponse('看完了。\n```json\n{"status":"pass","notes":["都有做到"],"violations":[]}\n```');
+    const v = parseReviewResponse('看完了。\n```json\n{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"notes":["都有做到"],"violations":[]}\n```');
     assert.equal(v?.status, 'pass');
     assert.deepEqual(v?.status === 'pass' ? v.notes : [], ['都有做到']);
   });
@@ -79,7 +79,7 @@ describe('parseReviewResponse', () => {
   });
 
   it('容忍 JSON 前後夾雜說明文字', () => {
-    const v = parseReviewResponse('結論如下：\n{"status":"pass","violations":[]}\n以上。');
+    const v = parseReviewResponse('結論如下：\n{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}\n以上。');
     assert.equal(v?.status, 'pass');
   });
 
@@ -172,7 +172,7 @@ describe('Reviewer.check', () => {
   });
 
   it('沒有 docRefs 規格 → skipped', async () => {
-    const r = new Reviewer({ ...base, queryFn: fakeQuery('{"status":"pass","violations":[]}') });
+    const r = new Reviewer({ ...base, queryFn: fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}') });
     const out = await r.check(task, [], '/wt', { baseRef: BASE });
     assert.equal(out.verdict.status, 'skipped');
   });
@@ -194,7 +194,7 @@ describe('Reviewer.check', () => {
   });
 
   it('合格 → ok=true', async () => {
-    const r = new Reviewer({ ...base, queryFn: fakeQuery('```json\n{"status":"pass","notes":["符合"],"violations":[]}\n```') });
+    const r = new Reviewer({ ...base, queryFn: fakeQuery('```json\n{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"notes":["符合"],"violations":[]}\n```') });
     const out = await r.check(task, docs, '/wt', { baseRef: BASE });
     assert.equal(out.ok, true);
     assert.equal(out.verdict.status, 'pass');
@@ -218,7 +218,7 @@ describe('Reviewer.check', () => {
       ...base,
       queryFn: (args) => {
         seen = args.prompt;
-        return fakeQuery('{"status":"pass","violations":[]}')(args);
+        return fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}')(args);
       },
     });
     await r.check(task, docs, '/wt', { baseRef: BASE });
@@ -258,7 +258,7 @@ describe('Reviewer.check', () => {
       collectDiff: async () => {
         throw new Error('not a repo');
       },
-      queryFn: fakeQuery('{"status":"pass","violations":[]}'),
+      queryFn: fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}'),
     });
     assert.equal((await r.check(task, docs, '/wt', { baseRef: BASE })).verdict.status, 'skipped');
   });
@@ -273,7 +273,7 @@ describe('Reviewer.check', () => {
       },
       queryFn: (args) => {
         seen = args.prompt;
-        return fakeQuery('{"status":"pass","violations":[]}')(args);
+        return fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}')(args);
       },
     });
     const out = await r.check(task, docs, '/wt', { baseRef: BASE, diff: 'INLINE_DIFF_MARKER' });
@@ -345,5 +345,54 @@ describe('reviewer 要知道人已經決定了什麼', () => {
   it('沒有任何決定時不多印一段空的（別讓 prompt 出現沒內容的標題）', () => {
     const p = buildReviewPrompt(task, docs, DIFF, []);
     assert.equal(/已經拍板的決定/.test(p), false);
+  });
+});
+
+/**
+ * 「這次有沒有看畫面」必須寫在放行書上。
+ *
+ * 先前這件事是**程式**用卡片類別決定的（`category === 'design'`），而跳過時
+ * 報告上一個字都沒有——於是「沒驗畫面」與「驗過而且沒問題」長得一模一樣。
+ * 一張把 Vue 元件改到破版的 `dev` 卡，其他關卡全綠就一路 complete_task 開 PR。
+ *
+ * 現在由審查者拿實際 diff 自己決定要不要看（那比字面比對準得多），
+ * 但它**必須說出來**。
+ */
+describe('uiChecked：放行書必填，空白不合法', () => {
+  it('pass 但沒填 uiChecked → 退回要它補講（不是默默放行）', () => {
+    const v = parseReviewResponse('{"status":"pass","notes":["都有做到"],"violations":[]}');
+    assert.equal(v?.status, 'fail', '空白會被退回');
+    assert.match(
+      v?.status === 'fail' ? v.violations[0]!.problem : '',
+      /uiChecked/,
+      '要講清楚缺的是什麼，否則 agent 不知道要補什麼',
+    );
+  });
+
+  it('「沒看」也完全合法——只要說得出為什麼', () => {
+    const v = parseReviewResponse(
+      '{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 API 序列化"},"violations":[]}',
+    );
+    assert.equal(v?.status, 'pass');
+    assert.equal(v?.status === 'pass' ? v.uiChecked?.looked : undefined, false);
+    assert.match(v?.status === 'pass' ? (v.uiChecked?.detail ?? '') : '', /只改 API/);
+  });
+
+  it('「看了」要寫出看了哪幾條路由與哪些寬度', () => {
+    const v = parseReviewResponse(
+      '{"status":"pass","uiChecked":{"looked":true,"detail":"看了 /profile 與 /settings（375 與 1440）"},"violations":[]}',
+    );
+    assert.equal(v?.status === 'pass' ? v.uiChecked?.looked : undefined, true);
+  });
+
+  it('detail 是空字串等同沒填（不能用空白字元蒙混）', () => {
+    const v = parseReviewResponse('{"status":"pass","uiChecked":{"looked":true,"detail":"   "},"violations":[]}');
+    assert.equal(v?.status, 'fail');
+  });
+
+  it('fail 不強制填（那時本來就要回去改，畫面的事下一輪再說）', () => {
+    const v = parseReviewResponse('{"status":"fail","violations":[{"requirement":"A","problem":"缺 A"}]}');
+    assert.equal(v?.status, 'fail');
+    assert.equal(v?.status === 'fail' ? v.violations.length : 0, 1);
   });
 });

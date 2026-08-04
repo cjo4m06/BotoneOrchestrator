@@ -6,7 +6,7 @@ import type { Logger } from '../observability/logger.js';
 import type { CheckResult, GateReport, TaskDetail } from '../types.js';
 import type { LoadedDoc } from './agent-runtime.js';
 import { collectDiffSince } from '../git/status.js';
-import { createPreToolUseGuard } from './agent-runtime.js';
+import { createPreToolUseGuard, READONLY_BROWSER_TOOLS } from './agent-runtime.js';
 import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
 
 /**
@@ -30,9 +30,25 @@ export interface ReviewViolation {
   suggestion?: string;
 }
 
+/**
+ * 「這次有沒有去看畫面」。**放行書的必填欄位，空白不合法。**
+ *
+ * 為什麼必填：先前「有沒有驗畫面」是程式用卡片類別決定的（`category === 'design'`），
+ * 而跳過時報告上一個字都沒有——一張把畫面改破版的卡，其他關卡全綠就一路開 PR。
+ * 現在改成由審查者拿**實際 diff** 自己決定，但它必須說出來：
+ * 「看了 /profile 與 /settings，375 與 1440」或「沒看：這次只改 API 序列化」，
+ * 兩者都合法，**空白不合法**。
+ */
+export interface UiChecked {
+  /** true = 有去看；false = 沒看（那也要說為什麼）。 */
+  looked: boolean;
+  /** 看了哪幾條路由／哪些寬度，或沒看的理由。不可為空。 */
+  detail: string;
+}
+
 export type ReviewVerdict =
-  | { status: 'pass'; notes: string[] }
-  | { status: 'fail'; violations: ReviewViolation[] }
+  | { status: 'pass'; notes: string[]; uiChecked?: UiChecked }
+  | { status: 'fail'; violations: ReviewViolation[]; uiChecked?: UiChecked }
   | { status: 'skipped'; reason: string };
 
 export interface ReviewOutcome {
@@ -122,7 +138,15 @@ const DEFAULT_MAX_DIFF_CHARS = 60_000;
 //
 // 先前這份清單只交給 SDK 的 allowedTools，而那個對工具不具強制力，所以少列 Bash 沒有後果；
 // 改成由 PreToolUse hook 強制之後，少列就等於**默默拿掉它一直在用的能力**（實跑撞到）。
-const REVIEWER_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS];
+const REVIEWER_TOOLS = [
+  'Read', 'Glob', 'Grep', 'Bash',
+  ...DOCS_TOOLS,
+  // 唯讀 git：要分得出「這次弄的」與「本來就有的」，否則會把既有瑕疵算到這次頭上
+  'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame',
+  // **審查者自己開瀏覽器看畫面**（介面判斷者併進來了）。
+  // 要不要看、看哪幾條路由由它拿實際 diff 決定——那比「卡片類別字面等於 design」準得多。
+  ...READONLY_BROWSER_TOOLS,
+];
 
 export class Reviewer {
   constructor(private deps: ReviewerDeps) {}
@@ -238,7 +262,13 @@ export class Reviewer {
 
 const REVIEWER_SYSTEM_PROMPT =
   '你是獨立的程式碼審查者。你沒有參與實作，也不負責修好它——你的唯一職責是判斷「實作是否符合規格的每一段」。' +
-  '寬鬆放行比錯殺更糟；但也不要挑規格沒要求的風格問題。只輸出要求的 JSON。';
+  '寬鬆放行比錯殺更糟；但也不要挑規格沒要求的風格問題。\n' +
+  '**畫面也是你的職責。** 先看這次的 diff：動到 .vue / .tsx / CSS / 模板，就自己開瀏覽器導頁去看；' +
+  '只動 server 端邏輯或設定就不必。看的時候用人眼看得出來的標準——讀不讀得下去、字級與對比夠不夠、' +
+  '版面有沒有破、可點的東西看起來像不像可點；不要挑「我覺得可以更好看」這種偏好。\n' +
+  '**放行時一定要填 uiChecked**：看了就寫看了哪幾條路由與哪些寬度，沒看就寫沒看與為什麼。' +
+  '兩者都合法，空白不合法——空白會被退回。\n' +
+  '只輸出要求的 JSON。';
 
 /** 是否具備 Claude 認證（無認證時 reviewer 直接 skip 而非炸掉）。 */
 export function hasClaudeAuth(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -280,7 +310,11 @@ export function buildReviewPrompt(
   p.push(
     `\n## 輸出格式（只輸出一個 JSON 程式碼區塊，不要其他文字）\n` +
       '```json\n' +
-      `{"status":"pass"|"fail","notes":["..."],"violations":[{"docRef":"檔名#段落","requirement":"規格要求","problem":"實作哪裡不符","suggestion":"建議修法"}]}\n` +
+      `{"status":"pass"|"fail","notes":["..."],` +
+      `"uiChecked":{"looked":true|false,"detail":"看了 /profile 與 /settings（375 與 1440）"｜"沒看：這次只改 API 序列化"},` +
+      `"violations":[{"docRef":"檔名#段落","requirement":"規格要求","problem":"實作哪裡不符","suggestion":"建議修法"}]}\n` +
+      'uiChecked 在 status=pass 時**必填**，空白會被退回（先前「沒驗畫面」在報告上一個字都沒有，' +
+      '於是它與「驗過而且沒問題」長得一模一樣）。\n' +
       '```\n' +
       `status=pass 時 violations 必須為空陣列。`,
   );
@@ -306,22 +340,49 @@ export function parseReviewResponse(text: string): ReviewVerdict | null {
   const status = typeof parsed.status === 'string' ? parsed.status.toLowerCase() : '';
   const violations = Array.isArray(parsed.violations) ? parsed.violations.flatMap(toViolation) : [];
   const notes = Array.isArray(parsed.notes) ? parsed.notes.filter((n): n is string => typeof n === 'string') : [];
+  const uiChecked = toUiChecked(parsed.uiChecked);
 
   if (status === 'fail') {
     // 說 fail 卻沒給理由 → 補一條泛用理由，否則回灌時 coder 不知道要改什麼
     return {
       status: 'fail',
       violations: violations.length > 0 ? violations : [{ requirement: '符合規格', problem: 'reviewer 判定不合格但未提供具體理由' }],
+      ...(uiChecked ? { uiChecked } : {}),
     };
   }
   if (status === 'pass') {
+    // **放行書沒說有沒有看畫面 → 不算放行。**
+    //
+    // 空白不合法是刻意的：先前「沒驗畫面」在報告上一個字都沒有，
+    // 於是它與「驗過而且沒問題」長得一模一樣。改成退回讓它補講——
+    // 回一句「沒看：這次只改 API 序列化」也完全合法，就是不能不講。
+    if (!uiChecked) {
+      return {
+        status: 'fail',
+        violations: [{
+          requirement: '放行書必須說明有沒有看畫面',
+          problem: 'uiChecked 欄位空白。請補上「看了哪幾條路由／哪些寬度」，'
+            + '或「沒看：<為什麼這次不需要>」——兩者都可以，但不能不講。',
+        }],
+      };
+    }
     // 說 pass 卻列了違規 → 以違規為準（寧可多改一輪，也不要放行沒做完的實作）
-    return violations.length > 0 ? { status: 'fail', violations } : { status: 'pass', notes };
+    return violations.length > 0
+      ? { status: 'fail', violations, uiChecked }
+      : { status: 'pass', notes, uiChecked };
   }
   if (status === 'skipped' || status === 'skip') {
     return { status: 'skipped', reason: notes[0] ?? 'reviewer 自述無法判定' };
   }
   return null;
+}
+
+/** 解析 uiChecked。**空白（缺欄位／空字串）一律回 undefined**——呼叫端據此退回。 */
+function toUiChecked(v: unknown): UiChecked | undefined {
+  if (!isRecord(v)) return undefined;
+  const detail = typeof v.detail === 'string' ? v.detail.trim() : '';
+  if (detail === '') return undefined;
+  return { looked: v.looked === true, detail };
 }
 
 /** ReviewVerdict → GateReport，讓 Worker 沿用既有的「失敗回灌」路徑。 */
