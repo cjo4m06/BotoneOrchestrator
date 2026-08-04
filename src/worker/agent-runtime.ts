@@ -1253,6 +1253,9 @@ export function resolveToolPolicy(options?: ToolPolicyOptions): ResolvedToolPoli
 const READONLY_COMMANDS = new Set([
   'grep', 'rg', 'egrep', 'fgrep', 'find', 'ls', 'cat', 'head', 'tail', 'wc',
   'sort', 'uniq', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'file', 'stat', 'echo', 'true',
+  // pwd 沒有任何寫入形式，卻被擋過（正式 log）。誤擋的代價不是「安全一點」，
+  // 是判斷者少一次定位自己在哪，然後憑猜的去讀檔案。
+  'pwd',
 ]);
 
 /**

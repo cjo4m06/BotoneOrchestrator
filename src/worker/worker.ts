@@ -1,5 +1,6 @@
 import { computeBackoffDelay, realSleep, type BackoffOptions } from '../core/retry.js';
 import { changedSince, gitHeadRef } from './verifier.js';
+import { commitExists, currentBranch } from '../git/status.js';
 import { markHumanReplyConsumed, pendingHumanReply, settledDecisions, type HumanReply } from './human-reply.js';
 import { cardStatusOf } from '../core/card-status.js';
 import { RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
@@ -76,6 +77,8 @@ const UNRETRYABLE_HINT: Partial<Record<SdkErrorCode, string>> = {
 /** 連續受阻計數用的稽核事件：deps_blocked 累加、task_claimed 歸零。 */
 const DEPS_BLOCK_EVENT = 'deps_blocked';
 const CLAIM_EVENT = 'task_claimed';
+/** 本任務**首次認領**時的 HEAD（DoD「diff 非空」關卡的基準）。見 storedDiffBase 的說明。 */
+const DIFF_BASE_EVENT = 'diff_base';
 
 /** agent 連續錯誤的退避設定（時間來源可注入，測試不必真的等）。 */
 export interface ErrorBackoffOptions extends BackoffOptions {
@@ -131,6 +134,10 @@ export interface WorkerDeps {
   noChangePolicy?: NoChangePolicy;
   /** 判定相對 baseRef 是否有變更（驗證 no_change 宣告用）。預設 verifier.changedSince。 */
   changedSince?: (cwd: string, baseRef: string) => Promise<{ ok: true; files: string[] } | { ok: false; detail: string }>;
+  /** 存下來的 diff 基準還在不在（跨輪沿用前的檢查）。預設 git/status.commitExists。 */
+  commitExists?: (cwd: string, sha: string) => Promise<boolean>;
+  /** 目前簽出的分支（判斷存下來的基準是不是同一條分支的）。預設 git/status.currentBranch。 */
+  currentBranch?: (cwd: string) => Promise<string | undefined>;
   /** 退避用的等待函式（測試注入，避免真的睡）。 */
   sleep?: (ms: number) => Promise<void>;
   /**
@@ -579,13 +586,24 @@ export class Worker {
    * 但要吵到看得見（log.error + Slack 通知），不能靜靜地把把關拿掉。
    */
   private async withDiffGate(config: VerifierConfig, cwd: string, taskId: string): Promise<VerifierConfig> {
-    const { log } = this.deps;
+    const { log, ledger } = this.deps;
     const head = this.deps.headRef ?? gitHeadRef;
-    let baseRef: string | undefined;
-    try {
-      baseRef = await head(cwd);
-    } catch (e) {
-      log.warn({ cwd, err: e instanceof Error ? e.message : String(e) }, '取 HEAD 失敗');
+    const exists = this.deps.commitExists ?? commitExists;
+    const branchOf = this.deps.currentBranch ?? currentBranch;
+
+    const branch = await branchOf(cwd).catch(() => undefined);
+    let baseRef = await this.storedDiffBase(taskId, cwd, branch, exists);
+    let reused = baseRef !== undefined;
+
+    if (!reused) {
+      try {
+        baseRef = await head(cwd);
+      } catch (e) {
+        log.warn({ cwd, err: e instanceof Error ? e.message : String(e) }, '取 HEAD 失敗');
+      }
+      if (baseRef) {
+        ledger.logEvent('task', taskId, DIFF_BASE_EVENT, JSON.stringify({ sha: baseRef, branch: branch ?? null }));
+      }
     }
 
     if (!baseRef) {
@@ -596,8 +614,68 @@ export class Worker {
       );
       return config;
     }
-    log.debug({ taskId, baseRef }, 'diff 非空關卡基準 = 任務開始時的 HEAD');
+    log.debug(
+      { taskId, baseRef, reused },
+      reused ? 'diff 非空關卡基準 = 首次認領時的 HEAD（沿用）' : 'diff 非空關卡基準 = 任務開始時的 HEAD',
+    );
     return { ...config, diff: { baseRef } };
+  }
+
+  /**
+   * 讀出這個任務**首次認領**時記下的 diff 基準，沒有／不能用就回 undefined（呼叫端重抓）。
+   *
+   * ── 為什麼基準不能每輪重抓 ──
+   *
+   * 一個任務會被重跑：retry、澄清答覆後續做、daemon 重啟後對帳重排。而 agent 上一輪
+   * 很可能**已經自己 commit 了**。每輪重抓 HEAD 的話，第二輪的基準就是「含它自己上一輪
+   * 產出的那個 commit」，於是 diff 為空 → DoD 判「本輪無變更」→ 回灌「尚未實作」。
+   *
+   * 實跑撞到（正式 log）：agent 自己說「本任務的實作已完整存在於本分支 HEAD
+   * （commit b0ddf9d，為本任務前一輪產出），工作區乾淨、DoD 已逐條經瀏覽器驗證。
+   * 但 no-changes 關卡以『本輪起始 HEAD』為基準，因此判定本輪無變更。」
+   * ——它做完了，而且知道自己做完了，卻沒有辦法讓關卡承認。
+   *
+   * ── 為什麼要驗分支與 sha 還在不在 ──
+   *
+   * 存下來的 sha 會變成孤兒：worktree 被砍掉重建、群分支刪掉重開、任務被搬到別群。
+   * 那時沿用舊 sha 有兩種壞法——解不開就擲錯（整道關卡靜靜停用），
+   * 或解得開但太舊（diff 含別的任務的成果，關卡就變成橡皮圖章）。
+   * 分支不同或 sha 不在 → 重抓，寧可回到「這一輪」的基準也不要拿一個錯的。
+   *
+   * 注意基準**刻意不是群分支起點**：群內多個任務共用同一 worktree，前面的任務已被
+   * commitAll 提交，用群起點會讓每個任務都繼承前面任務的 diff。
+   */
+  private async storedDiffBase(
+    taskId: string,
+    cwd: string,
+    branch: string | undefined,
+    exists: (cwd: string, sha: string) => Promise<boolean>,
+  ): Promise<string | undefined> {
+    const { log, ledger } = this.deps;
+    const raw = ledger.latestEvent('task', taskId, DIFF_BASE_EVENT)?.detail;
+    if (!raw) return undefined;
+
+    let sha: string | undefined;
+    let storedBranch: string | null | undefined;
+    try {
+      const parsed = JSON.parse(raw) as { sha?: unknown; branch?: unknown };
+      if (typeof parsed.sha === 'string') sha = parsed.sha;
+      if (typeof parsed.branch === 'string' || parsed.branch === null) storedBranch = parsed.branch;
+    } catch {
+      // 舊格式（純 sha 字串）也接受——升級時不要讓既有任務全部退回重抓
+      sha = raw.trim() || undefined;
+    }
+    if (!sha) return undefined;
+
+    if (storedBranch !== undefined && storedBranch !== (branch ?? null)) {
+      log.info({ taskId, storedBranch, branch }, 'diff 基準記錄的分支已不同 → 重抓基準');
+      return undefined;
+    }
+    if (!(await exists(cwd, sha).catch(() => false))) {
+      log.info({ taskId, sha }, 'diff 基準的 commit 已不在這個工作區 → 重抓基準');
+      return undefined;
+    }
+    return sha;
   }
 
   /**

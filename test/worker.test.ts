@@ -634,6 +634,113 @@ describe('Worker — 單任務監督迴圈', () => {
       assert.equal(verifier.configs[0]?.diff, undefined);
     });
 
+    // ── 基準跨輪沿用 ─────────────────────────────────────────────
+    //
+    // 一個任務會被重跑（retry／澄清答覆後續做／重啟對帳重排），而 agent 上一輪很可能
+    // 已經自己 commit 了。基準每輪重抓的話，第二輪就會拿「含它自己上一輪產出」的 HEAD
+    // 當基準 → diff 為空 → 判「本輪無變更」→ 回灌「尚未實作」。正式 log 實際撞到過。
+
+    it('同一任務再跑一次 → 沿用首次認領時的基準，不重抓', async () => {
+      const task = makeTask();
+      seed(task);
+      const heads = ['head-first-claim', 'head-after-agent-committed'];
+      let i = 0;
+      const verifier = recordingVerifier([green(), green()]);
+      const { worker } = build({
+        verifier,
+        headRef: async () => heads[i++],
+        currentBranch: async () => 'orch/proj/g_1',
+        commitExists: async () => true,
+      });
+
+      await worker.runTask({ task, ...cfg });
+      seed(task); // 任務被重新派工
+      await worker.runTask({ task, ...cfg });
+
+      assert.equal(i, 1, '第二輪不該再抓 HEAD——那個 HEAD 已經含 agent 上一輪的 commit');
+      assert.deepEqual(
+        verifier.configs.map((c) => c.diff?.baseRef),
+        ['head-first-claim', 'head-first-claim'],
+      );
+    });
+
+    it('分支不同了 → 重抓基準（群分支被刪掉重開，舊 sha 可能太舊或已成孤兒）', async () => {
+      const task = makeTask();
+      seed(task);
+      const heads = ['head-on-branch-a', 'head-on-branch-b'];
+      let i = 0;
+      const branches = ['orch/proj/g_1', 'orch/proj/g_2'];
+      let b = 0;
+      const verifier = recordingVerifier([green(), green()]);
+      const { worker } = build({
+        verifier,
+        headRef: async () => heads[i++],
+        currentBranch: async () => branches[b++],
+        commitExists: async () => true,
+      });
+
+      await worker.runTask({ task, ...cfg });
+      seed(task);
+      await worker.runTask({ task, ...cfg });
+
+      assert.deepEqual(
+        verifier.configs.map((c) => c.diff?.baseRef),
+        ['head-on-branch-a', 'head-on-branch-b'],
+      );
+    });
+
+    it('存下來的 sha 已不在工作區 → 重抓，不讓 git diff 擲錯把整道關卡靜靜停用', async () => {
+      const task = makeTask();
+      seed(task);
+      const heads = ['orphaned-sha', 'fresh-sha'];
+      let i = 0;
+      const verifier = recordingVerifier([green(), green()]);
+      const { worker } = build({
+        verifier,
+        headRef: async () => heads[i++],
+        currentBranch: async () => 'orch/proj/g_1',
+        commitExists: async (_cwd, sha) => sha !== 'orphaned-sha',
+      });
+
+      await worker.runTask({ task, ...cfg });
+      seed(task);
+      await worker.runTask({ task, ...cfg });
+
+      assert.deepEqual(
+        verifier.configs.map((c) => c.diff?.baseRef),
+        ['orphaned-sha', 'fresh-sha'],
+      );
+    });
+
+    it('端到端（真 Verifier + 真 git）：任務重跑時，agent 上一輪自己 commit 的成果仍算數', async () => {
+      const repo = createTmpGitRepo({ files: { 'a.txt': 'v1\n' } });
+      try {
+        const task = makeTask();
+        seed(task);
+        const mcp = fakeMcp();
+        // 第一輪：改檔並**自己 commit**（agent 常這麼做），然後這一輪被中斷／重派。
+        // 第二輪：什麼都不做。舊行為會在第二輪判「本輪無變更」，因為基準被重抓成
+        // 那個 commit 本身。正確行為是沿用第一輪的基準，看得到那個 commit 的內容。
+        let round = 0;
+        const agent: AgentLike = {
+          async iterate() {
+            round += 1;
+            if (round === 1) repo.commit({ 'a.txt': 'v2\n' }, 'agent 自己提交的成果');
+            return { sessionId: 's1', resultText: '完成了', isError: false };
+          },
+        };
+        const { worker } = build({ mcp, agent, verifier: new Verifier(createSilentLogger()), headRef: gitHeadRef });
+        const run = () => worker.runTask({ task, cwd: repo.path, verifierConfig: { test: 'exit 0' } });
+
+        assert.deepEqual(await run(), { status: 'done' });
+        seed(task);
+        assert.deepEqual(await run(), { status: 'done' }, '第二輪不該因為基準被重抓而判成「尚未實作」');
+        assert.equal(round, 2, 'agent 不該被 Stop hook 逼著再做一輪');
+      } finally {
+        repo.cleanup();
+      }
+    });
+
     it('端到端（真 Verifier + 真 git）：agent 什麼都沒改 → 不 complete_task，回灌後續做才完成', async () => {
       const repo = createTmpGitRepo({ files: { 'a.txt': 'v1\n' } });
       try {

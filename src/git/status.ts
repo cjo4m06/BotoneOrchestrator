@@ -81,6 +81,29 @@ export async function workingTreeChanged(cwd: string, baseRef?: string): Promise
 /** git 空樹的固定 sha：repo 還沒有任何 commit 時當基準，等於「所有檔案都是新增」。 */
 export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
+/**
+ * 這個 commit 在這個工作區裡還在不在。
+ *
+ * 用途：DoD 的 diff 基準會存進 ledger 跨輪沿用，但工作區可能被砍掉重建、
+ * 群分支可能被刪掉重開——存下來的 sha 到那時就是個孤兒。拿它去 `git diff`
+ * 只會擲錯，而那個錯會被當成「取不到基準」→ 整道關卡靜靜停用。
+ * 沿用之前先問一句它還在不在，不在就重抓。
+ *
+ * 空樹永遠算存在：它是 git 內建的常數 sha，任何 repo 都解得開。
+ */
+export async function commitExists(cwd: string, sha: string): Promise<boolean> {
+  if (sha === EMPTY_TREE) return true;
+  const r = await execa('git', ['-C', cwd, 'cat-file', '-e', `${sha}^{commit}`], { reject: false });
+  return r.exitCode === 0;
+}
+
+/** 目前簽出的分支名；detached HEAD 或不是 git 工作區 → undefined。 */
+export async function currentBranch(cwd: string): Promise<string | undefined> {
+  const r = await execa('git', ['-C', cwd, 'symbolic-ref', '--quiet', '--short', 'HEAD'], { reject: false });
+  const name = r.exitCode === 0 ? r.stdout.trim() : '';
+  return name === '' ? undefined : name;
+}
+
 /** git 查詢逾時：卡住的 git 不該讓整個任務跟著卡住。 */
 const GIT_TIMEOUT_MS = 10_000;
 
