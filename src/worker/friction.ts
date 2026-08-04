@@ -36,7 +36,6 @@ export interface FrictionReport {
   /** 建議怎麼改（可選——只回報問題也有價值）。 */
   suggestion?: string;
   /** 這件事有沒有實際擋住你？ */
-  blocked?: boolean;
 }
 
 const Schema = z.object({
@@ -44,7 +43,6 @@ const Schema = z.object({
   what: z.string().min(1),
   evidence: z.string().optional(),
   suggestion: z.string().optional(),
-  blocked: z.boolean().optional(),
 });
 
 /** 寫入端只需要能記事件（Ledger 結構上即滿足）。 */
@@ -58,17 +56,38 @@ export const FRICTION_EVENT = 'friction_report';
  * 工具說明。刻意寫得長一點——這個工具的價值完全取決於 agent 用不用它、
  * 以及用得對不對，而那由這段文字決定。
  */
+/**
+ * report_friction 的定位。
+ *
+ * ── 為什麼要重寫 ──
+ *
+ * 舊版把它寫成「阻礙**或改進建議**」的管道，名義上是自我成長／流程優化的出口。
+ * 正式庫 26 筆實測：`workflow`（流程建議）這個 kind **一筆都沒有**，
+ * 100% 被當成「我被擋住了」在用。把它定義成「建議」正是原本設計失準的地方。
+ *
+ * 更嚴重的是舊版有一個 `blocked` 欄位，問 agent「這件事有沒有實際擋住你」。
+ * 我追過消費端：那個值只寫進一行 log 與一個統計 struct，**沒有任何東西讀它來改變行為**。
+ * 實跑 zZb5MGTMdQRZ 最後一筆 `blocked=true`——agent 明講「這擋住我了」——系統什麼都沒做。
+ * 那不只是誤導，是一條回報成功卻什麼都不會發生的**安慰劑升級管道**：
+ * agent 誠實標了 true 之後，就有理由認為「我已經講出去了」，於是不再敲 ask_human。
+ * 填得越誠實，越不會求救。所以欄位整個拿掉。
+ *
+ * 現在它只剩一個定位：**我看到這個系統或產品有問題，你該知道，但它沒擋住我交付。**
+ * 真的擋住了 → ask_human（而且同一類回報第二次，程式會自動停下來交人，見 stuck-detect.ts）。
+ */
 export const FRICTION_TOOL_DESCRIPTION =
-  '回報你在這個系統裡遇到的阻礙或改進建議。' +
-  '**這個工具不影響本任務的結果**——它不會讓任務通過或失敗，只是留一筆紀錄給維護者看。' +
-  '所以不要拿它當「做不完但想交差」的出口（那是 ask_human／report_no_change 的職責）。\n\n' +
-  '什麼時候該用：\n' +
-  '· 你想做某件事但工具或權限不夠（例如查不到某個資訊、某個指令被擋）\n' +
-  '· 規格本身有問題（前提與現況不符、自相矛盾、缺關鍵資訊）\n' +
+  '**我看到這個系統或產品有問題，你該知道——但它沒有擋住我交付。**\n\n' +
+  '這個工具不影響本任務的結果，只是留一筆給維護者。\n\n' +
+  '什麼時候用：\n' +
+  '· 工具或權限不夠，但你找到了替代路徑（照樣做得完）\n' +
   '· 某個關卡誤判了你的實作，或反過來——你看到問題但關卡沒發現\n' +
-  '· 流程上有明顯可改善的地方（重複勞動、順序不合理）\n\n' +
-  '**一定要附證據**：檔案與行號、指令輸出、量測數字。沒有證據的抱怨沒有價值，' +
-  '維護者無法據以判斷。可以在同一個任務裡回報多次。';
+  '· 你順手發現了與本任務無關的產品缺陷（不要順手修，改動會擴散到不相干的 PR）\n' +
+  '· 規格有問題但不影響你這張卡\n\n' +
+  '**真的擋住你的時候不要用這個，用 ask_human。**\n' +
+  '判準是「我還交得出去嗎」：交得出去就回報一筆繼續做，交不出去就停下來問人。\n' +
+  '（同一類障礙你回報第二次時，調度器會自動停下來交人——因為那代表它其實擋住你了。）\n\n' +
+  '**一定要附證據**：檔案與行號、指令輸出、量測數字。沒有證據的抱怨維護者無法據以判斷。\n' +
+  '可以在同一個任務裡回報多次。';
 
 export function createFrictionHandler(sink: FrictionSink, log: Logger, taskId: string, source: string) {
   return async (args: unknown) => {
@@ -84,7 +103,7 @@ export function createFrictionHandler(sink: FrictionSink, log: Logger, taskId: s
       log.warn({ taskId, err: e instanceof Error ? e.message : String(e) }, '摩擦回報寫入失敗（忽略）');
     }
     log.info(
-      { taskId, source, kind: r.kind, blocked: r.blocked === true, what: r.what.slice(0, 160) },
+      { taskId, source, kind: r.kind, what: r.what.slice(0, 160) },
       '📋 agent 回報了系統摩擦',
     );
     return {
@@ -118,7 +137,6 @@ export function parseFrictionEvent(detail: string | undefined): (FrictionReport 
 
 export interface FrictionSummary {
   total: number;
-  blocked: number;
   byKind: Record<string, number>;
   /** 最近幾筆，給人直接讀。 */
   recent: (FrictionReport & { taskId: string; source?: string; at?: number })[];
@@ -140,14 +158,11 @@ export function summarizeFriction(
     .filter((x): x is { taskId: string; rep: NonNullable<ReturnType<typeof parseFrictionEvent>> } => x.rep !== undefined);
 
   const byKind: Record<string, number> = {};
-  let blocked = 0;
   for (const { rep } of parsed) {
     byKind[rep.kind] = (byKind[rep.kind] ?? 0) + 1;
-    if (rep.blocked === true) blocked += 1;
   }
   return {
     total: parsed.length,
-    blocked,
     byKind,
     recent: parsed.slice(-recentLimit).reverse().map(({ taskId, rep }) => ({ taskId, ...rep })),
   };

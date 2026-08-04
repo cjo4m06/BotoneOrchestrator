@@ -292,13 +292,13 @@ export function frictionInput(
 export function formatFriction(s: FrictionSummary): string {
   if (s.total === 0) return '目前沒有任何 agent 回報系統摩擦。';
   const lines = [
-    `agent 回報 ${s.total} 則（其中 ${s.blocked} 則實際擋住了工作）`,
+    `agent 回報 ${s.total} 則（都是「不擋交付但你該知道」；真的被擋住的會走 ask_human）`,
     '',
     '分類：' + Object.entries(s.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join('  '),
     '',
   ];
   for (const r of s.recent) {
-    lines.push(`${r.blocked ? '🚫' : '·'} [${r.kind}] ${r.taskId}${r.source ? ` (${r.source})` : ''}`);
+    lines.push(`· [${r.kind}] ${r.taskId}${r.source ? ` (${r.source})` : ''}`);
     lines.push(`    ${oneLine(r.what)}`);
     if (r.evidence) lines.push(`    證據：${oneLine(r.evidence)}`);
     if (r.suggestion) lines.push(`    建議：${oneLine(r.suggestion)}`);

@@ -78,3 +78,45 @@ describe('規格工具：每一個角色都要接到', () => {
     );
   });
 });
+
+/**
+ * 出口工具的接線。
+ *
+ * ── 這個 repo 已經被同一種病咬過四次 ──
+ *
+ * 能力做好了、清單漏一項，症狀只有一行 WARN 而閘門照樣綠燈：
+ * DOCS_TOOLS 只接給 coder、ReviewWatcher 只掃兩種狀態（16 個任務死結）、
+ * pending 只掃 failed、typecheck 沒跑 test/tsconfig（81 個型別錯誤累積）。
+ *
+ * `createFrictionServer` 也一樣——它被寫好之後**零個呼叫端**，
+ * 而規劃者是唯一看得到「兩張卡彼此矛盾」的角色，一個出口都沒有。
+ */
+describe('出口工具接線', () => {
+  it('規劃 agent 的工具清單裡有 report_friction', () => {
+    const src = readFileSync('src/core/plan-agent.ts', 'utf8');
+    assert.match(
+      src,
+      /mcp__friction__report_friction/,
+      '它是唯一一次看到整批任務的角色——「兩張卡的要求彼此矛盾」只有它看得見',
+    );
+    assert.match(src, /createFrictionServer/, '清單列了工具但沒掛 server ＝ 呼叫時才失敗');
+  });
+
+  it('main 有把 sink 注入規劃 agent（沒接的話回報會靜靜消失）', () => {
+    const src = readFileSync('src/main.ts', 'utf8');
+    const i = src.indexOf('new PlanAgent({');
+    assert.ok(i >= 0, '找不到 PlanAgent 的建構');
+    assert.match(src.slice(i, i + 220), /frictionSink/, 'sink 沒接 → NOOP，agent 以為講出去了，其實沒有');
+  });
+
+  it('friction 的兩個註冊點欄位一致（少一個欄位＝那個角色講不出同樣的事）', () => {
+    const inline = readFileSync('src/worker/agent-runtime.ts', 'utf8');
+    const server = readFileSync('src/worker/friction-server.ts', 'utf8');
+    for (const field of ['kind', 'what', 'evidence', 'suggestion']) {
+      assert.match(server, new RegExp(`${field}:`), `friction-server 少了 ${field}`);
+      assert.match(inline, new RegExp(`${field}:`), `agent-runtime 的 friction 少了 ${field}`);
+    }
+    // blocked 已退場：兩邊都不可以留著（留一邊＝兩個角色的契約不一樣）
+    assert.doesNotMatch(server, /blocked:/);
+  });
+});

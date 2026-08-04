@@ -207,6 +207,13 @@
       <h2><span class="left"><svg class="i"><use href="#i-play"/></svg>執行中</span></h2>
       <div id="running"></div>
     </div>
+    <!-- agent 回報的、不擋交付但你該知道的事。
+         先前 GET /api/friction 早就實作好了，但沒有任何畫面呼叫它——
+         於是「PMM 未授權」這種跨 7 個任務、連續兩天的問題完全沒人知道。 -->
+    <div class="panel">
+      <h2><span class="left"><svg class="i"><use href="#i-help"/></svg>agent 說你該知道</span><span id="frictionCount" class="tag">0</span></h2>
+      <div id="friction"></div>
+    </div>
     <div class="panel">
       <h2><span class="left"><svg class="i"><use href="#i-merge"/></svg>群組</span></h2>
       <div class="scroll"><table class="data" id="groups"></table></div>
@@ -537,10 +544,30 @@ const KIND = {
   stuck_group: { label: '群組卡住', icon: 'alert' },
 };
 
+async function loadFriction() {
+  let f;
+  // 這一區壞掉不可以拖垮總覽——它是「參考資訊」，不是主流程
+  try { f = await api('/api/friction'); } catch { return; }
+  $('frictionCount').textContent = f.total ?? 0;
+  if (!f.total) {
+    $('friction').innerHTML = '<div class="empty">agent 沒有回報任何問題</div>';
+    return;
+  }
+  const kinds = Object.entries(f.byKind ?? {}).sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `<span class="tag">${esc(k)} ${n}</span>`).join(' ');
+  const rows = (f.recent ?? []).map((r) => `<div class="row"><div class="grow">
+    <div class="title"><span class="tag">${esc(r.kind)}</span><code>${esc(r.taskId)}</code></div>
+    <div class="meta">${esc(r.what)}${r.evidence ? '<br><span class="mono">' + esc(r.evidence) + '</span>' : ''}</div>
+  </div></div>`).join('');
+  $('friction').innerHTML =
+    `<div class="meta" style="margin-bottom:8px">共 ${f.total} 則（都是「不擋交付但你該知道」；真的被擋住的會出現在上面「等你處理」）${kinds ? '<br>' + kinds : ''}</div>${rows}`;
+}
+
 async function loadState() {
   let s;
   try { s = await api('/api/state'); }
   catch (e) { $('status').textContent = '連不上：' + e.message; return; }
+  void loadFriction();
 
   const t = s.taskCounts;
   const active = s.projects.filter((p) => p.enabled).length;
