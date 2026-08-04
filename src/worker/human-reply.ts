@@ -33,6 +33,46 @@ export type HumanReplyKind = (typeof HUMAN_REPLY_EVENTS)[number];
  * 與 pendingHumanReply 的差別：那個是「還沒送進 agent 的最新一則」，讀完要標記消費；
  * 這個是「歷來所有裁決」，任何時候都能讀，不影響消費狀態。
  */
+/**
+ * 常設決定（`scope='always'`）在事件表裡的 kind。
+ *
+ * 掛在 `system` scope、refId ＝ repo：這樣它**不屬於任何一張卡**，
+ * 而下一張卡查得到。這正是它存在的理由。
+ */
+export const STANDING_DECISION = 'standing_decision';
+
+/**
+ * 這個 repo 上「人已經拍板、而且說了以後都這樣」的決定。
+ *
+ * ── 為什麼需要跨任務 ──
+ *
+ * 實跑（2026-08-04）：`spec/ 寫不進去` 這件事，02:43 害了 QTa5wZ5CIi_z，
+ * 17:44 又原封不動害了 zZb5MGTMdQRZ——**相隔 14 小時、同一個 repo、同一個成因**。
+ * 就算第一次有人回答了，那個答案也只存在於第一張卡的事件裡，第二張卡看不到。
+ *
+ * 所以人在回答時可以說「以後都這樣」，答案就掛到 repo 上而不是那張卡上。
+ * 下一個 agent 的 prompt 裡自動帶出來——不必再問一次，也不必寫進 spec/ 才存在。
+ */
+export function standingDecisions(
+  ledger: { listEvents(q: { scope: 'system'; refId: string; kind?: string; limit?: number }): LedgerEvent[] },
+  repo: string,
+): { question: string; answer: string }[] {
+  const rows = ledger.listEvents({ scope: 'system', refId: repo, kind: STANDING_DECISION, limit: 50 });
+  return rows
+    .map((e) => {
+      try {
+        const j = JSON.parse(e.detail ?? '{}') as { question?: unknown; answer?: unknown };
+        return {
+          question: typeof j.question === 'string' ? j.question : '（原問題已不可考）',
+          answer: typeof j.answer === 'string' ? j.answer : '',
+        };
+      } catch {
+        return { question: '（原問題已不可考）', answer: e.detail ?? '' };
+      }
+    })
+    .filter((d) => d.answer.trim() !== '');
+}
+
 export function settledDecisions(
   ledger: { listEvents(q: { scope: 'task'; refId: string; kind?: string; limit?: number }): LedgerEvent[] },
   taskId: string,

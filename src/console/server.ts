@@ -346,9 +346,12 @@ export class ConsoleServer {
     if (!id) return { ok: false, error: '缺少 id' };
 
     switch (action) {
-      case 'answer':
-        router.handleAnswer({ taskId: id, threadTs: '', freeText: String(input.text ?? '') });
-        return { ok: true };
+      case 'answer': {
+        // scope='always' → 答覆掛到 repo 上而不是這張卡上（見 human-reply.ts 的 standingDecisions）
+        const scope = input.scope === 'always' ? ('always' as const) : ('task' as const);
+        router.handleAnswer({ taskId: id, threadTs: '', freeText: String(input.text ?? ''), scope });
+        return { ok: true, ...(scope === 'always' ? { detail: '已設為常設決定，之後這個專案的任務都會看到' } : {}) };
+      }
       case 'retry': {
         // stuck_group 的 id 是**群組** id。走 handleControl 的 retry 對它無效
         //（那個做的是 clearBlock(taskId)），實跑撞到：按了什麼都沒發生。

@@ -14,6 +14,7 @@ import type {
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Logger } from '../observability/logger.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from '../core/merge-credential.js';
+import { STANDING_DECISION } from '../worker/human-reply.js';
 import type { FeedbackSource } from '../pr/review-watcher.js';
 
 /** 事件轉為簡短中文摘要（Slack 與 console 共用文案）。 */
@@ -234,6 +235,17 @@ export class InboundRouter {
       const answer = a.optionId ?? a.freeText ?? '';
       ledger.logEvent('task', a.taskId, 'clarification_answer', JSON.stringify({ threadTs: a.threadTs, answer }));
       ledger.recordClarificationAnswer?.(a.taskId, a.threadTs, answer);
+
+      // **「以後都這樣」的答覆掛到 repo 上，不是掛到這張卡上。**
+      //
+      // 實跑：`spec/ 寫不進去` 在 02:43 害了一個任務、17:44 又原封不動害了另一個
+      // ——同一個 repo、同一個成因、相隔 14 小時。就算第一次有人回答了，
+      // 那個答案也只存在於第一張卡的事件裡，第二張卡看不到，於是重問一次、重卡一次。
+      if (a.scope === 'always') {
+        const question = latestQuestion(ledger, a.taskId);
+        ledger.logEvent('system', task.repo, STANDING_DECISION, JSON.stringify({ question, answer, fromTask: a.taskId }));
+        log.warn({ repo: task.repo, taskId: a.taskId, answer }, '📌 這個答覆已設為常設決定，之後同一個 repo 的任務都會看到');
+      }
 
       if (task.state === 'blocked' && task.block?.reason === 'needs_clarification') {
         // 回 queued 而不是就地續跑：worker slot 已經釋放，重新排隊才拿得到執行資源。
@@ -522,5 +534,23 @@ export class InboundRouter {
     } catch (err) {
       this.deps.log.error({ err: String(err), handler: name }, '入站事件處理失敗（已吞下，不影響 daemon）');
     }
+  }
+}
+
+/**
+ * 取這個任務最後一次提問的內容（常設決定要連問題一起記，否則只剩一句沒有上下文的答案）。
+ * 取不到就用佔位字串——有答案總比什麼都沒有好。
+ */
+function latestQuestion(
+  ledger: { latestEvent?(scope: 'task', refId: string, kind: string): { detail?: string } | undefined },
+  taskId: string,
+): string {
+  const e = ledger.latestEvent?.('task', taskId, 'clarification_asked');
+  if (!e?.detail) return '（原問題已不可考）';
+  try {
+    const j = JSON.parse(e.detail) as { question?: unknown };
+    return typeof j.question === 'string' ? j.question : e.detail;
+  } catch {
+    return e.detail;
   }
 }

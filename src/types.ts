@@ -150,7 +150,20 @@ export interface GroupOutcome { groupId: string; ok: boolean; prUrl?: string; er
 // ── Clarification / Slack ──
 export interface ClarificationOption { id: string; label: string; recommended?: boolean; }
 export interface ClarificationRequest { question: string; options: ClarificationOption[]; recommendedDefault?: string; rationale: string; }
-export interface ClarificationAnswer { taskId: string; threadTs: string; optionId?: string; freeText?: string; }
+export interface ClarificationAnswer {
+  taskId: string;
+  threadTs: string;
+  optionId?: string;
+  freeText?: string;
+  /**
+   * 這個答覆適用到哪。`'always'` ＝ 以後這個 repo 的任務都適用（掛到 repo 上，不是這張卡）。
+   * 省略 ＝ 只適用這張卡。
+   *
+   * 存在的理由：實跑撞到同一個成因在 14 小時內害了兩個任務——第一次的答案
+   * 只存在於第一張卡的事件裡，第二張卡看不到，於是重問一次、重卡一次。
+   */
+  scope?: 'task' | 'always';
+}
 export type LifecycleEvent =
   | { type: 'claimed' }
   | { type: 'docs_read'; refs: string[] }

@@ -1,7 +1,7 @@
 import { computeBackoffDelay, realSleep, type BackoffOptions } from '../core/retry.js';
 import { changedSince, gitHeadRef } from './verifier.js';
 import { commitExists, currentBranch } from '../git/status.js';
-import { markHumanReplyConsumed, pendingHumanReply, settledDecisions, type HumanReply } from './human-reply.js';
+import { markHumanReplyConsumed, pendingHumanReply, settledDecisions, standingDecisions, type HumanReply } from './human-reply.js';
 import { cardStatusOf } from '../core/card-status.js';
 import { RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { Ledger } from '../store/ledger.js';
@@ -305,6 +305,17 @@ export class Worker {
 
     const maxRounds = this.deps.maxRounds ?? DEFAULT_MAX_ROUNDS;
 
+    // 這個 repo 上人已經拍板、而且說了「以後都這樣」的決定。
+    // 取一次就好：它不會在任務執行中改變，而每輪重查只是白花 DB。
+    // 讀失敗不擋任務——少了它最多是 agent 重問一次，擲錯會讓整張卡跑不動。
+    let standing: { question: string; answer: string }[] = [];
+    try {
+      standing = standingDecisions(ledger, task.repo);
+      if (standing.length > 0) log.info({ taskId: task.id, repo: task.repo, n: standing.length }, '帶上這個專案已拍板的決定');
+    } catch (e) {
+      log.warn({ taskId: task.id, err: e instanceof Error ? e.message : String(e) }, '讀常設決定失敗（略過）');
+    }
+
     while (true) {
       round += 1;
       this.syncCard(detail, {
@@ -335,7 +346,7 @@ export class Worker {
       // 同一群前面幾個任務的交付說明。從 DB 讀而不是靠 session 記得——
       // 群內共用 session 的 context 會被自動壓縮，壓縮壓不掉 DB。
       const priorDeliveries = input.groupId ? this.priorDeliveries(input.groupId, task.id) : [];
-      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.planHint ? { planHint: input.planHint } : {}), ...(priorDeliveries.length ? { priorDeliveries } : {}), ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
+      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.planHint ? { planHint: input.planHint } : {}), ...(priorDeliveries.length ? { priorDeliveries } : {}), ...(standing.length ? { standingDecisions: standing } : {}), ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
         // 只注入一次：不標消費的話，之後每一輪都會再貼一次同樣的答覆，

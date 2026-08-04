@@ -95,6 +95,7 @@ export function formatPending(items: PendingItem[]): string {
     lines.push('');
   });
   lines.push('用法：npm run ask -- <編號或 id> <動作或答案>');
+  lines.push('　　　答覆後面加 --always ＝ 這個專案以後都照這個答案，下次不會再問');
   lines.push('（daemon 在跑時清單會變動，用 id 指定較安全）');
   return lines.join('\n');
 }
@@ -110,6 +111,13 @@ export interface AskAction {
   /** 標準化後的動作；freeText 代表「這是澄清的答案」。 */
   verb: 'answer' | 'confirm' | 'reject' | 'approve' | 'deny' | 'retry' | 'abort' | 'pause' | 'land-anyway';
   answer?: string;
+  /**
+   * `--always`：這個答覆掛到 repo 上，不是掛到這張卡上。
+   *
+   * 實跑撞到：同一個成因（spec/ 寫不進去）在 14 小時內害了兩個任務，
+   * 而第一次的答案只存在於第一張卡的事件裡——第二張卡看不到，於是重問、重卡。
+   */
+  scope?: 'always';
 }
 
 /**
@@ -162,13 +170,17 @@ export function resolveAction(items: PendingItem[], target: string, rest: string
   if (item.kind !== 'clarification') {
     return `${item.id} 需要動作而非自由文字，可用：${item.actions.join(' / ')}`;
   }
-  return { item, verb: 'answer', answer: raw };
+  // `--always` 放在最後：這個答覆之後同一個 repo 的任務都適用，不必再問一次。
+  const always = rest.at(-1) === '--always';
+  const text = (always ? rest.slice(0, -1) : rest).join(' ').trim();
+  if (text === '') return `${item.id} 的答覆不可以是空的`;
+  return { item, verb: 'answer', answer: text, ...(always ? { scope: 'always' as const } : {}) };
 }
 
 /** 執行動作所需的協作者（測試可全部注入）。 */
 export interface ApplyDeps {
   router: {
-    handleAnswer(a: { taskId: string; threadTs: string; optionId?: string; freeText?: string }): void;
+    handleAnswer(a: { taskId: string; threadTs: string; optionId?: string; freeText?: string; scope?: 'task' | 'always' }): void;
     handleControl(c: ExtendedControlCommand): Promise<void> | void;
     handleMergeDecision(d: { groupId: string; approved: boolean; userId?: string }): void;
     /** 把 failed 的群組放回待派工。沒有它的話 stuck_group 的 retry 是空操作。 */
@@ -196,8 +208,15 @@ export async function applyAction(action: AskAction, deps: ApplyDeps): Promise<s
   switch (verb) {
     case 'answer':
       // threadTs 用本機標記：Slack 那側靠它反查 thread，CLI 沒有 thread，但稽核仍要留下來源
-      router.handleAnswer({ taskId: item.id, threadTs: `cli:${item.id}`, freeText: action.answer ?? '' });
-      return `✅ 已回覆 ${item.id}：${action.answer}（任務回到排隊，daemon 下一輪會重跑）`;
+      router.handleAnswer({
+        taskId: item.id,
+        threadTs: `cli:${item.id}`,
+        freeText: action.answer ?? '',
+        ...(action.scope ? { scope: action.scope } : {}),
+      });
+      return action.scope === 'always'
+        ? `✅ 已回覆 ${item.id}：${action.answer}\n📌 已設為**常設決定**——之後這個專案的任務都會看到它，不會再問一次`
+        : `✅ 已回覆 ${item.id}：${action.answer}（任務回到排隊，daemon 下一輪會重跑）`;
     case 'confirm': {
       await router.handleControl({ type: 'confirm_no_change', taskId: item.id, userId: CLI_USER });
       // 查證實際結果再回報：MCP 可能拒絕（任務不存在／已被別人動過），此時任務會留在 blocked

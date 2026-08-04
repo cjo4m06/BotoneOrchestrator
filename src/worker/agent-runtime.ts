@@ -55,6 +55,18 @@ export interface IterateInput {
    */
   priorDeliveries?: { taskId: string; text: string }[];
   /**
+   * 這個 repo 上「人已經拍板、而且說了以後都這樣」的決定。
+   *
+   * ── 為什麼是 repo 層級不是任務層級 ──
+   *
+   * 實跑（2026-08-04）：`spec/ 寫不進去` 在 02:43 害了一個任務、17:44 又原封不動
+   * 害了另一個——同一個 repo、同一個成因、相隔 14 小時。就算第一次有人回答了，
+   * 那個答案也只存在於第一張卡的事件裡，第二張卡看不到，於是重問一次、重卡一次。
+   *
+   * 先前這份資料**只餵給審查者**，寫程式的 agent 完全看不到——而會重問的正是它。
+   */
+  standingDecisions?: { question: string; answer: string }[];
+  /**
    * 本任務起點 sha（＝DoD diff 關卡與 reviewer 同一枚）。
    * Stop hook 用它判「這一輪到底做了沒」；未給 → 退回 porcelain，
    * 那只看得到未 commit 的東西，agent 自行 commit 後會被誤判成什麼都沒做。
@@ -1065,6 +1077,15 @@ export function buildAgentPrompt(input: IterateInput): string {
 
   if (input.answer) {
     p.push(`\n## 澄清答覆\n問題：${input.answer.question}\n答覆：${input.answer.answer}`);
+  }
+
+  if (input.standingDecisions?.length) {
+    p.push('\n## 這個專案已經拍板的決定（人回答過，以後都這樣）');
+    p.push(
+      '這些是人已經做過的決定，**直接照著做，不要再問一次**，也不要在總結裡當成待確認的假設。'
+      + '如果你認為某一條在這張卡上不適用，說出理由再偏離——不要默默改掉。',
+    );
+    for (const d of input.standingDecisions) p.push(`\n- **${d.question}**\n  → ${d.answer}`);
   }
 
   const feedbackText = formatGateFeedback(input.feedback);

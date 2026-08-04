@@ -674,7 +674,15 @@ document.addEventListener('click', async (ev) => {
   if (!el) return;
   const [action, id] = el.dataset.act.split(':');
   let text;
-  if (action === 'answer') { text = prompt('你的答覆：'); if (text === null) return; }
+  let scope;
+  if (action === 'answer') {
+    text = prompt('你的答覆：');
+    if (text === null) return;
+    // 同一個成因在實跑裡 14 小時內害了兩個任務——第一次的答案只掛在第一張卡上，
+    // 第二張卡看不到，於是重問一次、重卡一次。問這一句就能把它掛到專案上。
+    scope = confirm('這個答案以後也適用於這個專案的其他任務嗎？\n\n按「確定」＝ 以後都這樣，不會再問。\n按「取消」＝ 只套用這一張卡。')
+      ? 'always' : 'task';
+  }
   if (action === 'confirm_no_change' && !confirm(`確定把 ${id} 標記完成嗎？這會呼叫 complete_task，之後無法反悔。`)) return;
   if (action === 'land-anyway') {
     text = prompt('你要帶著一個已知的紅落地。請說明為什麼它不是這一群造成的（會記進 PR 內文與 ledger）：');
@@ -682,7 +690,7 @@ document.addEventListener('click', async (ev) => {
   }
   el.disabled = true;
   try {
-    const r = await api('/api/decide', { method: 'POST', body: JSON.stringify({ action, id, text }) });
+    const r = await api('/api/decide', { method: 'POST', body: JSON.stringify({ action, id, text, scope }) });
     if (r.ok) { toast('已送出', 'ok'); await loadState(); } else toast(r.error, 'bad');
   } catch (e) { toast(e.message, 'bad'); } finally { el.disabled = false; }
 });
