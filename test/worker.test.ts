@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import Database from 'better-sqlite3';
+import { collectPending } from '../src/core/pending.js';
 import assert from 'node:assert/strict';
 import { Worker, type WorkerDeps } from '../src/worker/worker.js';
 import { Verifier, gitHeadRef, type VerifierConfig } from '../src/worker/verifier.js';
@@ -571,6 +572,69 @@ describe('Worker — 單任務監督迴圈', () => {
     assert.ok(ev, '「agent 這一輪收到了什麼」必須是查得到的事實');
     assert.match(ev?.detail ?? '', /\[test\]（timeout）/, '記的要是 prompt 實際會輸出的那段，不是另外拼的摘要');
     assert.match(ev?.detail ?? '', /輸出第 119 行/);
+  });
+
+  /**
+   * **同一個障礙第二次擋住它 → 停下來交人。**
+   *
+   * 實跑（zZb5MGTMdQRZ）：agent 在第 1 次退回之後 13 分鐘就講出了確切的阻礙
+   *（「spec 寫不進去」），卻又跑了三輪、多花 27 美元，最後那個 PR 帶著一條
+   * 沒滿足的 DoD 被人按核准合併——而「這是刻意的特例」沒有留在任何地方。
+   */
+  it('同一類 friction 回報第二次 → park 交人，不再燒下一輪', async () => {
+    const task = makeTask();
+    seed(task);
+    const agent = fakeAgent([{}, {}, {}]);
+    const { worker } = build({ agent, verifier: fakeVerifier([red(), red(), green()]) });
+
+    // 模擬 agent 前兩輪各回報一次同類障礙（實跑就是這個形狀）
+    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
+      JSON.stringify({ kind: 'system_limitation', what: 'spec/ 不在 repo，docs MCP 唯讀' }));
+    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
+      JSON.stringify({ kind: 'system_limitation', what: '審查要我改 spec，但我寫不進去' }));
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.equal(out.status, 'blocked');
+    assert.ok(out.status === 'blocked' && out.reason === 'needs_human', 'park 不是 failed——成果與 worktree 都要留著');
+    // **一定要是 needs_human**：`deps` 代表「自動等上游」，不會開交接單——
+    // 那會變成「任務停了、但沒有人被告知」，正是這整套要修掉的病。
+    assert.equal(
+      collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length,
+      1,
+      '停下來就一定要有人被告知，否則它會靜靜地卡在那裡',
+    );
+    assert.equal(agent.inputs.length, 0, '偵測在迴圈開頭，不該再燒任何一輪 agent');
+    const block = tmp.ledger.getTask('T-1')?.block;
+    assert.match(block?.detail ?? '', /spec\/ 不在 repo/, '兩次的原話都要帶給人');
+    assert.match(block?.detail ?? '', /我寫不進去/);
+  });
+
+  it('同一份規格被退回兩次 → park，並點出「這幾條可能無法同時成立」', async () => {
+    const task = makeTask();
+    seed(task);
+    const { worker } = build({ verifier: fakeVerifier([green()]) });
+
+    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 1 次退回：\n1. [spec/buttons.md#觸控目標] 熱區不足 44×44');
+    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 2 次退回：\n1. [spec/buttons.md#觸控目標] 相鄰熱區重疊');
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.ok(out.status === 'blocked' && out.reason === 'needs_human');
+    assert.equal(collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length, 1, '要出現在「等你處理」上');
+    assert.match(tmp.ledger.getTask('T-1')?.block?.detail ?? '', /無法同時成立/);
+  });
+
+  it('只回報一次、只退回一次 → 照常續做（不可以動不動就停整個群組）', async () => {
+    const task = makeTask();
+    seed(task);
+    const { worker } = build({ verifier: fakeVerifier([green()]) });
+
+    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
+      JSON.stringify({ kind: 'system_limitation', what: 'PMM 沒授權（不擋交付）' }));
+    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 1 次退回：[spec/a.md#x] 不符');
+
+    assert.deepEqual(await worker.runTask({ task, ...cfg }), { status: 'done' });
   });
 
   it('回饋只在真的有失敗關卡時才傳給 agent（空失敗清單不回灌）', async () => {

@@ -8,6 +8,7 @@ import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { AgentLike, McpTaskClient, Notifier, ReviewerLike, TaskCardProgress, VerifierLike } from '../contracts.js';
 import { formatGateFeedback } from './agent-runtime.js';
+import { detectStuck, type RepeatedObstacle } from './stuck-detect.js';
 import type { AgentErrorKind, ClarificationCapture, IterateResult, LoadedDoc, NoChangeCapture, NoChangeCategory, SdkErrorCode } from './agent-runtime.js';
 import type { ReviewOutcome } from './reviewer.js';
 import type { VerifierConfig } from './verifier.js';
@@ -315,6 +316,19 @@ export class Worker {
       // 而是不允許「無聲的無限迴圈」持續燒 token 又永久佔住 worker slot（見 DEFAULT_MAX_ROUNDS）。
       // agent 執行錯誤的那幾輪也計入：連續 20 輪 API 出錯同樣是「卡在系統問題」，人該知道。
       if (maxRounds > 0 && round > maxRounds) return this.parkRoundLimit(detail, maxRounds, feedback, threadTs);
+
+      // 兜底出口之二：**同一個障礙第二次擋住它**（見 stuck-detect.ts）。
+      //
+      // 輪數上限（20）擋的是「無聲的無限迴圈」，但撞到它以前已經燒掉二十輪。
+      // 真正該停的時機早得多——實跑的 zZb5MGTMdQRZ 在第 1 次退回之後 13 分鐘就已經
+      // 講出了確切的阻礙（「spec 寫不進去」），卻又跑了三輪、多花 27 美元，
+      // 而最後那個 PR 帶著一條沒滿足的 DoD 被人按核准合併。
+      //
+      // 這裡數的是**呼叫端看得到的事實**（同一個 friction kind 第二次／同一份規格
+      // 被退回第二次），不讀內容、不判斷語意。
+      const stuck = detectStuck(ledger.listEvents({ scope: 'task', refId: task.id, limit: 200 }));
+      if (stuck) return this.parkStuck(detail, stuck, threadTs);
+
       this.say(threadTs, { type: 'iterating', round }, detail);
 
       input.onPhase?.(`第 ${round} 輪：agent 寫程式中`);
@@ -479,6 +493,35 @@ export class Worker {
    * needs_human 走的是 GroupRunner 的可恢復路徑（群組 park、worktree 保留），
    * 人排除障礙後由 requeue 階段轉回 ready 續做。
    */
+  /**
+   * 同一個障礙擋了第二次 → park 交人。
+   *
+   * **這是 park 不是 failed**：worktree、已 commit 的成果、session 全部保留，
+   * 人排除障礙之後 requeue 就續做。
+   *
+   * 誤判的代價刻意設成不對稱的：誤停一次 ＝ 人按一下重試；漏掉一次 ＝ 實跑那 36 美元，
+   * 外加一條沒滿足的 DoD 被人按核准合併、而「這是刻意的特例」沒有留在任何地方。
+   * 所以偏向多停。
+   */
+  private parkStuck(detail: TaskDetail, stuck: RepeatedObstacle, threadTs: string | undefined): TaskOutcome {
+    const { ledger, log } = this.deps;
+    const why =
+      `同一個障礙第 ${stuck.count} 次擋住這個任務，agent 沒有主動求救 → 停下來交人。\n\n` +
+      `${stuck.body}\n\n` +
+      '**如果這幾條要求真的無法同時成立，需要你決定誰讓步**——' +
+      'agent 每次滿足其中一邊都會被另一邊退回，再跑幾輪也一樣。\n' +
+      '排除障礙（或給出裁決）之後按重試，它會接著原本的 session 續做，成果都還在。';
+
+    ledger.setBlock(detail.id, 'needs_human', truncate(why, 1200));
+    ledger.logEvent('task', detail.id, 'stuck_parked', `${stuck.kind} ×${stuck.count}`);
+    this.say(threadTs, { type: 'problem', detail: why }, detail);
+    log.error(
+      { taskId: detail.id, kind: stuck.kind, count: stuck.count },
+      '⚠️ 同一個障礙重複出現，park 交人（可恢復）',
+    );
+    return { status: 'blocked', reason: 'needs_human', detail: why };
+  }
+
   private parkRoundLimit(
     detail: TaskDetail,
     maxRounds: number,
