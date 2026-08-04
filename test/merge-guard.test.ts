@@ -89,7 +89,12 @@ function configure(repo: string): void {
   git(repo, 'config', 'commit.gpgsign', 'false');
 }
 
-/** 記錄所有 git 呼叫的假 runner；預設每個指令都成功。 */
+/**
+ * 記錄所有 git 呼叫的假 runner；預設每個指令都成功。
+ *
+ * `rev-parse` 回一個像樣的 40 位 sha：驗收樹會拿它當「這次驗的是哪一顆 base」，
+ * 而那個欄位有格式檢查（存 ref 名字進去等於放一個會飄的東西）。
+ */
 function spyGit(overrides: (args: string[]) => GitExecResult | undefined = () => undefined): {
   runner: GitRunner;
   calls: string[][];
@@ -99,7 +104,10 @@ function spyGit(overrides: (args: string[]) => GitExecResult | undefined = () =>
     calls,
     async runner(_repoPath, args) {
       calls.push(args);
-      return overrides(args) ?? { exitCode: 0, stdout: '', stderr: '' };
+      const forced = overrides(args);
+      if (forced) return forced;
+      if (args[0] === 'rev-parse') return { exitCode: 0, stdout: 'a'.repeat(40), stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
     },
   };
 }
@@ -246,6 +254,7 @@ describe('MergeGuard — 合併守衛', () => {
     const verifier = fakeVerifier(true);
     const guard = new MergeGuard(verifier, createSilentLogger());
 
+    const branchTip = repo.git('rev-parse', 'feat/a');
     const verdict = await guard.attempt({
       repoPath: repo.path,
       branch: 'feat/a',
@@ -254,10 +263,11 @@ describe('MergeGuard — 合併守衛', () => {
     });
 
     assert.equal(verdict.ok, true);
-    // 驗證是在「合併後狀態」跑的：分支已被 rebase 到 main 之上
-    assert.deepEqual(verifier.calls, [{ cwd: repo.path }]);
-    assert.deepEqual(repo.git('log', '--format=%s').split('\n'), ['add feature', 'main moves on', 'base']);
-    assert.equal(repo.branch(), 'feat/a');
+    // 驗證跑在**拋棄式驗收樹**上，不是主 clone——群分支一位元都不該被動到
+    assert.equal(verifier.calls.length, 1);
+    assert.notEqual(verifier.calls[0]?.cwd, repo.path, '驗的是合併後狀態的那棵樹');
+    assert.equal(branchTip, repo.git('rev-parse', 'feat/a'), '群分支的 sha 不變 → 永遠不需要 force push');
+    assert.equal(repo.branch(), 'main', '主 clone 的 HEAD 也不該被切走');
   });
 
   it('語意飄移：無文字衝突，但 rebase 後測試紅 → semantic_drift', async () => {
@@ -292,8 +302,8 @@ describe('MergeGuard — 合併守衛', () => {
     assert.equal(verdict.ok, false);
     assert.equal(verdict.ok === false ? verdict.reason : '', 'semantic_drift');
     assert.match(verdict.ok === false ? verdict.detail : '', /\[test\]/);
-    // rebase 本身是成功的（沒有文字衝突）
-    assert.equal(repo.branch(), 'feat/b');
+    // 併是成功的（沒有文字衝突），而且主 clone 完全沒被動過
+    assert.equal(repo.branch(), 'main');
     assert.equal(existsSync(join(repo.path, '.git', 'rebase-merge')), false);
   });
 
@@ -327,10 +337,12 @@ describe('MergeGuard — 合併守衛', () => {
     assert.equal(verdict.ok === false ? verdict.reason : '', 'code_conflict');
     assert.match(verdict.ok === false ? verdict.detail : '', /conflict/i);
     assert.equal(verifier.calls.length, 0, '有衝突時不該再跑驗證');
-    assert.equal(existsSync(join(repo.path, '.git', 'rebase-merge')), false, 'rebase 必須被 abort');
-    assert.equal(repo.branch(), 'feat/d');
-    assert.match(repo.git('show', 'HEAD:lib.js'), /return 2/, '分支內容應回到 abort 前的樣子');
-    assert.ok(rec.messages('warn').includes('Merge Guard：rebase 有 CODE 衝突'));
+    // 現在併在拋棄式樹上，主 clone 從頭到尾沒被碰過——沒有「半途狀態」可言
+    assert.equal(repo.branch(), 'main', '主 clone 的 HEAD 不該被切走');
+    assert.match(repo.git('show', 'feat/d:lib.js'), /return 2/, '群分支的內容不變');
+    // 衝突檔案來自機器格式（git diff --diff-filter=U），不是解析人類可讀訊息
+    assert.deepEqual(verdict.ok === false ? verdict.conflicts : [], ['lib.js']);
+    assert.ok(rec.messages('warn').includes('Merge Guard：併上最新 base 有衝突'));
   });
 
   it('分支已包含最新 base → rebase 為 no-op，仍照跑驗證', async () => {
@@ -363,7 +375,7 @@ describe('MergeGuard — 合併守衛', () => {
     assert.equal(verifier.calls.length, 0, 'checkout 失敗後不該再驗證');
     assert.equal(repo.branch(), 'main', 'HEAD 不可被改動');
     assert.equal(repo.head(), before);
-    assert.ok(rec.messages('error').includes('Merge Guard：無法切到目標分支，前置條件不成立'));
+    assert.ok(rec.messages('error').includes('Merge Guard：驗收樹建不起來，前置條件不成立'));
   });
 
   describe('base 新鮮度（fetch）— 需求 7 的前提', () => {
@@ -398,7 +410,13 @@ describe('MergeGuard — 合併守衛', () => {
       assert.deepEqual(freshness, [{ ref: 'origin/main', fetched: true }]);
       assert.equal(verdict.ok, false, '沒 fetch 的話這裡會是假綠燈');
       assert.equal(verdict.ok === false ? verdict.reason : '', 'semantic_drift');
-      assert.ok(!git(remote.work, 'show', 'HEAD:lib.js').includes('bar'), 'rebase 基準必須是 remote 的最新 base');
+      // 主 clone 的 HEAD 本來就不會被動（併在拋棄式樹上），所以要驗的是
+      // **fetch 之後的 origin/main**——那才是這一次併的基準。
+      assert.ok(
+        !git(remote.work, 'show', 'origin/main:lib.js').includes('bar'),
+        '併的基準必須是 remote 的最新 base（fetch 過的那份）',
+      );
+      assert.equal(git(remote.work, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main', '主 clone 的 HEAD 不該被切走');
     });
 
     it('有 remote 且 fetch 成功、無飄移 → ok，且以 origin/base 為基準、無但書', async (t) => {
@@ -425,7 +443,14 @@ describe('MergeGuard — 合併守衛', () => {
 
       assert.equal(verdict.ok, true);
       assert.deepEqual(freshness, [{ ref: 'origin/main', fetched: true }]);
-      assert.equal(git(remote.work, 'log', '--format=%s', '-1', 'HEAD~1'), 'upstream 前進', '分支已站在 remote 最新 base 上');
+      // 群分支不再被 rebase，所以不能看主 clone 的歷史。要驗的是：
+      // **remote 最新 base 確實是這次併的基準**——`origin/main` 是它已經進來的祖先。
+      assert.equal(git(remote.work, 'log', '--format=%s', '-1', 'origin/main'), 'upstream 前進');
+      assert.equal(
+        git(remote.work, 'rev-parse', 'feat/ok'),
+        git(remote.work, 'rev-parse', 'feat/ok@{0}'),
+        '群分支一位元都沒被改寫',
+      );
       assert.ok(!rec.messages('warn').includes('Merge Guard：base 新鮮度有但書'));
     });
 

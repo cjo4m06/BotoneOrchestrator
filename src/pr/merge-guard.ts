@@ -1,4 +1,5 @@
 import { execa } from 'execa';
+import { createMergeTree } from './merge-verify.js';
 import { resolveBaseFreshness, type BaseFreshness } from '../git/base-freshness.js';
 import type { VerifierLike } from '../contracts.js';
 import type { VerifierConfig } from '../worker/verifier.js';
@@ -7,6 +8,8 @@ import { driftFeedback, type DriftVerdict } from './drift-judge.js';
 import type { Logger } from '../observability/logger.js';
 
 export interface MergeGuardInput {
+  /** 所屬 repo——判斷者要靠它去任務板查規格（程式不預抓）。 */
+  repo?: string;
   repoPath: string; // 本地 clone（工作區）
   branch: string; // 群組分支
   base: string; // 目標分支（如 main）
@@ -31,6 +34,11 @@ export interface GitExecResult {
 export type GitRunner = (repoPath: string, args: string[], opts?: { timeoutMs?: number }) => Promise<GitExecResult>;
 
 export interface MergeGuardOptions {
+  /**
+   * 驗收樹建好之後的準備工作（node_modules、本機設定檔）。
+   * **一定要接**：沒有依賴就跑關卡，紅的是環境不是程式碼，而 agent 會去修一個沒壞的東西。
+   */
+  prepareTree?: (treePath: string) => Promise<void>;
   /** 取最新 base 的 remote 名稱。預設 'origin' */
   remote?: string;
   /** 是否在 attempt() 前 fetch 最新 base。預設 true；設 false 等於明示「接受基於本地狀態的驗證」 */
@@ -90,69 +98,95 @@ export class MergeGuard {
     return { exitCode: r.exitCode ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
   }
 
+  /**
+   * 驗「這一群併上最新 base 之後好不好」。
+   *
+   * ── 這裡不再 rebase 群分支 ──
+   *
+   * 先前是 `checkout 群分支 → rebase 最新 base → 驗 → force-push`。
+   * 現在改成在**一棵拋棄式的樹**上 detach 到群分支的 sha、把 base 併進來、跑關卡、
+   * 跑完連樹一起刪掉（見 pr/merge-verify.ts）。
+   *
+   * 換來兩件事：
+   * 1. **群分支一位元都不會被改寫** → 永遠不需要 force push，整整一類不可逆動作消失。
+   * 2. 「使用者在 GitHub 上看到的那份」與「我們驗過的那份」始終是同一個東西。
+   *
+   * 代價：PR 會一直顯示 "out of date"（我們驗的是合併後狀態，不是 head）。那是正常的。
+   */
   async attempt(input: MergeGuardInput): Promise<MergeVerdict> {
     const { repoPath, branch, base } = input;
 
-    // 0) 前置：確實切到目標分支。checkout 失敗（分支不存在等）若不檢查，後續會在
-    //    「當前分支」上 rebase+驗證並回綠燈——等於替一個從未檢出的分支背書，是嚴重誤判。
-    const co = await this.git(repoPath, ['checkout', branch]);
-    if (co.exitCode !== 0) {
-      this.log.error({ branch }, 'Merge Guard：無法切到目標分支，前置條件不成立');
-      return { ok: false, reason: 'precondition_failed', detail: tail(`${co.stdout}\n${co.stderr}`) };
-    }
-
-    // 1) 取最新 base。不 fetch 的話，rebase 的是「本地那份可能停在舊 commit 的 base」，
-    //    驗證的是一個不存在的世界；而真正會發生語意飄移的情況恰恰就是 remote 有新變更。
+    // 1) 取最新 base。不 fetch 的話驗的是「本地那份可能停在舊 commit 的 base」，
+    //    也就是一個不存在的世界——而真正會出事的情況恰恰就是 remote 有新變更。
     const freshness = await this.resolveBase(repoPath, base);
     this.opts.onBaseFreshness?.(freshness);
     if (freshness.caveat) {
       this.log.warn({ branch, base, ref: freshness.ref, caveat: freshness.caveat }, 'Merge Guard：base 新鮮度有但書');
     }
 
-    // 分岔點必須在 rebase **之前**取：rebase 會把分支接到 base 頂端，
-    // 之後就再也算不出「base 在本群動工之後多了什麼」——而那正是判斷意圖有沒有打架的材料。
-    const mergeBase = (await this.git(repoPath, ['merge-base', 'HEAD', freshness.ref])).stdout.trim();
+    // 分岔點要在併之前取：併完就再也算不出「base 在本群動工之後多了什麼」，
+    // 而那正是判斷意圖有沒有打架的材料。
+    const mergeBase = (
+      await this.git(repoPath, ['merge-base', branch, freshness.ref])
+    ).stdout.trim();
 
-    // 2) rebase 最新 base → 有文字衝突即 code_conflict
-    const rb = await this.git(repoPath, ['rebase', freshness.ref]);
-    if (rb.exitCode !== 0) {
-      await this.git(repoPath, ['rebase', '--abort']);
-      this.log.warn({ branch, base: freshness.ref }, 'Merge Guard：rebase 有 CODE 衝突');
-      return { ok: false, reason: 'code_conflict', detail: withCaveat(freshness, tail(`${rb.stdout}\n${rb.stderr}`)) };
-    }
-
-    // 3) 在「合併後狀態」重跑 DoD → 紅燈即語意飄移（無衝突但功能壞）
-    // **任務資訊要帶下去。** 少了它，這一關的介面判斷者拿不到 baseRef，
-    // 就沒有唯讀 git 可用，也就分不出「這次弄的」與「本來就有的」——
-    // 實跑撞到：同一輪裡任務關卡那次有查 git、Merge Guard 這次沒有，
-    // 而擋下 PR 的正是後者，把別人先前 commit 的瑕疵算到這次頭上。
-    const gate = await this.verifier.check({
-      cwd: repoPath,
-      config: input.verifierConfig,
-      ...(input.task ? { task: input.task } : {}),
+    // 2) 建拋棄式驗收樹（群分支 ＋ 最新 base）。併不起來就是 code_conflict。
+    const built = await createMergeTree({
+      repoPath,
+      branch,
+      baseRef: freshness.ref,
+      log: this.log,
+      // **一定要把注入的 git 傳下去。** 不傳的話守衛會用到兩條不同的 git 路徑：
+      // 一條可被測試/呼叫端替換，一條寫死用 execa——那種不一致查起來特別花時間。
+      git: (cwd, args) => this.git(cwd, args),
+      ...(this.opts.prepareTree ? { prepare: this.opts.prepareTree } : {}),
     });
-    if (!gate.green) {
-      this.log.warn({ branch, base: freshness.ref }, 'Merge Guard：rebase 後建置/測試紅 → 語意飄移');
-      return { ok: false, reason: 'semantic_drift', detail: withCaveat(freshness, failSummary(gate)) };
+    if (!built.ok) {
+      if (built.reason === 'conflict') {
+        this.log.warn({ branch, base: freshness.ref, conflicts: built.conflicts }, 'Merge Guard：併上最新 base 有衝突');
+        return {
+          ok: false,
+          reason: 'code_conflict',
+          detail: withCaveat(freshness, built.output),
+          conflicts: built.conflicts,
+        };
+      }
+      this.log.error({ branch, base: freshness.ref }, 'Merge Guard：驗收樹建不起來，前置條件不成立');
+      return { ok: false, reason: 'precondition_failed', detail: withCaveat(freshness, built.output) };
     }
 
-    // 4) 事實層都綠了 → 判斷層：兩邊的意圖有沒有打架。
-    //    這一層抓的是「能編譯、測試也綠，但合起來的產品行為自相矛盾」——量不出來，
-    //    只有讀得懂意圖的才判斷得出。判不出來就放行（見 drift-judge.ts 的說明）。
-    const drift = await this.judgeDrift(input, freshness.ref, mergeBase);
-    if (drift) return drift;
+    const { tree } = built;
+    try {
+      // 3) 在「合併後狀態」重跑關卡。
+      // **任務資訊要帶下去**：少了它，介面判斷者拿不到 baseRef，就分不出
+      // 「這次弄的」與「本來就有的」（實跑撞到：把別人先前 commit 的瑕疵算到這次頭上）。
+      const gate = await this.verifier.check({
+        cwd: tree.path,
+        config: input.verifierConfig,
+        ...(input.task ? { task: input.task } : {}),
+      });
+      if (!gate.green) {
+        this.log.warn({ branch, base: freshness.ref }, 'Merge Guard：併上最新 base 後建置/測試紅');
+        return { ok: false, reason: 'semantic_drift', detail: withCaveat(freshness, failSummary(gate)) };
+      }
 
-    // 記下「驗的是哪一個 base」。合併之前呼叫端會再讀一次比對——
-    // 不一樣代表 base 在這之後被動過，上面那句「可安全合併」對現在的 base 就不成立了。
-    const baseSha = (await this.git(repoPath, ['rev-parse', freshness.ref])).stdout.trim();
+      // 4) 事實層都綠了 → 判斷層：兩邊的意圖有沒有打架。
+      //    抓的是「能編譯、測試也綠，但合起來的產品行為自相矛盾」——量不出來，
+      //    只有讀得懂意圖的才判斷得出。判不出來就放行（見 drift-judge.ts）。
+      const drift = await this.judgeDrift(input, freshness.ref, mergeBase, tree.path);
+      if (drift) return drift;
 
-    this.log.info(
-      { branch, base: freshness.ref, fetched: freshness.fetched, baseSha: baseSha.slice(0, 8) },
-      freshness.caveat
-        ? 'Merge Guard：rebase + 重測通過（但書：未能確認 base 為最新）'
-        : 'Merge Guard：rebase + 重測通過，可安全合併',
-    );
-    return baseSha ? { ok: true, baseSha } : { ok: true };
+      this.log.info(
+        { branch, base: freshness.ref, fetched: freshness.fetched, baseSha: tree.verifiedBaseSha.slice(0, 8) },
+        freshness.caveat
+          ? 'Merge Guard：併上最新 base 重測通過（但書：未能確認 base 為最新）'
+          : 'Merge Guard：併上最新 base 重測通過，可安全合併',
+      );
+      return { ok: true, baseSha: tree.verifiedBaseSha };
+    } finally {
+      // 拋棄式的東西一定要收掉——留著會累積在磁碟上，而且下一輪撞名就是一整群報銷
+      await tree.dispose();
+    }
   }
 
   /**
@@ -165,17 +199,24 @@ export class MergeGuard {
     input: MergeGuardInput,
     baseRef: string,
     mergeBase: string,
+    /** 判斷者要看的工作區＝**驗收樹**（合併後狀態），不是主 clone。 */
+    treePath: string,
   ): Promise<MergeVerdict | undefined> {
     const judge = this.opts.driftJudge;
     if (!judge || !mergeBase) return undefined;
     try {
+      // 兩份 diff 都用**明確的 ref 範圍**算，不依賴任何工作區的 HEAD——
+      // 先前用 `${baseRef}..HEAD` 是因為那時分支被 rebase 到主 clone 的 HEAD 上；
+      // 現在群分支不動，HEAD 在哪由呼叫者決定，寫死 HEAD 會算到別的東西。
       const baseChanges = (await this.git(input.repoPath, ['diff', '--no-color', `${mergeBase}..${baseRef}`])).stdout;
-      const groupChanges = (await this.git(input.repoPath, ['diff', '--no-color', `${baseRef}..HEAD`])).stdout;
+      const groupChanges = (await this.git(input.repoPath, ['diff', '--no-color', `${mergeBase}..${input.branch}`])).stdout;
       const verdict = await judge.judge({
-        cwd: input.repoPath,
+        // 判斷者要站在**合併後狀態**上看：那才是它要判斷「意圖有沒有打架」的世界
+        cwd: treePath,
         baseChanges,
         groupChanges,
         taskTitles: input.taskTitles ?? [],
+        ...(input.repo ? { repo: input.repo } : {}),
       });
       if (verdict.status !== 'conflict') return undefined;
       this.log.warn(

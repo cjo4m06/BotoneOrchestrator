@@ -974,9 +974,16 @@ export class GroupRunner {
       const mergeCtx: CheckContext = {
         repo: group.repo, branch: group.branch, workspaceKind: 'merge_tree', requestedBy: 'merger',
       };
+      // 驗收樹要有 node_modules 與本機設定檔才跑得動關卡。
+      // 沒有的話紅的是**環境**不是程式碼——而 agent 會被派去修一個根本沒壞的東西。
+      guardOptions.prepareTree = async (treePath: string) => {
+        await prepareNodeModules(proj.repoPath, treePath, log, this.deps.nodeModulesEnv);
+        await prepareLocalFiles(proj.repoPath, treePath, log, proj.localFiles);
+      };
       const guard = this.deps.makeMergeGuard?.(this.deps.makeVerifier(mergeCtx), guardOptions)
         ?? new MergeGuard(this.deps.makeVerifier(mergeCtx), log, guardOptions);
       const verdict = await guard.attempt({
+        repo: group.repo,
         repoPath: wtPath,
         branch: group.branch,
         base: proj.baseBranch,

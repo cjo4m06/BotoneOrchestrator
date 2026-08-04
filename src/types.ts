@@ -198,4 +198,10 @@ export type MergeVerdict =
       // 必須與其他 reason 區分——它代表「這次根本沒驗到」，不可當成驗證通過。
       reason: 'precondition_failed' | 'code_conflict' | 'semantic_drift' | 'tests_red' | 'post_merge_red';
       detail: string;
+      /**
+       * 衝突檔案清單。**來自 `git diff --name-only --diff-filter=U`（機器格式）**，
+       * 不是從 git 印給人看的訊息用正則撈的——那樣 12 個檔衝突時會掉 5 個，
+       * 而下游還是用肯定句對 agent 說「衝突檔案：…」。
+       */
+      conflicts?: string[];
     };

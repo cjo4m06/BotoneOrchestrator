@@ -259,36 +259,21 @@ export class PrManager {
 
     const openPr = await this.findOpenPr(repo, branch, repoPath);
     if (openPr) {
-      // 這是**更新自己的 PR**，不是覆寫別人的東西。
+      // **群分支不再被改寫，所以這裡不該再出現 non-fast-forward。**
       //
-      // 為什麼一定會走到這裡：群組開了 PR 之後，只要 base 有變動，重做時 Merge Guard
-      // 會 rebase（改寫歷史），接著 push 必然是 non-fast-forward。這是每個開發者
-      // rebase 後更新自己 PR 的日常，不是異常。先前一律拒絕，等於任何「開了 PR 又要重做」
-      // 的群組都死在這裡（實跑撞到，群組直接 failed）。
+      // 先前 Merge Guard 會 rebase 群分支（改寫歷史），於是每次「開了 PR 又要重做」
+      // 都必然要 force push；那條路用 `--force-with-lease` 守著，但它終究是
+      // 一個不可逆動作，而且 lease 過期時的失敗形狀很難懂。
       //
-      // 安全性靠 `--force-with-lease`：只有在遠端還停在**我上次 fetch 到的那顆 commit**
-      // 時才覆寫；中間只要有人推了東西就中止。這跟裸 `--force` 是兩回事——
-      // 裸 force 會無條件蓋掉，那個我們永遠不用。
-      await withFetchLock(repoPath, () => this.git(repoPath, ['fetch', 'origin', branch]));
-      const lease = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${branch}`])).stdout.trim();
-      if (!lease) {
-        throw new Error(`分支 ${branch} 與遠端分歧，但取不到遠端狀態，無法安全更新 PR #${openPr.number}：${openPr.url}`);
-      }
-      this.log.warn({ repo, branch, pr: openPr.number, lease: lease.slice(0, 8) }, 'rebase 後更新既有 PR（force-with-lease）');
-      const forced = await this.git(repoPath, [
-        'push',
-        `--force-with-lease=${branch}:${lease}`,
-        '-u',
-        'origin',
-        branch,
-      ]);
-      if (forced.exitCode !== 0) {
-        throw new Error(
-          `更新 PR #${openPr.number} 的分支失敗（遠端在我們讀取之後又變了，已中止而非強制覆寫）：` +
-            `${tail(`${forced.stderr}${forced.stdout}`)}`,
-        );
-      }
-      return;
+      // 現在合併驗證跑在拋棄式樹上（見 pr/merge-verify.ts），群分支一位元都不會被動——
+      // 分支只會往前長。所以走到這裡代表**遠端有我們不知道的東西**，
+      // 那不是「更新自己的 PR」，是真的分歧了。停下來讓人看，不要猜。
+      throw new Error(
+        `分支 ${branch} 與遠端分歧，但它有開著的 PR #${openPr.number}（${openPr.url}）。\n` +
+          '群分支不會被本系統改寫，所以這代表遠端被別的東西動過了。\n' +
+          '已停下來而不是強制覆寫——請看一下那個 PR 再決定。\n' +
+          `git push 的輸出：${tail(out)}`,
+      );
     }
 
     // 「安不安全刪掉」有兩種證明，任一成立即可：

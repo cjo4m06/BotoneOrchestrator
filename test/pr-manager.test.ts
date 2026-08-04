@@ -233,33 +233,22 @@ describe('PrManager — openPr 冪等', () => {
      *
      * 安全性靠 --force-with-lease：只有遠端還停在我們讀到的那顆 commit 時才覆寫。
      */
-    it('分支上有開著的 PR → 用 force-with-lease 更新它（不刪分支、也不裸 force）', async () => {
+    // 群分支不再被本系統改寫（合併驗證跑在拋棄式樹上，見 pr/merge-verify.ts），
+    // 所以分支只會往前長，不會出現 non-fast-forward。走到那裡代表遠端被別的東西動過了
+    // ——那不是「更新自己的 PR」，是真的分歧。整條 force push 的路徑因此消失。
+    it('分支有開著的 PR 又與遠端分歧 → 停下來讓人看，絕不 force push', async () => {
       const r = runnerFor(true, '[{"number":7,"url":"https://github.com/acme/web/pull/7"}]');
-      const pr = await new PrManager(createSilentLogger(), r.run).openPr(OPEN_PR_INPUT);
 
-      assert.equal(pr.number, 7, '沿用既有 PR');
-      assert.equal(r.calls.some(isDelete), false, '絕不刪掉還開著 PR 的分支');
-      const forced = r.calls.find((c) => c.args.some((a) => a.startsWith('--force-with-lease')));
-      assert.ok(forced, '應該用 force-with-lease 更新');
-      assert.match(forced!.args.join(' '), /--force-with-lease=feat\/g1:a{40}/);
-      assert.equal(r.calls.some((c) => c.args.includes('--force') || c.args.includes('-f')), false, '不可裸 force');
-    });
-
-    it('force-with-lease 被拒（遠端在我們讀取後又變了）→ 中止而非強制覆寫', async () => {
-      let pushes = 0;
-      const r = makeRunner((c) => {
-        if (prListState(c) === 'merged') return { stdout: '[]' };
-        if (isPrList(c)) return { stdout: '[{"number":7,"url":"https://x/pull/7"}]' };
-        if (isPush(c)) {
-          pushes += 1;
-          return { exitCode: 1, stderr: pushes === 1 ? REJECT_STDERR : 'stale info' };
-        }
-        if (c.args[2] === 'rev-parse') return { stdout: 'a'.repeat(40) };
-        return {};
-      });
       await assert.rejects(
         () => new PrManager(createSilentLogger(), r.run).openPr(OPEN_PR_INPUT),
-        /已中止而非強制覆寫/,
+        /群分支不會被本系統改寫/,
+      );
+
+      assert.equal(r.calls.some(isDelete), false, '絕不刪掉還開著 PR 的分支');
+      assert.equal(
+        r.calls.some((c) => c.args.some((a) => a.startsWith('--force'))),
+        false,
+        'force push 這條路已經不存在了',
       );
     });
 
