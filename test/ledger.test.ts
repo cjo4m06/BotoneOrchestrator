@@ -776,3 +776,48 @@ test('工具計數：找不到任務要留 warn，不要靜默吞掉', (t) => {
   ledger.addTaskToolCalls('不存在', { Read: 1 });
   assert.ok(rec.messages('warn').some((w) => /工具計數/.test(w)));
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 群內同階段共用 session（使用者裁決）
+//
+// 一群 = 一批相關的任務。先前 session 按 task_id 查，所以群裡第二個任務是全新
+// context——它不知道第一個任務為什麼那樣寫、試過什麼、放棄了什麼（diff 裡看不到）。
+// 「一起做」的意義只剩下「檔案在同一個資料夾」。
+// ─────────────────────────────────────────────────────────────────────
+
+test('群內共用：同群同角色回同一條 session', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', groupId: 'g1', sessionId: 's-coder', costUsd: 1 });
+
+  assert.equal(ledger.latestGroupSession('g1', 'worker')?.sessionId, 's-coder');
+});
+
+test('群內共用：寫程式與審查是兩條線，絕不互相繼承', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', groupId: 'g1', sessionId: 's-coder', costUsd: 1 });
+  ledger.recordAgentSession({ kind: 'reviewer', taskId: 'T-1', groupId: 'g1', sessionId: 's-review', costUsd: 1 });
+
+  assert.equal(ledger.latestGroupSession('g1', 'worker')?.sessionId, 's-coder');
+  assert.equal(
+    ledger.latestGroupSession('g1', 'reviewer')?.sessionId,
+    's-review',
+    '審查者繼承了寫程式的人的想法就審不出東西',
+  );
+});
+
+test('群內共用：別群的 session 不會被撈到', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', groupId: 'g1', sessionId: 's1', costUsd: 1 });
+  assert.equal(ledger.latestGroupSession('g2', 'worker'), undefined);
+});
+
+test('群內共用：壞掉的 session 不要傳給下一個任務', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', groupId: 'g1', sessionId: 's-bad', costUsd: 1, status: 'error' });
+
+  assert.equal(
+    ledger.latestGroupSession('g1', 'worker'),
+    undefined,
+    '接一條已知壞掉的 session，第二個任務會連開場都失敗',
+  );
+});

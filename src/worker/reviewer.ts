@@ -55,6 +55,20 @@ export interface ReviewOptions {
   /** 直接指定要審的 diff（測試/已算好時用）；未給則由 collectDiff 取。 */
   diff?: string;
   /**
+   * 續接同一群的審查 session。
+   *
+   * **群內同階段共用一條 session**（使用者裁決）：審查者審第二個任務時要記得
+   * 第一個任務改了什麼、自己當時放行的理由——先前它**根本不知道第一個任務存在**，
+   * 所以第二個任務破壞了第一個時它不可能發現。
+   *
+   * 注意這與 REVIEWER_SYSTEM_PROMPT 上面那句「不 resume coder 的 session」不衝突：
+   * 那句講的是**不能繼承寫程式的人的想法**（否則審不出東西），
+   * 這裡續接的是**審查者自己**先前的審查，兩條線始終隔離。
+   */
+  resumeSessionId?: string;
+  /** 所屬群組（記帳與 session 歸屬用）。 */
+  groupId?: string;
+  /**
    * 比較基準＝**本任務開始時的 HEAD sha**，與 DoD「diff 非空」關卡同一枚
    * （worker 的 gateConfig.diff.baseRef）。
    *
@@ -70,7 +84,7 @@ export interface ReviewOptions {
 }
 
 /** SDK query 的最小結構介面，供注入假件。 */
-export type ReviewQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
+export type ReviewQueryFn = (args: { prompt: string; cwd: string; resume?: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface ReviewerDeps {
   /**
@@ -141,7 +155,12 @@ export class Reviewer {
     );
     let text: string;
     try {
-      text = await this.runQuery(prompt, cwd, { taskId: task.id, repo: task.repo });
+      text = await this.runQuery(prompt, cwd, {
+        taskId: task.id,
+        repo: task.repo,
+        ...(opts.groupId ? { groupId: opts.groupId } : {}),
+        ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
+      });
     } catch (e) {
       this.deps.log.warn({ taskId: task.id, err: msg(e) }, 'reviewer 呼叫失敗，略過（不阻斷流程）');
       return toReviewOutcome({ status: 'skipped', reason: `reviewer 呼叫失敗：${msg(e)}` });
@@ -160,7 +179,11 @@ export class Reviewer {
     return toReviewOutcome(verdict);
   }
 
-  private async runQuery(prompt: string, cwd: string, ctx?: { taskId?: string; repo?: string }): Promise<string> {
+  private async runQuery(
+    prompt: string,
+    cwd: string,
+    ctx?: { taskId?: string; repo?: string; groupId?: string; resume?: string },
+  ): Promise<string> {
     const q: ReviewQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -169,6 +192,7 @@ export class Reviewer {
           options: {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
+            ...(args.resume ? { resume: args.resume } : {}),
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
             allowedTools: REVIEWER_TOOLS,
             systemPrompt: REVIEWER_SYSTEM_PROMPT,
@@ -180,7 +204,7 @@ export class Reviewer {
         }) as AsyncIterable<Record<string, unknown>>);
 
     let out = '';
-    for await (const raw of q({ prompt, cwd })) {
+    for await (const raw of q({ prompt, cwd, ...(ctx?.resume ? { resume: ctx.resume } : {}) })) {
       const m = raw as { type?: string; subtype?: string; result?: string };
       if (m.type === 'result') {
         recordAgentUsage(this.deps.usage, this.deps.log, { kind: 'reviewer', ...(ctx ?? {}) }, raw);

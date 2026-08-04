@@ -205,16 +205,18 @@ const greenVerifier = (): VerifierLike => ({
 
 /** 依 taskId 回不同總結；未列出的任務回空字串（模擬 agent 沒給總結）。 */
 function fakeAgent(byTask: Record<string, string> = {}): AgentLike & { rounds: number; calls: IterateInput[] } {
-  const a = {
+  // 型別標在變數上（不是最後才轉型）：這個假件少一個 IterateResult 的必填欄位時
+  // 要當場紅，而不是被 `as` 蓋掉——那正是「假件與介面脫節、測試照樣綠」的路。
+  const a: AgentLike & { rounds: number; calls: IterateInput[] } = {
     rounds: 0,
-    calls: [] as IterateInput[],
-    async iterate(input: IterateInput) {
+    calls: [],
+    async iterate(input) {
       a.rounds += 1;
       a.calls.push(input);
-      return { sessionId: 's', resultText: byTask[input.task.id] ?? '', isError: false };
+      return { sessionId: 's', resultText: byTask[input.task.id] ?? '', toolCalls: {}, isError: false };
     },
   };
-  return a as AgentLike & { rounds: number; calls: IterateInput[] };
+  return a;
 }
 
 function fakeMcp(detailOf: (id: string) => TaskDetail): McpTaskClient & { started: string[]; completed: string[] } {
@@ -872,15 +874,16 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     const group = seedGroup(['需要澄清的任務']);
     const h = build({
       agent: {
-        async iterate() {
+        async iterate(): Promise<IterateResult> {
           return {
             sessionId: 's',
             resultText: '',
             isError: false,
+            toolCalls: {},
             askedClarification: { question: '要用哪個色票？', rationale: '不可逆' },
           };
         },
-      } as unknown as AgentLike,
+      },
     });
 
     await h.runner.run(group);

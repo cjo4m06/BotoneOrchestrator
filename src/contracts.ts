@@ -70,6 +70,13 @@ export interface ReviewerLike {
        * 否則會把一個解決過的問題重新提出來退回（實跑撞到，白費一輪）。
        */
       decisions?: { question: string; answer: string }[];
+      /**
+       * 續接同一群的審查 session（群內同階段共用一條線）。
+       * 與 coder 的 session 始終隔離——審查者不能繼承寫程式的人的想法。
+       */
+      resumeSessionId?: string;
+      /** 所屬群組。 */
+      groupId?: string;
     },
   ): Promise<ReviewOutcome>;
 }

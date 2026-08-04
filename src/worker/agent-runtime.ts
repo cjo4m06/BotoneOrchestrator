@@ -46,6 +46,15 @@ export interface IterateInput {
    */
   planHint?: { rationale: string; files: string[] };
   /**
+   * 同一群裡**前面幾個任務的交付說明**（agent 自己寫的：做了什麼／為什麼／取捨／
+   * 試過但放棄的方向）。
+   *
+   * 為什麼需要：群內共用 session 之後 context 會跨任務累積並被自動壓縮
+   * （單一任務就可能到 170k token）。壓縮壓得掉對話、壓不掉 DB——
+   * 所以關鍵決策靠這裡保住，而不是指望它還記得。
+   */
+  priorDeliveries?: { taskId: string; text: string }[];
+  /**
    * 本任務起點 sha（＝DoD diff 關卡與 reviewer 同一枚）。
    * Stop hook 用它判「這一輪到底做了沒」；未給 → 退回 porcelain，
    * 那只看得到未 commit 的東西，agent 自行 commit 後會被誤判成什麼都沒做。
@@ -977,6 +986,19 @@ export function buildAgentPrompt(input: IterateInput): string {
     if (input.planHint.files.length > 0) {
       p.push(`\n規劃時預期會動到（整組共用，不是只有這個任務）：\n${input.planHint.files.map((f) => `- ${f}`).join('\n')}`);
     }
+  }
+
+  // 同一群前面幾個任務做了什麼。**這一段的價值在「為什麼」而不是「做了什麼」**——
+  // 做了什麼看 diff 就知道，但「試過 X 但因為 Y 放棄」只有寫的人知道，
+  // 而那正是下一個任務最容易重蹈的覆轍。
+  if (input.priorDeliveries?.length) {
+    p.push(`\n## 這一群前面幾個任務的交付說明`);
+    p.push(
+      '同一群的任務是相關的，前面的人已經在這個工作區留下了程式碼與判斷。'
+      + '**沿用他們的命名、寫法與取捨**，不要另起爐灶；如果你認為前面的做法有問題，'
+      + '說出來而不是默默改掉（那會讓兩個任務互相打架）。',
+    );
+    for (const d of input.priorDeliveries) p.push(`\n### ${d.taskId}\n${d.text}`);
   }
 
   if (input.answer) {

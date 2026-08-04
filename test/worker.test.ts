@@ -717,6 +717,82 @@ describe('Worker — 單任務監督迴圈', () => {
 
     // 上面那些測試用的是 'head-1' 這種假 sha，走不進欄位那條路（欄位只收 40 位 sha）。
     // 這一條專門證明**欄位本身**生效：只寫欄位、不寫事件，基準仍要被沿用。
+    // 群內共用 session（使用者裁決）：群裡第二個任務不該是全新 context。
+    it('群內第二個任務續接同一群的寫程式 session，不是自己開新的', async () => {
+      const task = makeTask();
+      seed(task);
+      // 同一群、別的任務先跑過一輪
+      tmp.ledger.recordAgentSession({ kind: 'worker', taskId: 'T-前一個', groupId: 'g-shared', sessionId: 's-群共用', costUsd: 1 });
+
+      const inputs: IterateInput[] = [];
+      const agent: AgentLike = {
+        async iterate(i) { inputs.push(i); return { sessionId: 's-群共用', resultText: '完成', isError: false, toolCalls: {} }; },
+      };
+      const { worker } = build({ agent });
+
+      await worker.runTask({ task, ...cfg, groupId: 'g-shared' });
+
+      assert.equal(inputs[0]?.resumeSessionId, 's-群共用', '第二個任務要接得上第一個的脈絡');
+    });
+
+    it('沒有群（單獨派工）時退回這個任務自己的 session', async () => {
+      const task = makeTask();
+      seed(task);
+      tmp.ledger.recordAgentSession({ kind: 'worker', taskId: task.id, sessionId: 's-自己的', costUsd: 1 });
+
+      const inputs: IterateInput[] = [];
+      const agent: AgentLike = {
+        async iterate(i) { inputs.push(i); return { sessionId: 's-自己的', resultText: '完成', isError: false, toolCalls: {} }; },
+      };
+      const { worker } = build({ agent });
+
+      await worker.runTask({ task, ...cfg });
+
+      assert.equal(inputs[0]?.resumeSessionId, 's-自己的');
+    });
+
+    // 交付說明存 DB、下一個任務從 DB 讀——群內共用 session 的 context 會被自動壓縮
+    // （單一任務就可能到 170k token），壓縮壓得掉對話、壓不掉 DB。
+    it('前面任務的交付說明會進到下一個任務的提示詞', async () => {
+      const task = makeTask();
+      seed(task);
+      tmp.ledger.openHandoff({
+        groupId: 'g-shared', taskId: 'T-前一個', fromRole: 'coder', toRole: 'coder',
+        kind: 'delivery', blocking: false, title: 't', body: '用了 useLocalStorage；試過 pinia 但放棄，因為 SSR 會炸',
+      });
+
+      const inputs: IterateInput[] = [];
+      const agent: AgentLike = {
+        async iterate(i) { inputs.push(i); return { sessionId: 's', resultText: '完成', isError: false, toolCalls: {} }; },
+      };
+      const { worker } = build({ agent });
+
+      await worker.runTask({ task, ...cfg, groupId: 'g-shared' });
+
+      assert.deepEqual(inputs[0]?.priorDeliveries, [
+        { taskId: 'T-前一個', text: '用了 useLocalStorage；試過 pinia 但放棄，因為 SSR 會炸' },
+      ]);
+    });
+
+    it('自己上一輪的交付說明不會再貼給自己（會被當成別人做的）', async () => {
+      const task = makeTask();
+      seed(task);
+      tmp.ledger.openHandoff({
+        groupId: 'g-shared', taskId: task.id, fromRole: 'coder', toRole: 'coder',
+        kind: 'delivery', blocking: false, title: 't', body: '我自己上一輪寫的',
+      });
+
+      const inputs: IterateInput[] = [];
+      const agent: AgentLike = {
+        async iterate(i) { inputs.push(i); return { sessionId: 's', resultText: '完成', isError: false, toolCalls: {} }; },
+      };
+      const { worker } = build({ agent });
+
+      await worker.runTask({ task, ...cfg, groupId: 'g-shared' });
+
+      assert.equal(inputs[0]?.priorDeliveries, undefined);
+    });
+
     it('基準沿用讀的是 tasks.task_start_sha 欄位（不是只靠 events）', async () => {
       const task = makeTask();
       seed(task);

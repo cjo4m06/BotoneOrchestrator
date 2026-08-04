@@ -819,6 +819,30 @@ export class GroupRunner {
     const recorder = new SummaryRecorder(this.deps.agent, (taskId, text) => {
       // 稽核用：總結同時落 ledger events，之後即使進程重啟也查得到當時 agent 說了什麼
       ledger.logEvent('task', taskId, 'agent_summary', text);
+      // **交付說明也落成交接單。**
+      //
+      // 群內共用 session 之後，context 會跨任務累積並被自動壓縮（單一任務就可能到
+      // 170k token）。壓縮壓得掉對話，壓不掉 DB——所以每個任務結束時把 agent 自己
+      // 寫的交付說明存成一張 delivery 單，下一個任務的提示詞從這裡讀，
+      // 而不是指望它還記得。
+      //
+      // blocking=false：這不是要人處理的事，是給下一棒的脈絡。
+      try {
+        ledger.openHandoff({
+          groupId: group.id,
+          taskId,
+          fromRole: 'coder',
+          toRole: 'coder',
+          kind: 'delivery',
+          blocking: false,
+          title: `${taskId} 交付說明`,
+          body: text,
+        });
+      } catch (e) {
+        // openHandoff 對空 body 會擲錯——交付說明本來就可能是空的（agent 只回了空白），
+        // 那不是錯誤，只是沒東西可傳。不能讓它把整個任務弄倒。
+        log.debug({ taskId, err: e instanceof Error ? e.message : String(e) }, '交付說明是空的，不開交接單');
+      }
     });
 
     // rework 模式：暫存區裡有這個群組的意見 = orchestrator 帶著 reviewer 意見把它派回來了。

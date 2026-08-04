@@ -276,7 +276,15 @@ export class Worker {
     //
     // session 存在 Claude Code engine 的磁碟上，不是我們行程的記憶體，重啟後照樣接得回來；
     // 真的過期了 iterate 會自己降級開新的（isResumeFailure），不會讓這一輪報銷。
-    let session = this.deps.ledger.latestAgentSession(task.id)?.sessionId;
+    // **群內共用一條寫程式的 session**（使用者裁決）：先找同一群同一角色最近用的，
+    // 沒有才退回這個任務自己的（單獨派工、或還沒有群的情況）。
+    //
+    // 為什麼：群裡第二個任務先前是全新 context——它不知道第一個任務為什麼那樣寫、
+    // 試過什麼、放棄了什麼，那些 diff 裡看不到。於是「一起做」的意義只剩下
+    // 「檔案在同一個資料夾」，而不是連貫的理解。
+    let session =
+      (input.groupId ? this.deps.ledger.latestGroupSession(input.groupId, 'worker')?.sessionId : undefined) ??
+      this.deps.ledger.latestAgentSession(task.id)?.sessionId;
     let answer = pending ? { question: pending.question, answer: pending.answer } : undefined;
     if (pending) {
       log.info(
@@ -313,7 +321,10 @@ export class Worker {
       this.say(threadTs, { type: 'iterating', round }, detail);
 
       input.onPhase?.(`第 ${round} 輪：agent 寫程式中`);
-      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.planHint ? { planHint: input.planHint } : {}), ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
+      // 同一群前面幾個任務的交付說明。從 DB 讀而不是靠 session 記得——
+      // 群內共用 session 的 context 會被自動壓縮，壓縮壓不掉 DB。
+      const priorDeliveries = input.groupId ? this.priorDeliveries(input.groupId, task.id) : [];
+      const r = await agent.iterate({ cwd, task: detail, docs, feedback, resumeSessionId: session, ...(input.planHint ? { planHint: input.planHint } : {}), ...(priorDeliveries.length ? { priorDeliveries } : {}), ...(gateConfig.diff ? { baseRef: gateConfig.diff.baseRef } : {}), ...(input.signal ? { signal: input.signal } : {}), ...(answer ? { answer } : {}) });
       session = r.sessionId ?? session;
       if (pending && answer) {
         // 只注入一次：不標消費的話，之後每一輪都會再貼一次同樣的答覆，
@@ -326,8 +337,10 @@ export class Worker {
       this.recordSession(detail, session, r, input.groupId);
       // 工具計數累加到任務層級（不是每輪）——agent 會 resume session，
       // 第 1 輪讀了規格第 3 輪不會再讀，按輪算會讓協定一致性檢查誤報。
-      // `?? {}` 是給測試假件的退路：那些假件沒有被型別檢查（tsconfig 只含 src/）。
-      ledger.addTaskToolCalls(task.id, r.toolCalls ?? {});
+      //
+      // 沒有 `?? {}` 退路是刻意的：test/ 現在也在 typecheck 裡了（4b 片），
+      // 漏傳 toolCalls 會是**編譯錯誤**而不是靜默的 undefined。
+      ledger.addTaskToolCalls(task.id, r.toolCalls);
 
       // 3a) agent 提出不可逆歧義 → park（M4 接 Slack 等答覆）
       if (r.askedClarification) {
@@ -391,7 +404,7 @@ export class Worker {
         input.onPhase?.(`第 ${round} 輪：關卡綠燈，reviewer 對規格審查中`);
         // baseRef 一定要傳，而且**不要 `?? 'HEAD'`**——讓 undefined 一路傳到 reviewer，
         // 由它決定「沒有基準就不審」。退回 HEAD 正是這個 bug 的源頭。
-        const review = await this.review(detail, docs, cwd, threadTs, reviewRejections, gateConfig.diff?.baseRef);
+        const review = await this.review(detail, docs, cwd, threadTs, reviewRejections, gateConfig.diff?.baseRef, input.groupId);
         if (review.rejected) {
           reviewRejections += 1;
           effective = review.report;
@@ -589,6 +602,18 @@ export class Worker {
    * 取不到 HEAD（cwd 不是 git 工作區）→ 停用此關卡並警告：安全檢查不該讓正常流程直接癱瘓，
    * 但要吵到看得見（log.error + Slack 通知），不能靜靜地把把關拿掉。
    */
+  /**
+   * 同一群裡**這個任務之前**的交付說明。
+   *
+   * 排除自己：重跑時把自己上一輪的交付說明再貼一次，只會讓 agent 以為那是別人做的。
+   */
+  private priorDeliveries(groupId: string, taskId: string): { taskId: string; text: string }[] {
+    return this.deps.ledger
+      .listHandoffs({ groupId, kind: 'delivery' })
+      .filter((h) => h.taskId && h.taskId !== taskId)
+      .map((h) => ({ taskId: h.taskId!, text: h.body }));
+  }
+
   private async withDiffGate(config: VerifierConfig, cwd: string, taskId: string): Promise<VerifierConfig> {
     const { log, ledger } = this.deps;
     const head = this.deps.headRef ?? gitHeadRef;
@@ -953,6 +978,8 @@ export class Worker {
     rejectionsSoFar: number,
     /** 與 DoD diff 關卡同一枚基準（任務開始時的 HEAD sha）。undefined ＝ 取不到，reviewer 會 skip。 */
     baseRef: string | undefined,
+    /** 所屬群組——審查 session 要以群為單位共用。 */
+    groupId: string | undefined,
   ): Promise<{ rejected: false } | { rejected: true; report: GateReport }> {
     const { reviewer, notifier, log } = this.deps;
     if (!reviewer) return { rejected: false };
@@ -963,7 +990,16 @@ export class Worker {
       void Promise.resolve(this.deps.notifier.updateTaskCard?.(detail.id, 'reviewing')).catch(() => {});
       // 把人已經拍板的決定一起給 reviewer。少了它，規格寫「沒有定論」的地方
       // 會被重新提出來退回——而那個問題明明已經有答案了（實跑撞到，白費一輪）。
-      outcome = await reviewer.check(detail, docs, cwd, { baseRef, decisions: this.settledDecisions(detail.id) });
+      // 群內共用一條**審查**的 session（與寫程式那條完全隔離）。
+      // 沒有它，審查者審第二個任務時根本不知道第一個任務存在——
+      // 第二個破壞了第一個時它不可能發現。
+      const reviewResume = groupId ? this.deps.ledger.latestGroupSession(groupId, 'reviewer')?.sessionId : undefined;
+      outcome = await reviewer.check(detail, docs, cwd, {
+        baseRef,
+        decisions: this.settledDecisions(detail.id),
+        ...(reviewResume ? { resumeSessionId: reviewResume } : {}),
+        ...(groupId ? { groupId } : {}),
+      });
     } catch (e) {
       // reviewer 掛掉不能拖垮任務：DoD 已綠，退化成「沒有 reviewer」的既有行為
       log.warn({ taskId: detail.id, err: e instanceof Error ? e.message : String(e) }, 'reviewer 呼叫失敗，略過審查');

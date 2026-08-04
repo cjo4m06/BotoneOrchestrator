@@ -1047,6 +1047,24 @@ async function evaluate(
     `跑過 ${ranIds.length} 個，有計數 ${counted.length} 個`,
   );
 
+  // 29) 群內共用 session ＋ 交付說明落 DB。
+  //
+  // 兩件事一起驗，因為它們互為前提：共用 session 讓 context 跨任務連貫，
+  // 而 context 會被自動壓縮——關鍵決策靠交付說明保住（壓縮壓不掉 DB）。
+  // 只做其中一件的話，要嘛第二個任務是全新 context（等於沒有一起做），
+  // 要嘛存了沒人讀。
+  const deliveries = ledger.listHandoffs({ kind: 'delivery' });
+  const multi = [...new Set(TASKS.map((t) => ledger.getTask(t.id)?.groupId).filter(Boolean))]
+    .map((g) => ledger.getGroup(g as string))
+    .filter((g) => g && g.taskIds.length > 1);
+  note(
+    '㉙ 每個跑過 agent 的任務都留下交付說明（下一個任務靠它接脈絡，不靠記憶）',
+    deliveries.length > 0 && deliveries.every((h) => h.body.trim() !== '' && h.blocking === false),
+    deliveries.length === 0
+      ? '一張都沒有——交付說明沒接上，群內第二個任務會是全新 context'
+      : `${deliveries.length} 張（多任務群 ${multi.length} 個），全部有內容且不擋流程`,
+  );
+
   // 24) done 的任務不該還掛著 block_reason（狀態資料一致性）
   const staleBlocks = TASKS.map((t) => ledger.getTask(t.id)).filter((t) => t?.state === 'done' && t.block !== undefined);
   note(

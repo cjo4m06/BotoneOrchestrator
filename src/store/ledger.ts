@@ -526,6 +526,35 @@ export class Ledger {
   }
 
   /** 取某任務最近一次的 session（resume 用：人回覆澄清後要接回同一個 session）。 */
+  /**
+   * 這一群某個角色最近用的 session。**群內同階段共用一個 session**（使用者裁決）。
+   *
+   * ── 為什麼要共用 ──
+   *
+   * 一群 = 一批相關的任務。先前 session 是按 `task_id` 查的，所以群裡第二個任務是
+   * **全新的 context**：它不知道第一個任務為什麼那樣寫、試過什麼、放棄了什麼——
+   * 那些東西 diff 裡看不到。於是它會重讀一次同一批檔案、重新建立一次同樣的理解、
+   * 可能用不一樣的命名與寫法。「一起做」的意義只剩下「檔案在同一個資料夾」。
+   *
+   * ── 為什麼還要分 kind ──
+   *
+   * 寫程式與審查**絕不可以共用同一個 session**：審查者要用全新的眼睛看規格對不對，
+   * 繼承了寫程式的人的想法就審不出東西。所以是「每個角色一條連貫的線」，
+   * 不是「整群一條線」。
+   *
+   * context 會累積、會被自動壓縮——這是預期的。關鍵決策靠每個任務結束時寫進
+   * `handoffs` 的交付說明保住（壓縮壓不掉 DB）。
+   */
+  latestGroupSession(groupId: string, kind: string): AgentSessionRow | undefined {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM agent_sessions WHERE group_id = @groupId AND kind = @kind' +
+          " AND status != 'error' ORDER BY updated_at DESC, id DESC LIMIT 1",
+      )
+      .get({ groupId, kind }) as Row | undefined;
+    return row ? toAgentSession(row) : undefined;
+  }
+
   latestAgentSession(taskId: string): AgentSessionRow | undefined {
     const row = this.db
       .prepare('SELECT * FROM agent_sessions WHERE task_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1')
