@@ -92,6 +92,17 @@ export interface IterateResult {
   sdkRetries?: number;
   /** 本輪用量與花費（記進 ledger 的 agent_sessions）。 */
   usage?: AgentUsage;
+  /**
+   * 本輪各工具的呼叫次數。**必填**（沒用工具就給空物件）。
+   *
+   * 為什麼要一路傳出來而不是只寫 log：這是「協定一致性檢查」唯一的資料源——
+   * 「這個任務有 docRefs，卻從頭到尾一次都沒查過規格」「宣稱看過畫面卻零次瀏覽器呼叫」
+   * 這種事實，只有把計數帶出這一層才有人接得到。
+   *
+   * 刻意設成必填：漏傳的症狀是「檢查永遠不會觸發」，而那是靜默的。
+   * 讓 typecheck 逼每一個產生 IterateResult 的地方（含測試假件）都想一次。
+   */
+  toolCalls: Record<string, number>;
   askedClarification?: ClarificationCapture;
   /** agent 宣告本任務無需改動（處置由 Worker 依政策決定，見 NoChangeCategory）。 */
   reportedNoChange?: NoChangeCapture;
@@ -473,6 +484,7 @@ export class AgentRuntime {
       askedClarification: captured.clar,
       reportedNoChange: captured.noChange,
       isError,
+      toolCalls: Object.fromEntries(toolsUsed),
       ...(outcome.errorKind ? { errorKind: outcome.errorKind } : {}),
       ...(outcome.sdkError ? { sdkError: outcome.sdkError } : {}),
       ...(outcome.httpStatus !== undefined ? { httpStatus: outcome.httpStatus } : {}),

@@ -1032,6 +1032,18 @@ async function evaluate(
       : `${runs.length} 列，工作區種類 ${[...kinds].join('/')}，有輸出的 ${withOutput} 列`,
   );
 
+  // 28) 工具計數要累到任務層級（協定一致性檢查唯一的資料源）。
+  // 假件 agent 不會產生真的工具呼叫，所以這裡驗的是**管道有沒有通**：
+  // 跑過 agent 的任務都要有 toolCalls 這個欄位（就算是空物件），
+  // 因為「跑了一輪什麼都沒用」與「從來沒跑過」是不同的事實。
+  const ranIds = [...new Set(agent.calls.map((c) => c.taskId))];
+  const counted = ranIds.filter((id) => ledger.getTask(id)?.toolCalls !== undefined);
+  note(
+    '㉘ 跑過 agent 的任務都有累計的工具計數（管道通了，不是靜默的 undefined）',
+    counted.length === ranIds.length,
+    `跑過 ${ranIds.length} 個，有計數 ${counted.length} 個`,
+  );
+
   // 24) done 的任務不該還掛著 block_reason（狀態資料一致性）
   const staleBlocks = TASKS.map((t) => ledger.getTask(t.id)).filter((t) => t?.state === 'done' && t.block !== undefined);
   note(

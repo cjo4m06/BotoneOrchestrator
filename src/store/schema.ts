@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- 舊 sha 可能還解得開（所以 commitExists 擋不住）但已經太舊，
   -- 拿它當基準會讓 diff 含進別的任務的成果，關卡就變成橡皮圖章。
   task_start_branch TEXT,
+  -- 這個任務**累計**用過哪些工具幾次（JSON: {"Read": 12, "mcp__docs__read_doc": 2}）。
+  --
+  -- 為什麼是累計而不是每輪：agent 會 resume session——第 1 輪讀了規格，第 3 輪不會再讀一次。
+  -- 按輪算的話「這個任務從頭到尾沒查過規格」這個判斷會誤報。
+  tool_calls TEXT,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
 );
@@ -276,6 +281,7 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
   { table: 'groups', column: 'base_sha', ddl: 'ALTER TABLE groups ADD COLUMN base_sha TEXT' },
   { table: 'tasks', column: 'task_start_sha', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_sha TEXT' },
   { table: 'tasks', column: 'task_start_branch', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_branch TEXT' },
+  { table: 'tasks', column: 'tool_calls', ddl: 'ALTER TABLE tasks ADD COLUMN tool_calls TEXT' },
 ];
 
 export interface MigratableDb {

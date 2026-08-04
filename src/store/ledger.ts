@@ -939,6 +939,7 @@ export class Ledger {
       sourceUpdatedAt: (r.source_updated_at as number) ?? undefined,
       taskStartSha: (r.task_start_sha as string) ?? undefined,
       taskStartBranch: (r.task_start_branch as string) ?? undefined,
+      toolCalls: r.tool_calls ? (JSON.parse(r.tool_calls as string) as Record<string, number>) : undefined,
       createdAt: r.created_at as number,
       updatedAt: r.updated_at as number,
     };
@@ -978,6 +979,25 @@ export class Ledger {
       )
       .run({ id, sha, branch: branch ?? null });
     return r.changes > 0;
+  }
+
+  /**
+   * 把這一輪的工具呼叫次數**累加**到任務層級。
+   *
+   * 累加而不是覆寫：agent 會 resume session，第 1 輪讀了規格、第 3 輪不會再讀一次。
+   * 只看最後一輪的話，「這個任務從頭到尾沒查過規格」這個判斷會對每一個跑超過一輪的
+   * 任務誤報。
+   *
+   * 空的計數也要呼叫（不是 no-op）：「跑了一輪、一個工具都沒用」與「從來沒跑過」
+   * 是不同的事實，前者要留下 `{}` 這個痕跡。
+   */
+  addTaskToolCalls(taskId: string, counts: Record<string, number>): void {
+    const cur = this.getTask(taskId)?.toolCalls ?? {};
+    for (const [name, n] of Object.entries(counts)) cur[name] = (cur[name] ?? 0) + n;
+    const r = this.db
+      .prepare('UPDATE tasks SET tool_calls = @json, updated_at = @ts WHERE id = @id')
+      .run({ id: taskId, json: JSON.stringify(cur), ts: this.now() });
+    if (r.changes === 0) this.log.warn({ taskId }, '累加工具計數時找不到任務');
   }
 
   // ── check_runs：關卡執行的流水帳（純記帳、零解讀） ──────────────────

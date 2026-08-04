@@ -744,3 +744,35 @@ test('開工基準只收 40 位 sha——寫 ref 名字進去會擲錯（那是�
 
   assert.equal(ledger.getGroup(g.id)?.baseSha, undefined, '擲錯就不該留下半個值');
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 工具呼叫計數：協定一致性檢查唯一的資料源
+//
+// 「這個任務有 docRefs，卻從頭到尾一次都沒查過規格」——這種事實只有把計數
+// 累計到任務層級才成立。按輪算會對每一個跑超過一輪的任務誤報（agent 會 resume）。
+// ─────────────────────────────────────────────────────────────────────
+
+test('工具計數：跨輪累加，不是覆寫（agent 會 resume，第 3 輪不會再讀一次規格）', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+
+  ledger.addTaskToolCalls('T-1', { Read: 3, mcp__docs__read_doc: 1 });
+  ledger.addTaskToolCalls('T-1', { Read: 2, Bash: 5 }); // 第 2 輪沒再讀規格
+
+  assert.deepEqual(ledger.getTask('T-1')?.toolCalls, { Read: 5, mcp__docs__read_doc: 1, Bash: 5 });
+});
+
+test('工具計數：空的也要記——「跑了一輪什麼工具都沒用」不等於「從來沒跑過」', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+
+  assert.equal(ledger.getTask('T-1')?.toolCalls, undefined, '跑之前是 undefined');
+  ledger.addTaskToolCalls('T-1', {});
+  assert.deepEqual(ledger.getTask('T-1')?.toolCalls, {}, '跑過之後是 {}，兩者要分得出來');
+});
+
+test('工具計數：找不到任務要留 warn，不要靜默吞掉', (t) => {
+  const { ledger, rec } = setupWithLog(t);
+  ledger.addTaskToolCalls('不存在', { Read: 1 });
+  assert.ok(rec.messages('warn').some((w) => /工具計數/.test(w)));
+});

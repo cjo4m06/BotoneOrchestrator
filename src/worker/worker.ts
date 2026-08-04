@@ -324,6 +324,10 @@ export class Worker {
       // **每一輪都記**（不只互動用的）：session_id ↔ task_id 的對照是事後看 log 的唯一線索，
       // 成本也只有在這裡拿得到實際數字（SDK 的 result 給的，不是估算）。
       this.recordSession(detail, session, r, input.groupId);
+      // 工具計數累加到任務層級（不是每輪）——agent 會 resume session，
+      // 第 1 輪讀了規格第 3 輪不會再讀，按輪算會讓協定一致性檢查誤報。
+      // `?? {}` 是給測試假件的退路：那些假件沒有被型別檢查（tsconfig 只含 src/）。
+      ledger.addTaskToolCalls(task.id, r.toolCalls ?? {});
 
       // 3a) agent 提出不可逆歧義 → park（M4 接 Slack 等答覆）
       if (r.askedClarification) {

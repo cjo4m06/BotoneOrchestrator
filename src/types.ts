@@ -50,6 +50,11 @@ export interface Task {
   taskStartSha?: string;
   /** 基準是在哪條分支上抓的（沿用前要比對，見 task_start_branch 的說明）。 */
   taskStartBranch?: string;
+  /**
+   * 這個任務**累計**用過哪些工具幾次。協定一致性檢查唯一的資料源。
+   * 累計而不是每輪——agent 會 resume session，按輪算會誤報。
+   */
+  toolCalls?: Record<string, number>;
   createdAt: number;
   updatedAt: number;
 }
