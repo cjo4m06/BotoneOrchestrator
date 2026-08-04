@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 import { ConfigStore, expandEnv } from '../config/store.js';
 import { collectPending, frictionInput, statusInput, summarizeFriction } from '../cli/ask.js';
+import { FRICTION_EVENT, parseFrictionEvent } from '../worker/friction.js';
+import { FRICTION_TRIAGED, TRIAGE_LABEL, isTriageAction, triagedMap, toTaskCardText } from '../worker/friction-triage.js';
 import { quietWaits, startOfToday, TASK_STATES, GROUP_STATES } from '../cli/report.js';
 import { mcpResilienceFromEnv } from '../mcp/mcp-client.js';
 import { listBranches } from '../git/base-freshness.js';
@@ -172,7 +174,48 @@ export class ConsoleServer {
     if (path === '/api/friction' && m === 'GET') {
       // agent 回報的系統摩擦。唯讀——這裡不做任何自動處置，
       // 因為那些是自我回報，可能對也可能只是它不想做某件事。
-      return this.json(res, 200, summarizeFriction(frictionInput(ledger)));
+      // 預設只回**未分診的**——處理過的東西繼續佔版面，清單就永遠不會變短。
+      const triaged = triagedMap(ledger.listEvents({ scope: 'system', kind: FRICTION_TRIAGED, limit: 500 }));
+      return this.json(res, 200, summarizeFriction(frictionInput(ledger), 200, triaged));
+    }
+
+    if (path === '/api/friction/card' && m === 'GET') {
+      // 「要處理」的按鈕要貼到任務板，而 MCP **沒有建立任務的工具**（只有 list/get/start/complete），
+      // 所以程式開不了卡——這裡只把原話、證據、建議整理成可貼的文字，一個字都不改寫。
+      const id = Number(url.searchParams.get('id'));
+      const row = ledger.listEvents({ scope: 'task', kind: FRICTION_EVENT, limit: 500 }).find((e) => e.id === id);
+      const rep = row ? parseFrictionEvent(row.detail) : undefined;
+      if (!row || !rep) return this.json(res, 404, { ok: false, error: `找不到編號 ${id} 的回報` });
+      return this.json(res, 200, {
+        ok: true,
+        text: toTaskCardText({ ...rep, taskId: row.refId ?? undefined }),
+      });
+    }
+
+    if (path === '/api/friction/triage' && m === 'POST') {
+      const body = await this.body(req);
+      const id = Number(body.id);
+      const action = body.action;
+      if (!Number.isInteger(id) || id <= 0) return this.json(res, 400, { ok: false, error: '缺少回報 id' });
+      if (!isTriageAction(action)) {
+        return this.json(res, 400, { ok: false, error: `未知的動作：${String(action)}` });
+      }
+      // **這一筆回報真的存在嗎。** 不驗的話打錯 id 會留下一筆指向空氣的分診，
+      // 而那一筆會永遠把某個未來的回報藏起來（id 是遞增的，總有一天會撞上）。
+      const exists = ledger.listEvents({ scope: 'task', kind: FRICTION_EVENT, limit: 500 }).some((e) => e.id === id);
+      if (!exists) return this.json(res, 404, { ok: false, error: `找不到編號 ${id} 的回報` });
+
+      const note = typeof body.note === 'string' ? body.note.trim() : '';
+      // wont_fix 的理由是必填：事後要看得出「當時為什麼決定不處理」，
+      // 而那正是幾週後最想知道、卻最查不到的東西。
+      if (action === 'wont_fix' && note === '') {
+        return this.json(res, 400, { ok: false, error: '「不處理」要寫一句理由（事後只剩這一行字查得到）' });
+      }
+      ledger.logEvent('system', String(id), FRICTION_TRIAGED, JSON.stringify({
+        action, ...(note ? { note } : {}), by: 'console',
+      }));
+      this.deps.log.info({ frictionId: id, action, note }, '📋 摩擦回報已分診');
+      return this.json(res, 200, { ok: true, detail: `已標記為「${TRIAGE_LABEL[action]}」` });
     }
 
     if (path === '/api/settings' && m === 'GET') {

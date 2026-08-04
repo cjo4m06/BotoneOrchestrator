@@ -548,20 +548,63 @@ async function loadFriction() {
   let f;
   // 這一區壞掉不可以拖垮總覽——它是「參考資訊」，不是主流程
   try { f = await api('/api/friction'); } catch { return; }
-  $('frictionCount').textContent = f.total ?? 0;
+
+  // 計數顯示**組數**：26 筆其實只有幾類，讓人先看到「有幾件事」而不是「有幾行字」
+  const groups = f.groups ?? [];
+  $('frictionCount').textContent = groups.length;
+
   if (!f.total) {
-    $('friction').innerHTML = '<div class="empty">agent 沒有回報任何問題</div>';
+    $('friction').innerHTML = `<div class="empty">沒有待處理的回報${f.triaged ? `（已處理 ${f.triaged} 則）` : ''}</div>`;
     return;
   }
-  const kinds = Object.entries(f.byKind ?? {}).sort((a, b) => b[1] - a[1])
-    .map(([k, n]) => `<span class="tag">${esc(k)} ${n}</span>`).join(' ');
-  const rows = (f.recent ?? []).map((r) => `<div class="row"><div class="grow">
-    <div class="title"><span class="tag">${esc(r.kind)}</span><code>${esc(r.taskId)}</code></div>
-    <div class="meta">${esc(r.what)}${r.evidence ? '<br><span class="mono">' + esc(r.evidence) + '</span>' : ''}</div>
-  </div></div>`).join('');
+
+  const item = (r) => `<div class="row"><div class="grow">
+      <div class="title"><code>${esc(r.taskId)}</code>${esc(r.what ?? '')}</div>
+      ${r.evidence ? `<div class="meta mono">${esc(r.evidence)}</div>` : ''}
+      ${r.suggestion ? `<div class="meta">建議：${esc(r.suggestion)}</div>` : ''}
+    </div>
+    <button class="btn" data-fr="resolved:${r.id}" title="這個問題已經修好了">已解決</button>
+    <button class="btn" data-fr="wont_fix:${r.id}" title="知道了，但不打算處理">不處理</button>
+    <button class="btn primary" data-fr="to_task:${r.id}" title="複製成任務板卡片的文字並標記轉出">要處理</button>
+  </div>`;
+
   $('friction').innerHTML =
-    `<div class="meta" style="margin-bottom:8px">共 ${f.total} 則（都是「不擋交付但你該知道」；真的被擋住的會出現在上面「等你處理」）${kinds ? '<br>' + kinds : ''}</div>${rows}`;
+    `<div class="meta" style="margin-bottom:8px">${f.total} 則待處理，分成 ${groups.length} 類`
+    + `${f.triaged ? `　·　已處理 ${f.triaged} 則` : ''}`
+    + `<br>這些都是「不擋交付但你該知道」；真的被擋住的會出現在上面「等你處理」</div>`
+    + groups.map((g) => `<details open><summary><span class="tag">${esc(g.kind)}</span> ${g.count} 則</summary>`
+        + g.items.map(item).join('') + '</details>').join('');
 }
+
+document.addEventListener('click', async (ev) => {
+  const el = ev.target.closest('button[data-fr]');
+  if (!el) return;
+  const [action, id] = el.dataset.fr.split(':');
+  let note;
+  if (action === 'wont_fix') {
+    // 理由必填：幾週後最想知道的就是「當時為什麼決定不處理」，而那時只剩這一行字
+    note = prompt('為什麼不處理？（事後只剩這一行字查得到）');
+    if (note === null || note.trim() === '') return;
+  }
+  if (action === 'to_task') {
+    // MCP 沒有建立任務的工具，所以程式開不了卡——把文字整理好給人貼過去。
+    // **先複製再標記**：複製失敗卻標成已轉出，那筆就這樣消失了。
+    const r = await api('/api/friction/card?id=' + encodeURIComponent(id));
+    try {
+      await navigator.clipboard.writeText(r.text);
+      toast('卡片文字已複製，貼到任務板即可', 'ok');
+    } catch {
+      // 沒有剪貼簿權限（非 https / 使用者拒絕）→ 攤出來讓人自己複製，不要靜靜地失敗
+      window.prompt('複製這段貼到任務板：', r.text);
+    }
+  }
+  el.disabled = true;
+  try {
+    const r = await api('/api/friction/triage', { method: 'POST', body: JSON.stringify({ id: Number(id), action, note }) });
+    if (r.ok) { toast(r.detail ?? '已處理', 'ok'); await loadFriction(); } else toast(r.error, 'bad');
+  } catch (e) { toast(e.message, 'bad'); } finally { el.disabled = false; }
+});
+
 
 async function loadState() {
   let s;

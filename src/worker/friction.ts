@@ -136,11 +136,31 @@ export function parseFrictionEvent(detail: string | undefined): (FrictionReport 
 }
 
 export interface FrictionSummary {
+  /** **未分診的**筆數（那才是「還要你看的」）。 */
   total: number;
+  /** 已分診（已解決／不處理／已轉成任務）的筆數。預設不顯示，但要看得到它在減少。 */
+  triaged: number;
   byKind: Record<string, number>;
-  /** 最近幾筆，給人直接讀。 */
-  recent: (FrictionReport & { taskId: string; source?: string; at?: number })[];
+  /**
+   * 依 kind 分組。
+   *
+   * **只用 agent 自己填的 kind 分組，不做文字相似度**——那是猜語意，換個寫法就失效
+   * （這一整串拆掉的垃圾設計都是那個形狀）。真正的去重（26 筆其實只有 7 件事）
+   * 要交給分診 agent，不是這裡。
+   */
+  groups: { kind: string; count: number; items: FrictionItem[] }[];
+  /** 攤平的清單（相容既有 CLI 輸出）。 */
+  recent: FrictionItem[];
 }
+
+/** 一筆回報 ＋ 它的事件 id（分診要靠它指名道姓）。 */
+export type FrictionItem = FrictionReport & {
+  id: number;
+  taskId: string;
+  source?: string;
+  at?: number;
+  triaged?: { action: string; note?: string; by?: string };
+};
 
 /**
  * 彙總摩擦回報。
@@ -150,20 +170,39 @@ export interface FrictionSummary {
  * 讓 agent 自動改調度器是最容易「靜默地弄壞一切」的方向。
  */
 export function summarizeFriction(
-  rows: { taskId: string; detail?: string }[],
+  rows: { id?: number; taskId: string; detail?: string }[],
   recentLimit = 20,
+  /** 已分診的（事件 id → 紀錄）。未提供 ＝ 全部都算未分診（CLI 舊呼叫端）。 */
+  triaged?: Map<number, { action: string; note?: string; by?: string }>,
 ): FrictionSummary {
   const parsed = rows
-    .map((r) => ({ taskId: r.taskId, rep: parseFrictionEvent(r.detail) }))
-    .filter((x): x is { taskId: string; rep: NonNullable<ReturnType<typeof parseFrictionEvent>> } => x.rep !== undefined);
+    .map((r) => ({ id: r.id ?? -1, taskId: r.taskId, rep: parseFrictionEvent(r.detail) }))
+    .filter((x): x is { id: number; taskId: string; rep: NonNullable<ReturnType<typeof parseFrictionEvent>> } => x.rep !== undefined);
+
+  // **預設只看未分診的。** 處理過的東西繼續佔版面，清單就永遠不會變短，
+  // 而一份不會變短的清單過幾週就沒有人會點開它。
+  const open = parsed.filter((x) => !triaged?.has(x.id));
+  const toItem = ({ id, taskId, rep }: (typeof parsed)[number]): FrictionItem => {
+    const t = triaged?.get(id);
+    return { id, taskId, ...rep, ...(t ? { triaged: t } : {}) };
+  };
 
   const byKind: Record<string, number> = {};
-  for (const { rep } of parsed) {
-    byKind[rep.kind] = (byKind[rep.kind] ?? 0) + 1;
+  for (const { rep } of open) byKind[rep.kind] = (byKind[rep.kind] ?? 0) + 1;
+
+  const grouped = new Map<string, FrictionItem[]>();
+  // 新到舊：同一類裡最近發生的排前面（舊的那筆多半已經在別處被處理了）
+  for (const x of [...open].reverse()) {
+    grouped.set(x.rep.kind, [...(grouped.get(x.rep.kind) ?? []), toItem(x)]);
   }
+
   return {
-    total: parsed.length,
+    total: open.length,
+    triaged: parsed.length - open.length,
     byKind,
-    recent: parsed.slice(-recentLimit).reverse().map(({ taskId, rep }) => ({ taskId, ...rep })),
+    groups: [...grouped.entries()]
+      .map(([kind, items]) => ({ kind, count: items.length, items }))
+      .sort((a, b) => b.count - a.count),
+    recent: open.slice(-recentLimit).reverse().map(toItem),
   };
 }

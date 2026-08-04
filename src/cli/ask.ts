@@ -300,12 +300,14 @@ export function needsConfirmation(action: AskAction): boolean {
  * 讓 agent 自動改調度器是最容易「靜默地弄壞一切」的方向。
  */
 export function frictionInput(
-  ledger: { listEvents(q: { scope: 'task'; kind?: string; limit?: number }): { refId: string | null; detail?: string }[] },
+  ledger: { listEvents(q: { scope: 'task'; kind?: string; limit?: number }): { id: number; refId: string | null; detail?: string }[] },
   limit = 200,
-): { taskId: string; detail?: string }[] {
+): { id: number; taskId: string; detail?: string }[] {
   return ledger
+    // **事件 id 要帶出來**：分診（已解決／不處理／已轉成任務）是掛在「哪一筆回報」上的，
+    // 少了它，畫面上就只能整批處理或完全不能處理。
     .listEvents({ scope: 'task', kind: FRICTION_EVENT, limit })
-    .map((e) => ({ taskId: e.refId ?? '(unknown)', ...(e.detail ? { detail: e.detail } : {}) }));
+    .map((e) => ({ id: e.id, taskId: e.refId ?? '(unknown)', ...(e.detail ? { detail: e.detail } : {}) }));
 }
 
 export function formatFriction(s: FrictionSummary): string {
