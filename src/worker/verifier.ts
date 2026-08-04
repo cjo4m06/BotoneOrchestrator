@@ -1,6 +1,5 @@
 import { execa } from 'execa';
-import type { CheckContext, CheckRecorder } from './check-recorder.js';
-import { createHash } from 'node:crypto';
+import { splitOutput, type CheckContext, type CheckRecorder } from './check-recorder.js';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
@@ -179,13 +178,24 @@ export const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 const GIT_TIMEOUT_MS = 10_000;
 
 /**
- * 固定的失敗識別字串。**絕不可帶變動內容**（檔名、數量、耗時），
- * 否則結果簽章每輪都變，無進展偵測（§D11）就永遠抓不到空轉。
+ * 失敗**種類**的固定碼。這是路由碼，不是從輸出猜出來的語意——
+ * 它由驗證器自己產生（我拒絕執行了／我逾時了／我根本沒跑起來），
+ * 是一組封閉的列舉，下游靠它分辨「這三種執行失敗」而不必去讀那段中文。
+ *
+ * 已經刪掉的是另一件事：先前還有一個 `extractFailingIds(output)`，
+ * 用正則從測試輸出裡撈「失敗的測試叫什麼」。那個只認得 TAP／node:test／jest 三種格式，
+ * 換一套工具鏈就靜默回空陣列——那是程式在猜語意，讀輸出是 agent 的事。
  */
 const ID_NO_CHANGES = 'no-changes';
 const ID_DIFF_UNAVAILABLE = 'unavailable';
 const ID_TIMEOUT = 'timeout';
 const ID_NO_GATES = 'no-gates';
+/**
+ * check_runs 裡代表「設定事實」的固定 command 標記（不是真的跑過的指令）。
+ * 讀的人靠它分辨「這個專案沒設關卡」與「關卡還沒跑」——那兩件事在一張空表上長得一樣。
+ */
+export const NO_GATES_COMMAND = '（設定事實）本專案沒有任何可執行的關卡';
+export const ONLY_DIFF_COMMAND = '（設定事實）只有 diff 非空關卡，沒有任何驗證指令';
 /** 視覺關卡執行期例外（量測端壞掉）。不帶錯誤訊息，簽章才穩定。 */
 const ID_VISUAL_ERROR = 'visual-error';
 /** 關卡指令命中紅線而被拒絕執行。 */
@@ -346,21 +356,51 @@ export class Verifier {
       // 否則回饋是一片空白，agent 只能亂猜亂改。
       checks.push({ name: 'config', ok: false, detail: NO_GATES_DETAIL, failingIds: [ID_NO_GATES] });
       this.log.error({ cwd: input.cwd }, 'DoD：本專案沒有任何可執行的關卡，無法判定完成（請補 projects.yaml 的 commands）');
+      // **「零關卡」必須是一件查得到的事實，不是「查無資料」。**
+      //
+      // check_runs 是事後查證唯一的依據，而審查者／合併者去查的時候，
+      // 「這個專案沒設關卡」與「關卡還沒跑」在一張空表上長得一模一樣——
+      // 前者代表「這裡永遠不會有把關」，後者代表「再等一下」，處置完全相反。
+      this.recordConfigFact(NO_GATES_COMMAND, NO_GATES_DETAIL);
     } else if (commandsRun === 0 && !visualRan) {
       // 只剩 diff 關卡且它過了 → 算綠（否則任務永遠跑不完），但驗證強度很弱，必須留痕。
       checks.push({ name: 'config', ok: true, detail: ONLY_DIFF_DETAIL });
       this.log.warn({ cwd: input.cwd }, 'DoD：本專案未設定驗證指令，僅以「diff 非空」判定完成（把關強度很弱）');
+      this.recordConfigFact(ONLY_DIFF_COMMAND, ONLY_DIFF_DETAIL);
     }
 
     const green = effective > 0 && checks.every((c) => c.ok);
     return this.finish(green, checks, screenshots);
   }
 
-  /** 統一收尾：算簽章、記 log、組報告（短路路徑也走這裡，確保簽章規則一致）。 */
+  /**
+   * 把一件「設定層面的事實」記成 check_run。
+   *
+   * exit code 刻意不填：那代表**沒有指令跑過**，與「跑了而且失敗（非 0）」是不同的事。
+   * command 用固定字串當標記，讀的人（與之後的查詢）靠它認出這是設定事實而非執行結果。
+   */
+  private recordConfigFact(command: string, detail: string): void {
+    const ctx = this.deps.checkContext;
+    if (!this.deps.checkRecorder || !ctx) return;
+    const now = Date.now();
+    this.deps.checkRecorder.record({
+      repo: ctx.repo,
+      ...(ctx.branch ? { branch: ctx.branch } : {}),
+      workspaceKind: ctx.workspaceKind,
+      command,
+      ...(ctx.headSha ? { headSha: ctx.headSha } : {}),
+      ...(ctx.verifiedBaseSha ? { verifiedBaseSha: ctx.verifiedBaseSha } : {}),
+      output: detail,
+      requestedBy: ctx.requestedBy,
+      startedAt: now,
+      endedAt: now,
+    });
+  }
+
+  /** 統一收尾：記 log、組報告（短路路徑也走這裡）。 */
   private finish(green: boolean, checks: CheckResult[], screenshots?: string[]): GateReport {
-    const signature = this.signature(checks);
-    this.log.info({ green, checks: checks.map((c) => `${c.name}:${c.ok ? 'ok' : 'fail'}`), signature }, 'DoD 關卡結果');
-    return screenshots ? { green, checks, signature, screenshots } : { green, checks, signature };
+    this.log.info({ green, checks: checks.map((c) => `${c.name}:${c.ok ? 'ok' : 'fail'}`) }, 'DoD 關卡結果');
+    return screenshots ? { green, checks, screenshots } : { green, checks };
   }
 
   /**
@@ -605,7 +645,6 @@ export class Verifier {
         `關卡指令：${cmd}\n` +
         '調度器絕不代為執行部署（DESIGN §10）。請把部署動作移出這個關卡會跑到的 script' +
         '（例如改由 CI 或人工執行），或在 projects.yaml 改用不含部署的指令。';
-      // 固定 id：設定沒改的話每輪都一樣，無進展偵測才抓得到（不會無限重試）
       return { result: { name, ok: false, detail, failingIds: [ID_REDLINE] }, output: detail };
     }
 
@@ -626,8 +665,7 @@ export class Verifier {
       const detail =
         `逾時：指令超過 ${timeoutMs}ms 仍未結束，已被終止。` +
         `\n可能是測試/建置卡住（等待輸入、watch 模式、等不到的服務），或這個專案本來就需要更長時間` +
-        `（可調 projects.yaml 的驗證逾時設定）。\n最後輸出：\n${lastLines(output, 20)}`;
-      // 固定 id：逾時反覆發生時簽章要一致，才會被無進展偵測抓到
+        `（可調 projects.yaml 的驗證逾時設定）。\n被終止前的輸出：\n${splitOutput(output).inline}`;
       return {
         result: { name, ok: false, detail, failingIds: [ID_TIMEOUT] },
         ...(res.exitCode === undefined ? {} : { exitCode: res.exitCode }),
@@ -645,31 +683,23 @@ export class Verifier {
     }
 
     const ok = res.exitCode === 0;
+    // **紅了就把整份輸出交出去，不挑行、不抽測試名。**
+    //
+    // 先前這裡做兩件事：`lastLines(output, 30)` 只留最後 30 行，
+    // 以及用正則從輸出撈「失敗的測試叫什麼」。兩件都是程式在**猜語意**：
+    // · 最後 30 行對 vitest 是摘要、對 tsc 是最後幾個錯誤、對 gradle 是一堆進度條——
+    //   換一個工具鏈就會剛好切掉真正的失敗原因，而且切掉了沒有人會知道。
+    // · 抽測試名的正則只認得 TAP／node:test／jest 三種格式，其餘一律回空陣列。
+    //
+    // 讀得懂輸出的是 agent，不是這裡。超長輸出用 splitOutput 保留頭尾並**明講省略了幾個字元**
+    //（全文在 check_runs 的 output_path），這與「悄悄只留 30 行」是不同的事。
     return {
-      result: {
-        name,
-        ok,
-        detail: ok ? 'ok' : lastLines(output, 30),
-        failingIds: ok ? undefined : extractFailingIds(output),
-      },
+      result: { name, ok, detail: ok ? 'ok' : splitOutput(output).inline },
       exitCode: res.exitCode,
       output,
     };
   }
 
-  /**
-   * 結果簽章 = 失敗關卡名 + 正規化後的失敗測試/錯誤 id 之排序雜湊。
-   * 「同一批東西一直紅」→ 簽章不變 → 無進展偵測會抓到。
-   * 視覺關卡刻意只提供穩定的 failingIds（斷點+路徑、元素定位字串），
-   * 浮動的像素差百分比只出現在 detail，不會進簽章。
-   */
-  private signature(checks: CheckResult[]): string {
-    const failing = checks
-      .filter((c) => !c.ok)
-      .map((c) => `${c.name}:${[...(c.failingIds ?? [])].sort().join(',')}`)
-      .sort();
-    return createHash('sha1').update(failing.join('|')).digest('hex').slice(0, 16);
-  }
 }
 
 /** 實跑關卡指令（獨立成函式，讓呼叫端拿得到 execa 依選項推導出的結果型別）。 */
@@ -878,22 +908,3 @@ function firstLine(s: string): string {
   return s.split('\n')[0] ?? s;
 }
 
-/**
- * 從輸出盡力抽出失敗識別（TAP / node:test / jest 常見格式）。
- * 需正規化掉「每次都變」的雜訊（如耗時 (0.85ms)），否則簽章不穩、無進展偵測失效。
- */
-function extractFailingIds(output: string): string[] {
-  const ids = new Set<string>();
-  for (const raw of output.split('\n')) {
-    const line = raw.trim();
-    const tap = /^not ok \d+ - (.+)$/.exec(line);
-    const mark = /^[✖✗×]\s+(.+)$/.exec(line);
-    const fail = /^FAIL\s+(.+)$/.exec(line);
-    let g = tap?.[1] ?? mark?.[1] ?? fail?.[1];
-    if (!g) continue;
-    g = g.replace(/\s*\(\d[\d.]*\s*m?s\)\s*$/i, '').trim(); // 去耗時 (0.85ms)/(1.2s)
-    if (!g || /^(failing|passing|todo|skipped)\s+tests:?$/i.test(g)) continue; // 濾掉區段標題
-    ids.add(g);
-  }
-  return [...ids];
-}

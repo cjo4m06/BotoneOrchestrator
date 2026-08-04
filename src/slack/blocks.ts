@@ -261,12 +261,6 @@ export function eventBlocks(event: LifecycleEvent, opts: EventBlockOptions = {})
   const mention = shouldMention(event) ? mentionPrefix(opts.mentions) : '';
   const blocks: KnownBlock[] = [section(truncate(`${mention}${summarizeEvent(event)}`, LIMIT_SECTION))];
 
-  // 只有需要人介入的事件才附細節，其餘保持一行，避免 thread 變長
-  if (event.type === 'stalled') {
-    const failed = event.gate.checks.filter((c) => !c.ok).map((c) => `• ${c.name}：${c.detail}`);
-    if (failed.length > 0) blocks.push(context(truncate(failed.join('\n'), LIMIT_SECTION)));
-    blocks.push(context(`結果簽章：\`${event.gate.signature}\``));
-  }
   return blocks;
 }
 
@@ -276,7 +270,7 @@ export function eventText(event: LifecycleEvent): string {
 
 /** 只有提問與失敗類事件才 @人（噪音控制）。 */
 function shouldMention(event: LifecycleEvent): boolean {
-  return event.type === 'failed' || event.type === 'problem' || event.type === 'stalled';
+  return event.type === 'failed' || event.type === 'problem';
 }
 
 function mentionPrefix(users: string[] | undefined): string {

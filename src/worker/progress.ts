@@ -60,9 +60,12 @@ export class ProgressMonitor {
     st.lastRound = round;
     st.seq += 1;
 
-    this.ledger.recordIteration(taskId, st.seq, gate.signature, gate.green, diffHash);
+    // 第 14 片起 gate.signature 恆為 undefined（驗證器不再算簽章），
+    // 這整個模組已無呼叫端，留到第 15 片與 task_iterations 一起刪。
+    const signature = gate.signature ?? '';
+    this.ledger.recordIteration(taskId, st.seq, signature, gate.green, diffHash);
 
-    st.recent.unshift(gate.signature);
+    st.recent.unshift(signature);
     if (st.recent.length > need) st.recent.length = need;
 
     // 綠燈豁免：已達標就不該同時被標成卡牆

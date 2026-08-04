@@ -15,9 +15,7 @@ import { Ledger } from '../src/store/ledger.js';
 import { WorktreeManager } from '../src/git/worktree.js';
 import { Verifier } from '../src/worker/verifier.js';
 import { AgentRuntime } from '../src/worker/agent-runtime.js';
-import { ProgressMonitor } from '../src/worker/progress.js';
 import { ConsoleNotifier } from '../src/notify/notifier.js';
-import { gitDiffHash } from '../src/git/status.js';
 import { Worker } from '../src/worker/worker.js';
 import type { AgentLike, McpTaskClient } from '../src/contracts.js';
 import type { McpOut, TaskBrief, TaskDetail } from '../src/types.js';
@@ -113,10 +111,8 @@ async function main() {
     mcp,
     agent: DRY ? dryAgent : new AgentRuntime(log),
     verifier: new Verifier(log),
-    progress: new ProgressMonitor(ledger, 3),
     ledger,
     notifier: new ConsoleNotifier(log),
-    diffHash: gitDiffHash,
     log,
   });
 

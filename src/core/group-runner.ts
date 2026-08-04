@@ -3,7 +3,6 @@ import { copyFileSync, existsSync, readdirSync, rmSync, symlinkSync } from 'node
 import { join } from 'node:path';
 import { WorktreeManager } from '../git/worktree.js';
 import { Worker } from '../worker/worker.js';
-import { ProgressMonitor } from '../worker/progress.js';
 import { MergeGuard, type BaseFreshness, type DriftJudgeLike, type MergeGuardInput, type MergeGuardOptions } from '../pr/merge-guard.js';
 import { PrManager } from '../pr/pr-manager.js';
 import { generatePrBody, narrativeFromSummaries, type AgentSummary } from '../pr/pr-body.js';
@@ -874,10 +873,8 @@ export class GroupRunner {
       verifier: this.deps.makeVerifier({
         repo: group.repo, branch: group.branch, workspaceKind: 'group_tree', requestedBy: 'coder',
       }),
-      progress: new ProgressMonitor(ledger, this.deps.progressRounds),
       ledger,
       notifier: this.deps.notifier,
-      diffHash: this.deps.diffHash ?? gitDiffHash,
       log,
       ...(this.deps.reviewer ? { reviewer: this.deps.reviewer } : {}),
       ...(this.deps.noChangePolicy ? { noChangePolicy: this.deps.noChangePolicy } : {}),

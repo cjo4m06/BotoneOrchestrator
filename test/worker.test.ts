@@ -2,7 +2,6 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import Database from 'better-sqlite3';
 import assert from 'node:assert/strict';
 import { Worker, type WorkerDeps } from '../src/worker/worker.js';
-import { ProgressMonitor } from '../src/worker/progress.js';
 import { Verifier, gitHeadRef, type VerifierConfig } from '../src/worker/verifier.js';
 import type { AgentLike, McpTaskClient, Notifier, ReviewerLike, VerifierLike } from '../src/contracts.js';
 import type { IterateInput, IterateResult, LoadedDoc, NoChangeCapture } from '../src/worker/agent-runtime.js';
@@ -165,10 +164,8 @@ describe('Worker — 單任務監督迴圈', () => {
       mcp: fakeMcp(),
       agent: fakeAgent([{}]),
       verifier: fakeVerifier([green()]),
-      progress: new ProgressMonitor(tmp.ledger, 3),
       ledger: tmp.ledger,
       notifier: fakeNotifier(),
-      diffHash: async () => 'd1',
       // 預設不碰 git（cwd 是假路徑）：diff 非空關卡另有專屬測試
       headRef: async () => undefined,
       // 退避不真的睡；jitter 的 random 固定成 0.5 → 延遲等於理論值，可精確斷言
@@ -453,24 +450,28 @@ describe('Worker — 單任務監督迴圈', () => {
     assert.ok(notifier.events.some((e) => e.type === 'problem' && e.detail.includes('agent 執行錯誤')));
   });
 
-  it('無進展（簽章連續 N 輪相同）→ 只通知 stalled，不中止任務', async () => {
+  /**
+   * 「無進展偵測」已於第 14 片下線。
+   *
+   * 它的判準是結果簽章連續 N 輪相同，而簽章 ＝ 失敗關卡名 ＋ 從輸出用正則撈到的失敗測試名。
+   * 撈那一步只認得 TAP／node:test／jest 三種格式，其他工具鏈一律回空陣列——
+   * 簽章因此退化成「哪幾條關卡是紅的」，於是 agent 每輪都在修不同的東西、輸出完全不同，
+   * 只要 `test` 這條還沒轉綠就會被判成「卡在同一處」。那是誤報製造機，不是保護。
+   *
+   * 取代它的是輪數上限（下面那條測試），那是一個數得清楚、不必猜語意的界線。
+   */
+  it('反覆紅燈但沒撞到輪數上限 → 照樣跑到綠，不會被誤判成卡住而中止', async () => {
     const task = makeTask();
     seed(task);
     const notifier = fakeNotifier();
     const { worker } = build({
-      // 連兩輪同一簽章 → 第 2 輪判定卡牆；第 3 輪轉綠
       verifier: fakeVerifier([red('same'), red('same'), green()]),
-      progress: new ProgressMonitor(tmp.ledger, 2),
       notifier,
     });
 
     const out = await worker.runTask({ task, ...cfg });
 
-    assert.deepEqual(out, { status: 'done' }, '卡牆只通知，不能中止任務');
-    const stalls = notifier.events.filter((e) => e.type === 'stalled');
-    assert.equal(stalls.length, 1);
-    // 迭代歷史有落地（供之後診斷）
-    assert.deepEqual(tmp.ledger.recentSignatures('T-1', 3), ['green', 'same', 'same']);
+    assert.deepEqual(out, { status: 'done' });
   });
 
   it('bug 類完成 → complete_task 帶 summary 修復報告', async () => {
@@ -536,15 +537,41 @@ describe('Worker — 單任務監督迴圈', () => {
     assert.equal(mcp.completeCalls.length, 1, '只有綠燈那輪才呼叫 complete_task');
   });
 
-  it('diffHash 以 worktree 路徑呼叫，並寫入迭代紀錄', async () => {
+  // diffHash 這個依賴隨無進展偵測一起退場（第 14 片）：它算的是工作區指紋，唯一的讀者是 progress.record。
+
+  /**
+   * **回灌管道是靜默失效的高風險區。**
+   *
+   * 接線斷掉時 typecheck 全綠、測試全綠、log 也不會有錯誤，只有 agent 開始盲改——
+   * 而那要好幾輪之後才看得出來，看出來時已經燒掉一整群的預算。所以這兩件事要被測住：
+   * (1) 上一輪的失敗真的送到 agent 手上；(2) 「它收到了什麼」查得到，不必去翻 log 猜。
+   */
+  it('上一輪的失敗（含完整輸出）要出現在 agent 下一輪的輸入，而且原樣落成事件', async () => {
     const task = makeTask();
     seed(task);
-    const seen: string[] = [];
-    const { worker } = build({ diffHash: async (cwd) => (seen.push(cwd), 'hash-x') });
+    const agent = fakeAgent([{}, {}]);
+    const longOutput = ['逾時：指令超過 600000ms 仍未結束', ...Array.from({ length: 120 }, (_, i) => `輸出第 ${i} 行`)].join('\n');
+    const { worker } = build({
+      agent,
+      verifier: fakeVerifier([
+        { green: false, checks: [{ name: 'test', ok: false, detail: longOutput, failingIds: ['timeout'] }] },
+        green(),
+      ]),
+    });
 
-    await worker.runTask({ task, cwd: '/tmp/worktree-a', verifierConfig: {} });
+    await worker.runTask({ task, ...cfg });
 
-    assert.deepEqual(seen, ['/tmp/worktree-a']);
+    // (1) 送到 agent 面前
+    const second = agent.inputs[1];
+    assert.ok(second?.feedback, '第二輪的 agent 必須收得到上一輪的失敗，否則它只能盲改');
+    const sentDetail = second.feedback?.checks.find((c) => !c.ok)?.detail ?? '';
+    assert.match(sentDetail, /輸出第 119 行/, '完整輸出要在——只留最後幾行的話真正的失敗原因可能剛好被切掉');
+
+    // (2) 查得到
+    const ev = tmp.ledger.latestEvent('task', 'T-1', 'feedback_to_agent');
+    assert.ok(ev, '「agent 這一輪收到了什麼」必須是查得到的事實');
+    assert.match(ev?.detail ?? '', /\[test\]（timeout）/, '記的要是 prompt 實際會輸出的那段，不是另外拼的摘要');
+    assert.match(ev?.detail ?? '', /輸出第 119 行/);
   });
 
   it('回饋只在真的有失敗關卡時才傳給 agent（空失敗清單不回灌）', async () => {
@@ -1289,13 +1316,12 @@ describe('Worker — 單任務監督迴圈', () => {
       );
     });
 
-    it('reviewer 否決納入無進展簽章：同一批違規重複出現 → 通知 stalled（不中止）', async () => {
+    it('reviewer 連續否決同一批違規 → 仍然續做，最後轉綠', async () => {
       const task = makeTask();
       seed(task);
       const notifier = fakeNotifier();
       const { worker } = build({
         notifier,
-        progress: new ProgressMonitor(tmp.ledger, 2),
         reviewer: fakeReviewer([fails('A'), fails('A'), { status: 'pass', notes: [] }]),
         maxReviewRejections: 5,
       });
@@ -1303,10 +1329,6 @@ describe('Worker — 單任務監督迴圈', () => {
       const out = await worker.runTask({ task, ...cfg });
 
       assert.deepEqual(out, { status: 'done' });
-      assert.equal(notifier.events.filter((e) => e.type === 'stalled').length, 1);
-      // DoD 全綠但 reviewer 否決的兩輪，簽章要落地成同一枚（否則偵測不到空轉）
-      const sigs = tmp.ledger.recentSignatures('T-1', 3);
-      assert.equal(sigs[1], sigs[2]);
     });
   });
 
@@ -1547,10 +1569,8 @@ describe('Worker — 每輪都記 session（含非互動）', () => {
       mcp: fakeMcp(),
       agent: fakeAgent([{}]),
       verifier: fakeVerifier([green()]),
-      progress: new ProgressMonitor(tmp.ledger, 3),
       ledger: tmp.ledger,
       notifier: fakeNotifier(),
-      diffHash: async () => 'd1',
       headRef: async () => undefined,
       sleep: async () => {},
       errorBackoff: { random: () => 0.5 },

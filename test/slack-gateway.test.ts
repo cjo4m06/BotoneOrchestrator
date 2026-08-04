@@ -180,21 +180,19 @@ test('噪音控制：例行迭代降頻、docs_read 只推一次、狀態轉移�
   assert.equal(posted.filter((t) => t.includes('已合併')).length, 1);
 });
 
-test('EventThrottle：卡牆與重複問題有冷卻，時間到就放行', () => {
+test('EventThrottle：重複的「遇到問題」有冷卻，時間到就放行', () => {
   let now = 1_000_000;
-  const th = new EventThrottle({ stalledCooldownMs: 1000, problemCooldownMs: 1000 }, () => now);
-  const gate = { green: false, signature: 's', checks: [] };
-  assert.equal(th.allow('t1', { type: 'stalled', gate }), true);
-  assert.equal(th.allow('t1', { type: 'stalled', gate }), false);
-  now += 1001;
-  assert.equal(th.allow('t1', { type: 'stalled', gate }), true);
+  const th = new EventThrottle({ problemCooldownMs: 1000 }, () => now);
 
   assert.equal(th.allow('t1', { type: 'problem', detail: '429' }), true);
   assert.equal(th.allow('t1', { type: 'problem', detail: '429' }), false);
   assert.equal(th.allow('t1', { type: 'problem', detail: '500' }), true); // 不同問題照推
+  now += 1001;
+  assert.equal(th.allow('t1', { type: 'problem', detail: '429' }), true);
   // 節流狀態逐 thread 獨立
-  assert.equal(th.allow('t2', { type: 'stalled', gate }), true);
+  assert.equal(th.allow('t2', { type: 'problem', detail: '429' }), true);
 });
+
 
 test('postScreenshots：uploadV2 帶 channel id、thread_ts 與檔名；不存在的檔案略過', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'slack-shot-'));

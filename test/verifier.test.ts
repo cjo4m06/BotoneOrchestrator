@@ -80,91 +80,28 @@ describe('Verifier — DoD 關卡', () => {
     assert.equal(gate.signature, again.signature);
   });
 
-  describe('failingIds 抽取與正規化', () => {
-    it('抽出 TAP / 符號標記 / FAIL 三種格式', async () => {
-      const gate = await verifier.check({
-        cwd: dir.path,
-        config: {
-          test: fail(['not ok 1 - tap 案例', '✖ mark 案例', 'FAIL src/foo.test.ts']),
-        },
-      });
+  /**
+   * 「從輸出撈失敗的測試叫什麼」整段退場（第 14 片）。
+   *
+   * 那是一個只認得 TAP／node:test／jest 三種格式的正則。換一套工具鏈（vitest 的
+   * 摘要、tsc 的錯誤、gradle 的 report）就靜默回空陣列，而下游還是用肯定句
+   * 對 agent 說「失敗項：…」。讀得懂輸出的是 agent，不是這裡——現在整份原始輸出直接交給它。
+   *
+   * 保留下來的 failingIds 只剩**種類碼**（redline / timeout / exec-error /
+   * no-changes / unavailable / no-gates）：那些由驗證器自己產生，是封閉的列舉，
+   * 不是從輸出猜出來的語意。它們各自的測試在下面。
+   */
 
-      const ids = gate.checks[0]?.failingIds ?? [];
-      assert.deepEqual([...ids].sort(), ['mark 案例', 'src/foo.test.ts', 'tap 案例'].sort());
-    });
+  /**
+   * 「結果簽章」整段退場（第 14 片）。
+   *
+   * 它是無進展偵測的資料源：失敗關卡名 ＋ 從輸出撈到的失敗測試名，雜湊起來比對。
+   * 撈失敗測試名那一半只認得三種格式（見上方說明），其餘一律空陣列——
+   * 簽章因此退化成「哪幾條關卡是紅的」，於是 agent 每輪都在修不同的東西也會被判成空轉。
+   *
+   * 取代它的是輪數上限：數得清楚、不必猜語意，撞到時保留全部現場交人。
+   */
 
-    it('去掉耗時雜訊 (0.85ms) / (1.2s)，並濾掉區段標題', async () => {
-      const gate = await verifier.check({
-        cwd: dir.path,
-        config: {
-          test: fail(['✖ failing tests:', 'not ok 1 - alpha (0.85ms)', '✖ beta (1.2s)']),
-        },
-      });
-
-      const ids = gate.checks[0]?.failingIds ?? [];
-      assert.deepEqual([...ids].sort(), ['alpha', 'beta']);
-      assert.ok(!ids.includes('failing tests:'), '區段標題不該被當成失敗項');
-    });
-
-    it('重複出現的同一失敗只計一次', async () => {
-      const gate = await verifier.check({
-        cwd: dir.path,
-        config: { test: fail(['not ok 1 - alpha (1ms)', 'not ok 2 - alpha (9ms)']) },
-      });
-      assert.deepEqual(gate.checks[0]?.failingIds, ['alpha']);
-    });
-
-    it('通過的關卡不帶 failingIds', async () => {
-      const gate = await verifier.check({ cwd: dir.path, config: { lint: OK } });
-      assert.equal(gate.checks[0]?.failingIds, undefined);
-    });
-  });
-
-  describe('結果簽章（無進展偵測的基礎）', () => {
-    it('同一批失敗、只有耗時不同 → 簽章相同', async () => {
-      const a = await verifier.check({
-        cwd: dir.path,
-        config: { test: fail(['not ok 1 - alpha (0.85ms)', 'not ok 2 - beta (3.10ms)']) },
-      });
-      const b = await verifier.check({
-        cwd: dir.path,
-        config: { test: fail(['not ok 1 - alpha (91.4ms)', 'not ok 2 - beta (1.2s)']) },
-      });
-
-      assert.equal(a.green, false);
-      assert.equal(a.signature, b.signature);
-    });
-
-    it('失敗項順序不同 → 簽章仍相同（有排序正規化）', async () => {
-      const a = await verifier.check({
-        cwd: dir.path,
-        config: { test: fail(['not ok 1 - alpha', 'not ok 2 - beta']) },
-      });
-      const b = await verifier.check({
-        cwd: dir.path,
-        config: { test: fail(['not ok 1 - beta', 'not ok 2 - alpha']) },
-      });
-      assert.equal(a.signature, b.signature);
-    });
-
-    it('失敗內容改變 → 簽章改變（代表有進展）', async () => {
-      const a = await verifier.check({ cwd: dir.path, config: { test: fail(['not ok 1 - alpha']) } });
-      const b = await verifier.check({ cwd: dir.path, config: { test: fail(['not ok 1 - gamma']) } });
-      assert.notEqual(a.signature, b.signature);
-    });
-
-    it('同一批失敗但發生在不同關卡 → 簽章不同', async () => {
-      const a = await verifier.check({ cwd: dir.path, config: { lint: fail(['not ok 1 - alpha']) } });
-      const b = await verifier.check({ cwd: dir.path, config: { test: fail(['not ok 1 - alpha']) } });
-      assert.notEqual(a.signature, b.signature);
-    });
-
-    it('由紅轉綠 → 簽章改變', async () => {
-      const red = await verifier.check({ cwd: dir.path, config: { test: fail(['not ok 1 - alpha']) } });
-      const green = await verifier.check({ cwd: dir.path, config: { test: OK } });
-      assert.notEqual(red.signature, green.signature);
-    });
-  });
 
   it('指令在指定 cwd 執行', async () => {
     const sub = dir.join('sub');
@@ -255,14 +192,18 @@ describe('Verifier — diff 非空關卡', () => {
     assert.deepEqual(gate.checks.map((c) => c.name), ['diff']);
   });
 
-  it('零變更兩輪 → 簽章相同（無進展偵測抓得到空轉）', async () => {
+  it('零變更兩輪 → 兩輪都給同一個種類碼，且與「測試紅」分得開', async () => {
     const cfg = cfgWith(repo.head());
     const a = await verifier.check({ cwd: repo.path, config: cfg });
     const b = await verifier.check({ cwd: repo.path, config: cfg });
-    assert.equal(a.signature, b.signature);
-    // 與「測試紅」要區分得開
+
+    // 種類碼是驗證器自己產生的封閉列舉（不是從輸出猜的），下游靠它分辨
+    // 「這一輪什麼都沒改」與「改了但測試紅」——那兩件事的處置完全不同。
+    assert.deepEqual(a.checks[0]?.failingIds, ['no-changes']);
+    assert.deepEqual(b.checks[0]?.failingIds, ['no-changes']);
+
     const redGate = await verifier.check({ cwd: repo.path, config: { test: fail(['not ok 1 - alpha']) } });
-    assert.notEqual(a.signature, redGate.signature);
+    assert.notDeepEqual(redGate.checks[0]?.failingIds, ['no-changes']);
   });
 
   it('修改既有檔案 → 算變更，其餘關卡照跑', async () => {
@@ -753,15 +694,14 @@ describe('Verifier — 視覺關卡整合', () => {
         assert.equal(notified, 0);
       });
 
-      it('執行期例外反覆發生 → 簽章相同，且與「頁面爆版」的簽章不同', async () => {
+      it('執行期例外的種類碼固定，不帶錯誤訊息（訊息每次都不一樣）', async () => {
         const a = await build(async () => { throw new Error('崩潰 A'); }).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
         const b = await build(async () => { throw new Error('崩潰 B（訊息不同）'); }).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-        assert.equal(a.signature, b.signature, '錯誤訊息不可進簽章，否則無進展偵測失效');
 
-        const overflow = await build(
-          failedVisual([{ name: 'visual:overflow-x', ok: false, detail: 'x', failingIds: ['mobile/::document'] }]),
-        ).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-        assert.notEqual(a.signature, overflow.signature);
+        assert.deepEqual(a.checks.at(-1)?.failingIds, ['visual-error']);
+        assert.deepEqual(b.checks.at(-1)?.failingIds, ['visual-error']);
+        assert.equal(a.green, false);
+        assert.equal(b.green, false);
       });
     });
 
@@ -790,38 +730,9 @@ describe('Verifier — 視覺關卡整合', () => {
     });
   });
 
-  describe('簽章穩定性（無進展偵測的基礎）', () => {
-    const overflow = (detail: string): VisualResult =>
-      failedVisual([{ name: 'visual:overflow-x', ok: false, detail, failingIds: ['mobile/::document'] }]);
-
-    it('同一批視覺問題、detail 的像素/百分比不同 → 簽章相同', async () => {
-      const a = await build(overflow('溢出 145px')).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-      const b = await build(overflow('溢出 146.4px（差異 3.71%）')).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-
-      assert.equal(a.green, false);
-      assert.equal(a.signature, b.signature);
-    });
-
-    it('視覺失敗項改變 → 簽章改變（代表有進展）', async () => {
-      const a = await build(overflow('x')).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-      const b = await build(
-        failedVisual([{ name: 'visual:overflow-x', ok: false, detail: 'x', failingIds: ['desktop/::document'] }]),
-      ).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-      assert.notEqual(a.signature, b.signature);
-    });
-
-    it('視覺紅 vs 只有指令紅 → 簽章不同（簽章確實吃到視覺結果）', async () => {
-      const withVisual = await build(overflow('x')).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-      const cmdOnly = await build().verifier.check({ cwd: dir.path, config: OK_CMDS });
-      assert.notEqual(withVisual.signature, cmdOnly.signature);
-    });
-
-    it('跳過的視覺說明 check 不影響簽章', async () => {
-      const skipped = await build(skippedVisual()).verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL } });
-      const none = await build().verifier.check({ cwd: dir.path, config: OK_CMDS });
-      assert.equal(skipped.signature, none.signature);
-    });
-  });
+  // 「簽章穩定性」整段退場（第 14 片）：簽章已經沒有人算了，見檔案上方的說明。
+  // 這裡原本守的性質——浮動數字（像素差 %、耗時）不可影響判定——由「種類碼不帶變動內容」
+  // 那幾條測試接手（見上面的 visual-error 與 no-changes）。
 
   describe('截圖目錄（不可落在 worktree 內）', () => {
     it('預設目錄在 worktree 外，並依任務 id 分層', async () => {

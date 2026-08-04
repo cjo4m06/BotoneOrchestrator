@@ -183,20 +183,9 @@ test('eventBlocks：失敗與提問類事件才 @人', () => {
   assert.doesNotMatch(allText(eventBlocks({ type: 'merged' }, { mentions: ['U1'] })), /<@U1>/);
 });
 
-test('eventBlocks：stalled 附失敗項目與結果簽章', () => {
-  const gate: GateReport = {
-    green: false,
-    signature: 'sig-abc',
-    checks: [
-      { name: 'test', ok: false, detail: '3 failed' },
-      { name: 'build', ok: true, detail: 'ok' },
-    ],
-  };
-  const text = allText(eventBlocks({ type: 'stalled', gate }));
-  assert.match(text, /test：3 failed/);
-  assert.doesNotMatch(text, /build/); // 只列失敗項
-  assert.match(text, /sig-abc/);
-});
+// 「卡牆」事件已於第 14 片下線：它的判準是結果簽章連續 N 輪不變，而簽章裡
+// 「失敗測試名」那一半只認得三種測試框架的輸出格式，其他工具鏈一律撈不到——
+// 簽章退化成「哪幾條關卡是紅的」，於是 agent 每輪都在改不同的東西也會被判成卡住。
 
 test('eventText：與 console 通知共用同一份文案', () => {
   assert.equal(eventText({ type: 'claimed' }), '🟡 已認領');

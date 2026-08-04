@@ -16,9 +16,7 @@ import { createLogger } from '../src/observability/logger.js';
 import { Ledger } from '../src/store/ledger.js';
 import { Verifier } from '../src/worker/verifier.js';
 import { AgentRuntime } from '../src/worker/agent-runtime.js';
-import { ProgressMonitor } from '../src/worker/progress.js';
 import { ConsoleNotifier } from '../src/notify/notifier.js';
-import { gitDiffHash } from '../src/git/status.js';
 import { Worker } from '../src/worker/worker.js';
 import { PmmMcpClient } from '../src/mcp/mcp-client.js';
 import { PrManager } from '../src/pr/pr-manager.js';
@@ -95,10 +93,8 @@ async function main() {
     mcp: new BoardSafeMcp(client, detail),
     agent: new AgentRuntime(log),
     verifier: new Verifier(log),
-    progress: new ProgressMonitor(ledger, 3),
     ledger,
     notifier: new ConsoleNotifier(log),
-    diffHash: gitDiffHash,
     log,
   });
 

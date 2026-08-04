@@ -23,7 +23,6 @@ describe('summarizeEvent — 生命週期事件文案', () => {
     [{ type: 'docs_read', refs: ['spec/a.md#1'] }, /已讀規格：spec\/a\.md#1/],
     [{ type: 'docs_read', refs: [] }, /（無）/],
     [{ type: 'iterating', round: 3 }, /第 3 輪/],
-    [{ type: 'stalled', gate: makeGateReport({ green: false }) }, /卡在同一處/],
     [{ type: 'problem', detail: '磁碟滿了' }, /遇到問題：磁碟滿了/],
     [{ type: 'pr_open', url: 'https://x/pr/1' }, /PR 已開：https:\/\/x\/pr\/1/],
     [{ type: 'in_review' }, /進入審查/],

@@ -115,16 +115,32 @@ test('回饋只列失敗關卡；通過的關卡不干擾 agent', () => {
   assert.equal(p.includes('typecheck'), false, '通過的關卡不應出現在修正清單');
 });
 
-test('回饋帶 failingIds 時附上具體失敗項', () => {
+/**
+ * failingIds 現在只剩**種類碼**（timeout / redline / exec-error / no-changes…）：
+ * 那是驗證器自己產生的封閉列舉，講的是「這一條是怎麼失敗的」。
+ * 從輸出用正則撈「失敗的測試叫什麼」那一套已於第 14 片下線——它只認得三種格式，
+ * 其餘工具鏈一律撈不到，而下游還是用肯定句對 agent 說「失敗項：…」。
+ */
+test('回饋帶種類碼時把它標出來，讓 agent 分得出這是逾時還是測試紅', () => {
   const p = buildAgentPrompt(
     input({
       feedback: makeGateReport({
         green: false,
-        checks: [{ name: 'test', ok: false, detail: '單元測試紅燈', failingIds: ['auth.spec.ts:12', 'auth.spec.ts:40'] }],
+        checks: [{ name: 'test', ok: false, detail: '逾時：指令超過 600000ms 仍未結束', failingIds: ['timeout'] }],
       }),
     }),
   );
-  assert.match(p, /- \[test\] 單元測試紅燈（失敗項：auth\.spec\.ts:12, auth\.spec\.ts:40）/);
+  assert.match(p, /- \[test\]（timeout） 逾時：指令超過 600000ms 仍未結束/);
+});
+
+test('紅燈的完整輸出原樣進 prompt（不截斷、不挑行）', () => {
+  const output = ['FAIL src/a.test.ts', ...Array.from({ length: 200 }, (_, i) => `  第 ${i} 行細節`)].join('\n');
+  const p = buildAgentPrompt(
+    input({ feedback: makeGateReport({ green: false, checks: [{ name: 'test', ok: false, detail: output }] }) }),
+  );
+
+  assert.match(p, /FAIL src\/a\.test\.ts/, '第一行是失敗的檔名——只留最後 30 行的話它會被切掉');
+  assert.match(p, /第 199 行細節/);
 });
 
 test('failingIds 為空陣列時不輸出括號', () => {

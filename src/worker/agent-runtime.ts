@@ -960,6 +960,32 @@ export function classifyAgentError(input: {
 
 // ── 純函式（可無金鑰單元驗證） ──
 
+/**
+ * 把上一輪的驗證結果渲染成給 agent 看的那一段文字。
+ *
+ * ── 為什麼要抽成函式 ──
+ *
+ * 回灌管道是**靜默失效**的高風險區：typecheck 全綠、測試全綠，但 agent 收不到意見、
+ * 開始盲改，而症狀要好幾輪之後才看得出來。抽出來之後，「agent 這一輪到底收到了什麼」
+ * 可以被原樣記進 ledger 事件——查得到，而不是只能去翻 log 猜。
+ *
+ * 沒有失敗關卡就回 undefined：全綠卻掛「未通過」的標題會讓 agent 去猜哪裡錯、
+ * 反而動到不該動的東西（審查者回灌的報告有可能每一條 check 都是 ok）。
+ */
+export function formatGateFeedback(feedback: GateReport | undefined): string | undefined {
+  const failed = feedback?.checks.filter((c) => !c.ok) ?? [];
+  if (failed.length === 0) return undefined;
+  const lines = ['\n## 上一輪驗證未通過，請修正後再完成'];
+  for (const c of failed) {
+    // failingIds 現在只剩**種類碼**（timeout / redline / exec-error / no-changes…），
+    // 那是驗證器自己產生的封閉列舉，講的是「這一條是怎麼失敗的」。
+    // 從輸出撈失敗測試名的那一套已經下線——原始輸出整份在 detail 裡，讀得懂的是你。
+    const kind = c.failingIds?.length ? `（${c.failingIds.join(', ')}）` : '';
+    lines.push(`- [${c.name}]${kind} ${c.detail}`);
+  }
+  return lines.join('\n');
+}
+
 /** 依任務/規格/回饋組裝 agent prompt。 */
 export function buildAgentPrompt(input: IterateInput): string {
   const p: string[] = [];
@@ -1005,16 +1031,8 @@ export function buildAgentPrompt(input: IterateInput): string {
     p.push(`\n## 澄清答覆\n問題：${input.answer.question}\n答覆：${input.answer.answer}`);
   }
 
-  // 只有真的有失敗關卡才輸出這段：全綠卻掛「未通過」標題會讓 agent 去猜哪裡錯、
-  // 反而動到不該動的東西（reviewer 回灌的 GateReport 有可能所有 checks 都是 ok）。
-  const failed = input.feedback?.checks.filter((c) => !c.ok) ?? [];
-  if (failed.length > 0) {
-    p.push(`\n## 上一輪驗證未通過，請修正後再完成`);
-    for (const c of failed) {
-      const ids = c.failingIds?.length ? `（失敗項：${c.failingIds.join(', ')}）` : '';
-      p.push(`- [${c.name}] ${c.detail}${ids}`);
-    }
-  }
+  const feedbackText = formatGateFeedback(input.feedback);
+  if (feedbackText) p.push(feedbackText);
 
   p.push(
     `\n## 完成要求\n` +

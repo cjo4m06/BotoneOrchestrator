@@ -160,8 +160,6 @@ export interface ThrottleOptions {
   iterateEvery: number;
   /** 兩則迭代事件的最小間隔（毫秒）。 */
   iterateMinIntervalMs: number;
-  /** 卡牆通知冷卻（毫秒），避免同一處反覆洗版。 */
-  stalledCooldownMs: number;
   /** 相同內容的「遇到問題」冷卻（毫秒）。 */
   problemCooldownMs: number;
 }
@@ -169,7 +167,6 @@ export interface ThrottleOptions {
 export const DEFAULT_THROTTLE: ThrottleOptions = {
   iterateEvery: 10,
   iterateMinIntervalMs: 5 * 60_000,
-  stalledCooldownMs: 10 * 60_000,
   problemCooldownMs: 5 * 60_000,
 };
 
@@ -204,10 +201,6 @@ export class EventThrottle {
       case 'docs_read':
         if (s.docsRead) return false;
         s.docsRead = true;
-        return true;
-      case 'stalled':
-        if (t - s.lastStalled < this.opts.stalledCooldownMs) return false;
-        s.lastStalled = t;
         return true;
       case 'problem': {
         const prev = s.lastProblem;

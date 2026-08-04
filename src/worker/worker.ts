@@ -7,8 +7,8 @@ import { RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { AgentLike, McpTaskClient, Notifier, ReviewerLike, TaskCardProgress, VerifierLike } from '../contracts.js';
+import { formatGateFeedback } from './agent-runtime.js';
 import type { AgentErrorKind, ClarificationCapture, IterateResult, LoadedDoc, NoChangeCapture, NoChangeCategory, SdkErrorCode } from './agent-runtime.js';
-import type { ProgressMonitor } from './progress.js';
 import type { ReviewOutcome } from './reviewer.js';
 import type { VerifierConfig } from './verifier.js';
 import type { BlockReason, GateReport, TaskDetail } from '../types.js';
@@ -109,11 +109,8 @@ export interface WorkerDeps {
   mcp: McpTaskClient;
   agent: AgentLike;
   verifier: VerifierLike;
-  progress: ProgressMonitor;
   ledger: Ledger;
   notifier: Notifier;
-  /** 工作區變更指紋（無進展偵測用）。預設 git/status.gitDiffHash，可注入假件。 */
-  diffHash: (cwd: string) => Promise<string>;
   /**
    * 獨立 reviewer（DESIGN §5）。**可選**：未注入 → DoD 綠燈即 complete_task（M1/M2 行為）。
    * 注入後 reviewer 自身也會優雅降級（無金鑰/呼叫失敗 → skipped，不阻擋）。
@@ -211,7 +208,7 @@ export class Worker {
 
   async runTask(input: RunTaskInput): Promise<TaskOutcome> {
     const { task, cwd, verifierConfig, threadTs } = input;
-    const { mcp, agent, verifier, progress, ledger, notifier, diffHash, log } = this.deps;
+    const { mcp, agent, verifier, ledger, notifier, log } = this.deps;
 
     // 1) 認領（MCP 檢查依賴/指派；signal=依賴未到 → 標 blocked）
     let detail: TaskDetail;
@@ -411,16 +408,22 @@ export class Worker {
         }
       }
 
-      // 3e) 無進展偵測用「有效報告」的簽章：reviewer 反覆挑同一批問題時簽章相同，
-      //     一樣會被判卡牆並通知（§D11），不會因為 DoD 綠燈就漏掉這種空轉。
       // 這一輪的結論寫進卡片：綠燈就說綠燈，紅燈就列出是哪些關卡不過。
       // 沒有這行，人只看得到狀態在「執行中／驗證中」之間跳，看不出它到底在修什麼。
       lastOutcome = effective.green
         ? '所有關卡通過'
         : effective.checks.filter((c) => !c.ok).map((c) => c.name).join('、') || '未通過';
 
-      const stall = progress.record(task.id, round, effective, await diffHash(cwd));
-      if (stall.stalled) this.say(threadTs, { type: 'stalled', gate: effective }, detail);
+      // ── 這裡原本有「無進展偵測」，已下線（第 14 片） ──
+      //
+      // 它的判準是「連續 N 輪的結果簽章一模一樣」，而簽章＝失敗關卡名 ＋
+      // 從輸出用正則撈到的失敗測試名。撈那一步只認得 TAP／node:test／jest 三種格式，
+      // 其他工具鏈一律回空陣列——於是簽章退化成「哪幾條關卡是紅的」。
+      // 結果是：agent 每一輪都在修不同的東西、輸出完全不同，只要 `test` 這條還沒轉綠，
+      // 簽章就一模一樣，它會被判定成「卡在同一處」並通知人。那是個誤報製造機。
+      //
+      // 取代它的是**輪數上限**（maxRounds → parkRoundLimit 交人）：那是一個數得清楚、
+      // 不需要猜語意的界線，而且撞到時保留全部現場給人看。
 
       if (effective.green) {
         // 4) 完成 → complete_task（bug 帶 summary，其餘不帶）
@@ -454,6 +457,18 @@ export class Worker {
       //    只有真的有失敗關卡才回灌：空的失敗清單會讓 prompt 出現「上一輪未通過」卻列不出任何項目，
       //    等於要 agent 猜謎（也可能讓它為了「修」而亂改）。
       feedback = actionableFeedback(effective);
+
+      // **把「agent 這一輪收到了什麼」原樣記下來。**
+      //
+      // 回灌是靜默失效的高風險區：接線斷掉時 typecheck 全綠、測試全綠、log 也不會有錯誤，
+      // 只有 agent 開始盲改——而那要好幾輪之後才看得出來，看出來時已經燒掉一整群的預算。
+      // 記的是 buildAgentPrompt **實際會輸出的那段文字**（同一個函式），不是另外拼一份摘要，
+      // 否則這筆紀錄本身就會跟事實脫節。
+      const sent = formatGateFeedback(feedback);
+      ledger.logEvent(
+        'task', task.id, 'feedback_to_agent',
+        sent ?? '（這一輪沒有可回灌的失敗明細——agent 下一輪不會收到「上一輪未通過」那一段）',
+      );
     }
   }
 

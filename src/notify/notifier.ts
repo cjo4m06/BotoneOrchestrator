@@ -22,7 +22,6 @@ export function summarizeEvent(e: LifecycleEvent): string {
     case 'claimed': return '🟡 已認領';
     case 'docs_read': return `📖 已讀規格：${e.refs.join(', ') || '（無）'}`;
     case 'iterating': return `🔧 實作中（第 ${e.round} 輪）`;
-    case 'stalled': return `⚠️ 卡在同一處（結果簽章多輪未改善）`;
     case 'problem': return `⚠️ 遇到問題：${e.detail}`;
     case 'pr_open': return `🚀 PR 已開：${e.url}`;
     case 'in_review': return '👀 進入審查';
