@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { execaRunner, type CommandRunner } from './pr-manager.js';
 import type { Group, GroupState, ReviewEvent } from '../types.js';
+import type { HandoffInput, HandoffRow } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 
 /**
@@ -93,62 +94,88 @@ export interface ReviewFeedback {
   at: number;
 }
 
-/** Store 需要的 ledger 子集（只要能寫稽核事件即可；不給也能運作）。 */
+/** Store 需要的 ledger 子集。 */
 export interface FeedbackLedgerLike {
   logEvent(scope: 'task' | 'group' | 'system', refId: string | null, kind: string, detail?: string): void;
+  openHandoff(input: HandoffInput): string;
+  listHandoffs(q: { toRole?: string; kind?: string; groupId?: string; unconsumedOnly?: boolean; limit?: number }): HandoffRow[];
+  consumeHandoffsFor(q: { groupId?: string; taskId?: string; kind?: string; toRole?: string }): number;
 }
 
 /**
  * 審查意見暫存區——**changes_requested 從死狀態變成可回灌的關鍵**。
  *
  * 為什麼需要它：ReviewWatcher 產生意見、Orchestrator 決定重新派工、GroupRunner 才真正
- * 把意見交給 agent，三者不在同一個呼叫堆疊上。ledger 目前沒有「讀事件」的 API
- * （events 只能寫），所以跨模組傳遞就靠這個共用實例；同時一律寫一份到 events 表當稽核軌跡。
+ * 把意見交給 agent，三者不在同一個呼叫堆疊上。
  *
- * **接線契約**：daemon 必須建立**一個**實例，同時注入 Orchestrator 與 GroupRunner。
- * Orchestrator 只有在拿到共用實例時才會把 changes_requested 群組重新派工——
- * 沒有人接得住意見就派回去，只會讓 agent 不知道要改什麼（見 orchestrator.ts 的 requeue 階段）。
+ * ── 為什麼從記憶體搬進 DB ──
  *
- * 生命週期：程序內記憶體。daemon 重啟後意見會遺失，屆時群組留在 changes_requested
- * 等下一次審查活動（保守：寧可停著等人，也不要讓 agent 盲改）。
+ * 先前這是一個 `Map`，註解自陳「daemon 重啟後意見會遺失，屆時群組留在
+ * changes_requested 等下一次審查活動」。實跑的後果比那句話嚴重：重啟之後
+ * orchestrator 看到「changes_requested 但沒有可回灌的意見」就**不重新派工**，
+ * 於是群組永遠停著——log 上只有一行「可能 daemon 重啟過，暫不重新派工」。
+ *
+ * 現在意見是一張 `to_role='coder'` 的交接單。跨重啟不會掉，而且與人的待處理清單
+ * 天然分開（那條查詢只看 `to_role='human'`）——審查往返本來就不該出現在人的清單上。
  */
 export class ReviewFeedbackStore {
-  private readonly byGroup = new Map<string, ReviewFeedback>();
-
   constructor(private readonly ledger?: FeedbackLedgerLike, private readonly now: () => number = Date.now) {}
 
-  /** 覆寫式寫入：同一群組只保留最新一次的要求（舊意見多半已被新意見取代）。 */
+  /**
+   * 覆寫式寫入：同一群組只保留最新一次的要求（舊意見多半已被新意見取代）。
+   * 「覆寫」在 DB 上的實作是「先收掉舊的未處理單，再開一張新的」。
+   */
   save(input: { groupId: string; comments: string[]; source: FeedbackSource }): ReviewFeedback {
     const fb: ReviewFeedback = { ...input, comments: [...input.comments], at: this.now() };
-    this.byGroup.set(fb.groupId, fb);
-    // 稽核：即使程序重啟後記憶體沒了，events 表仍查得到當時審查者要求改什麼
-    this.ledger?.logEvent('group', fb.groupId, FEEDBACK_EVENT_KIND, JSON.stringify(fb));
+    if (!this.ledger) return fb;
+    this.ledger.consumeHandoffsFor({ groupId: fb.groupId, kind: 'review_feedback' });
+    this.ledger.openHandoff({
+      groupId: fb.groupId,
+      fromRole: fb.source === 'merge_guard' ? 'merger' : fb.source === 'human_reject' ? 'human' : 'reviewer',
+      toRole: 'coder',
+      kind: 'review_feedback',
+      title: `審查要求修改（${fb.source}）`,
+      // body 不可為空——審查者按了 Request changes 卻沒留字是有可能的，
+      // 那時也要開得出單（不然這一群就從回灌路徑上消失了）。
+      body: fb.comments.length > 0 ? fb.comments.join('\n') : '審查者要求修改，但沒有留下文字說明。',
+      verdict: fb.source,
+    });
+    // 稽核：events 表仍留一份，事後查得到當時審查者要求改什麼
+    this.ledger.logEvent('group', fb.groupId, FEEDBACK_EVENT_KIND, JSON.stringify(fb));
     return fb;
   }
 
   has(groupId: string): boolean {
-    return this.byGroup.has(groupId);
+    return this.peek(groupId) !== undefined;
   }
 
   /** 讀但不清除（Orchestrator 判斷「能不能重新派工」用）。 */
   peek(groupId: string): ReviewFeedback | undefined {
-    return this.byGroup.get(groupId);
+    const rows = this.ledger?.listHandoffs({ groupId, kind: 'review_feedback', unconsumedOnly: true, limit: 1 }) ?? [];
+    const row = rows[0];
+    if (!row) return undefined;
+    return {
+      groupId,
+      comments: row.body.split('\n').filter((l) => l !== ''),
+      source: (row.verdict as FeedbackSource) ?? 'github_review',
+      at: row.createdAt,
+    };
   }
 
   /** 讀走（GroupRunner 真的把意見交給 agent 之後呼叫，避免下一輪重複回灌）。 */
   take(groupId: string): ReviewFeedback | undefined {
-    const fb = this.byGroup.get(groupId);
-    this.byGroup.delete(groupId);
+    const fb = this.peek(groupId);
+    if (fb) this.ledger?.consumeHandoffsFor({ groupId, kind: 'review_feedback' });
     return fb;
   }
 
   clear(groupId: string): void {
-    this.byGroup.delete(groupId);
+    this.ledger?.consumeHandoffsFor({ groupId, kind: 'review_feedback' });
   }
 
   /** 直接產生可塞進 agent prompt 的文字；沒有意見時回 undefined。 */
   promptFor(groupId: string): string | undefined {
-    const fb = this.byGroup.get(groupId);
+    const fb = this.peek(groupId);
     return fb ? formatFeedback(fb) : undefined;
   }
 }

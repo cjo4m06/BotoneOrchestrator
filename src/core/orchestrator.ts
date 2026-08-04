@@ -338,7 +338,6 @@ export const TICK_FAILED_EVENT = 'tick_failed';
 export class Orchestrator {
   private readonly feedback: ReviewFeedbackStore;
   /** feedback 是否為外部共用實例——沒共用就不能把 changes_requested 派回去（沒人讀得到意見）。 */
-  private readonly sharedFeedback: boolean;
   /** 群組 → 核准憑證。**合併的唯一依據**，只由 GitHub approved 事件或人工裁決寫入。 */
   private readonly approvals = new Map<string, MergeApproval>();
   /**
@@ -376,7 +375,6 @@ export class Orchestrator {
 
   constructor(private deps: OrchestratorDeps, private intervalSec: number | (() => number)) {
     this.feedback = deps.feedback ?? new ReviewFeedbackStore(deps.ledger);
-    this.sharedFeedback = deps.feedback !== undefined;
     // 人在 Slack 的裁決是合法的核准來源；訂閱它，合併路徑才有憑證可用。
     deps.gateway?.onMergeDecision?.((d) => this.onMergeDecision(d));
   }
@@ -770,13 +768,10 @@ export class Orchestrator {
       const tasks = g.taskIds.map((id) => ledger.getTask(id)).filter((t): t is Task => t !== undefined);
       const hasFeedback = this.feedback.has(g.id);
 
-      // 安全互鎖：意見存在本地實例裡，GroupRunner 讀不到。派回去只會讓 agent 盲改，
-      // 寧可停著等人接線（見 ReviewFeedbackStore 的接線契約）。放在最前面：只要有意見沒人
-      // 讀得到，就算走的是 park 復活路徑也不該派（agent 會漏掉那些意見）。
-      if (hasFeedback && !this.sharedFeedback) {
-        this.warnOnce(`noshare:${g.id}`, { group: g.id }, '有審查意見但未注入共用的 ReviewFeedbackStore（GroupRunner 讀不到），不重新派工');
-        continue;
-      }
+      // 先前這裡有一道安全互鎖：「有意見但沒接共用實例 → 不重新派工」。
+      // 那是因為意見存在**記憶體**裡，兩個實例讀不到對方的。
+      // 現在意見是 handoffs 表的一列（to_role='coder'），誰拿到 ledger 誰就讀得到，
+      // 所以那道互鎖連同它擋掉的整類問題一起消失了。
 
       // A1) park 等人：契約由 group-runner 定義（人回覆 → 任務 clearBlock 回 queued）。
       //     還有 blocked 任務就是還在等人 —— 這是正常狀態，不警告（會每輪洗版）。
@@ -1083,9 +1078,6 @@ export class Orchestrator {
     this.askedApproval.delete(e.group);
     this.feedback.save({ groupId: e.group, comments: e.comments, source: 'github_review' });
     this.notifyGroup(e.group, { type: 'changes_requested', count: e.comments.length });
-    if (!this.sharedFeedback) {
-      log.warn({ group: e.group }, '審查意見已存入本地暫存，但未與 GroupRunner 共用實例 → 不會自動重新派工');
-    }
     ledger.logEvent('group', e.group, 'feedback_ready', `${e.comments.length} 則審查意見待回灌`);
   }
 

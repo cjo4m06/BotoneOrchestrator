@@ -782,7 +782,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
   it('Merge Guard 擋下（語意飄移）→ 不合併、憑證作廢、退回 changes_requested 並存下可回灌的細節', async () => {
     const g = seedReviewedGroup();
     const m = fakeMerge({ verdict: { ok: false, reason: 'semantic_drift', detail: '[test] 3 個測試紅' } });
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const notif = fakeNotifier();
     const { orch } = build({
       reviewWatcher: fakeWatcher([[{ type: 'approved', group: g.id, approvedBy: 'bob' }]]),
@@ -803,7 +803,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
   it('Merge Guard 前置條件不成立（根本沒驗到）→ 標 failed，不可當成「要修」', async () => {
     const g = seedReviewedGroup();
     const m = fakeMerge({ verdict: { ok: false, reason: 'precondition_failed', detail: '分支不存在' } });
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const { orch } = build({
       reviewWatcher: fakeWatcher([[{ type: 'approved', group: g.id, approvedBy: 'bob' }]]),
       merge: m.deps,
@@ -928,7 +928,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const g = seedReviewedGroup({ state: 'merge_guard' });
     const m = fakeMerge();
     const gw = fakeGateway();
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const { orch } = build({ merge: m.deps, gateway: gw.gateway, feedback: store });
 
     gw.decide({ groupId: g.id, approved: true, userId: 'U1' });
@@ -989,7 +989,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
   it('changes_requested + 已有審查意見 → 轉 ready 並在同一輪被派出', async () => {
     seedTask('T-1', 'g_cr', 'done');
     const g = seedGroup('g_cr', 'changes_requested', ['T-1']);
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     store.save({ groupId: g.id, comments: ['@bob: 加錯誤處理'], source: 'github_review' });
     const { orch, dispatched } = build({ feedback: store });
 
@@ -1003,7 +1003,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
   it('審查要求修改 → 下一輪 tick 就重新派出（端到端）', async () => {
     seedTask('T-1', 'g_cr', 'done');
     const g = seedGroup('g_cr', 'changes_requested', ['T-1'], 11);
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const { orch, dispatched } = build({
       feedback: store,
       reviewWatcher: fakeWatcher([[{ type: 'changes_requested', group: g.id, comments: ['@bob: 拆函式'] }]]),
@@ -1017,28 +1017,29 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
   });
 
-  it('沒有共用 feedback store → 不重新派工（agent 會不知道要改什麼）', async () => {
+  // 先前這裡驗的是一道互鎖：「有意見但沒接共用實例 → 不重新派工」。
+  // 那道互鎖存在的原因是意見存在**記憶體**裡，兩個實例讀不到對方的。
+  // 意見搬進 handoffs 表之後，誰拿到 ledger 誰就讀得到——互鎖與它擋掉的整類問題
+  // 一起消失了。現在要驗的是相反的保證：**意見一定回得去**。
+  it('審查意見存進 DB → 就算換一個 store 實例也讀得到（重啟不會讓它蒸發）', async () => {
     seedTask('T-1', 'g_cr', 'done');
     const g = seedGroup('g_cr', 'changes_requested', ['T-1'], 12);
-    const rec = createRecordingLogger();
-    const { orch, dispatched } = build({
-      log: rec.logger,
+    const { orch } = build({
       reviewWatcher: fakeWatcher([[{ type: 'changes_requested', group: g.id, comments: ['改這裡'] }]]),
     });
 
     await tickAndPlan(orch);
-    await tickAndPlan(orch);
-    await tickAndPlan(orch);
 
-    assert.deepEqual(dispatched, []);
-    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested');
-    assert.equal(rec.messages('warn').filter((m) => m.includes('未注入共用的 ReviewFeedbackStore')).length, 1);
+    // 模擬 daemon 重啟：全新的 store 實例，記憶體裡什麼都沒有
+    const afterRestart = new ReviewFeedbackStore(tmp.ledger);
+    assert.equal(afterRestart.has(g.id), true, '重啟後意見還要在，否則這一群永遠不會被重新派工');
+    assert.deepEqual(afterRestart.peek(g.id)?.comments, ['改這裡']);
   });
 
   it('changes_requested 但沒有任何意見（重啟後遺失）→ 保守停著，不盲目重做', async () => {
     seedTask('T-1', 'g_cr', 'done');
     const g = seedGroup('g_cr', 'changes_requested', ['T-1'], 13);
-    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
+    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore(tmp.ledger) });
 
     await tickAndPlan(orch);
 
@@ -1067,7 +1068,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     seedTask('T-2', 'g_park', 'blocked'); // GroupRunner 問了澄清問題，群被 park
     const g = seedGroup('g_park', 'changes_requested', ['T-1', 'T-2']); // = PARKED_GROUP_STATE
     const rec = createRecordingLogger();
-    const { orch, dispatched } = build({ log: rec.logger, feedback: new ReviewFeedbackStore() });
+    const { orch, dispatched } = build({ log: rec.logger, feedback: new ReviewFeedbackStore(tmp.ledger) });
 
     await tickAndPlan(orch);
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'changes_requested', '人還沒回覆 → 不動');
@@ -1087,7 +1088,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     // ——e2e 實測過：群組卡死 + worktree 永久殘留。
     seedTask('T-1', 'g_done', 'done');
     const g = seedGroup('g_done', 'changes_requested', ['T-1']);
-    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
+    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore(tmp.ledger) });
 
     await tickAndPlan(orch);
 
@@ -1098,7 +1099,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
   it('已開 PR 的 changes_requested 沒有意見 → 保守停著（重派只會讓 agent 盲改）', async () => {
     seedTask('T-1', 'g_pr', 'done');
     const g = seedGroup('g_pr', 'changes_requested', ['T-1'], 21);
-    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore() });
+    const { orch, dispatched } = build({ feedback: new ReviewFeedbackStore(tmp.ledger) });
 
     await tickAndPlan(orch);
 

@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   FEEDBACK_EVENT_KIND,
@@ -12,7 +12,7 @@ import {
 } from '../src/pr/review-watcher.js';
 import type { CommandResult, CommandRunner } from '../src/pr/pr-manager.js';
 import type { Group, GroupState } from '../src/types.js';
-import { createSilentLogger, createRecordingLogger, createTmpLedger } from './helpers/index.js';
+import { createSilentLogger, createRecordingLogger, createTmpLedger, type TmpLedger } from './helpers/index.js';
 
 // ── 假件 ──────────────────────────────────────────────────────────────
 // 本檔一律不碰真實 gh／真實 repo：所有 GitHub 互動都由 fakeGh 回應。
@@ -401,12 +401,23 @@ describe('ReviewWatcher — 與真實 Ledger 整合', () => {
 });
 
 describe('ReviewFeedbackStore — 可回灌的審查意見', () => {
+  // **意見存在 DB 裡，不是記憶體。** 先前是一個 Map，daemon 重啟就掉——
+  // 而 orchestrator 看到「changes_requested 但沒有可回灌的意見」就不重新派工，
+  // 於是群組永遠停著，log 上只有一行「可能 daemon 重啟過，暫不重新派工」。
+  let tmp: TmpLedger;
+  beforeEach(() => { tmp = createTmpLedger(); });
+  afterEach(() => tmp.cleanup());
+
   it('存入後可被讀取；take 會讀走（避免下一輪重複回灌）', () => {
-    const store = new ReviewFeedbackStore(undefined, () => 1234);
+    const store = new ReviewFeedbackStore(tmp.ledger, () => 1234);
     store.save({ groupId: 'g_1', comments: ['@bob: 加錯誤處理'], source: 'github_review' });
 
     assert.equal(store.has('g_1'), true);
-    assert.deepEqual(store.peek('g_1'), { groupId: 'g_1', comments: ['@bob: 加錯誤處理'], source: 'github_review', at: 1234 });
+    // `at` 現在來自 DB 的 created_at（意見存在 handoffs 表裡），不是注入的時鐘
+    const got = store.peek('g_1');
+    assert.equal(got?.groupId, 'g_1');
+    assert.deepEqual(got?.comments, ['@bob: 加錯誤處理']);
+    assert.equal(got?.source, 'github_review');
     assert.equal(store.has('g_1'), true, 'peek 不可清掉');
 
     assert.equal(store.take('g_1')?.comments[0], '@bob: 加錯誤處理');
@@ -414,8 +425,45 @@ describe('ReviewFeedbackStore — 可回灌的審查意見', () => {
     assert.equal(store.take('g_1'), undefined);
   });
 
+  // **這一條是這一片存在的理由。**
+  //
+  // 先前 store 是一個 Map，註解自陳「daemon 重啟後意見會遺失」。實跑的後果比那句話嚴重：
+  // 重啟之後 orchestrator 看到「changes_requested 但沒有可回灌的意見」就不重新派工，
+  // 於是群組永遠停著——log 上只有一行「可能 daemon 重啟過，暫不重新派工」。
+  it('daemon 重啟後意見還在（換一個 store 實例照樣讀得到）', () => {
+    new ReviewFeedbackStore(tmp.ledger).save({
+      groupId: 'g_1', comments: ['@bob: 加錯誤處理'], source: 'merge_guard',
+    });
+
+    // 模擬重啟：全新的 store 實例，記憶體裡什麼都沒有
+    const afterRestart = new ReviewFeedbackStore(tmp.ledger);
+
+    assert.equal(afterRestart.has('g_1'), true, '重啟不該讓審查意見蒸發');
+    assert.deepEqual(afterRestart.peek('g_1')?.comments, ['@bob: 加錯誤處理']);
+    assert.equal(afterRestart.peek('g_1')?.source, 'merge_guard', '來源也要留著（決定回灌時的措辭）');
+  });
+
+  it('審查者按了 Request changes 卻沒留字 → 照樣開得出單（不然這一群會從回灌路徑上消失）', () => {
+    const store = new ReviewFeedbackStore(tmp.ledger);
+    store.save({ groupId: 'g_1', comments: [], source: 'github_review' });
+
+    assert.equal(store.has('g_1'), true);
+    assert.match(store.peek('g_1')?.comments[0] ?? '', /沒有留下文字說明/);
+  });
+
+  it('審查往返不會出現在人的待處理清單上（to_role 是 coder 不是 human）', () => {
+    new ReviewFeedbackStore(tmp.ledger).save({ groupId: 'g_1', comments: ['改這裡'], source: 'github_review' });
+
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true }),
+      [],
+      '正常的審查往返灌進人的清單，人就再也分不出哪幾件真的需要自己動手',
+    );
+    assert.equal(tmp.ledger.listHandoffs({ toRole: 'coder', unconsumedOnly: true }).length, 1);
+  });
+
   it('同一群組再次要求修改 → 覆寫（舊意見已被新意見取代）', () => {
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     store.save({ groupId: 'g_1', comments: ['舊'], source: 'github_review' });
     store.save({ groupId: 'g_1', comments: ['新'], source: 'merge_guard' });
 
@@ -438,7 +486,7 @@ describe('ReviewFeedbackStore — 可回灌的審查意見', () => {
   });
 
   it('promptFor 直接產出可塞進 agent prompt 的文字', () => {
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     assert.equal(store.promptFor('g_x'), undefined, '沒有意見就不要生出空 prompt');
     store.save({ groupId: 'g_x', comments: ['A', 'B'], source: 'github_review' });
     const text = store.promptFor('g_x')!;
@@ -448,9 +496,13 @@ describe('ReviewFeedbackStore — 可回灌的審查意見', () => {
 });
 
 describe('ReviewWatcher — 意見存進共用 store（changes_requested 不再是死狀態）', () => {
+  let tmp: TmpLedger;
+  beforeEach(() => { tmp = createTmpLedger(); });
+  afterEach(() => tmp.cleanup());
+
   it('要求修改 → 意見進 store，可被 GroupRunner 回灌', async () => {
     const f = fakeLedger([makeGroup({ state: 'in_review' })]);
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const gh = fakeGh([
       ghView({
         reviews: [review({ id: 'PRR_9', state: 'CHANGES_REQUESTED', login: 'bob', body: '這裡要加錯誤處理' })],
@@ -468,7 +520,7 @@ describe('ReviewWatcher — 意見存進共用 store（changes_requested 不再�
 
   it('核准不會在 store 留下修改意見', async () => {
     const f = fakeLedger([makeGroup({ state: 'in_review' })]);
-    const store = new ReviewFeedbackStore();
+    const store = new ReviewFeedbackStore(tmp.ledger);
     const gh = fakeGh([ghView({ reviews: [review({ id: 'PRR_1', state: 'APPROVED', login: 'bob' })], comments: [] })]);
 
     await new ReviewWatcher({ ledger: f.ledger, log: createSilentLogger(), run: gh.run, feedback: store }).poll();
