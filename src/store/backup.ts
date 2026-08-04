@@ -16,7 +16,13 @@ import type { Logger } from '../observability/logger.js';
  */
 
 export interface BackupOptions {
-  /** 保留幾份（由新到舊）。預設 10。 */
+  /**
+   * 保留幾份（由新到舊）。預設 3。
+   *
+   * 從 10 降到 3：check_runs 開始存關卡的**全文輸出**之後 DB 會明顯長肉，
+   * 而每次啟動都會做一份全量 VACUUM INTO——10 份就是 10 倍。
+   * 緩解要排在成長之前，不是等磁碟滿了才想到。
+   */
   keep?: number;
   /** 備份目錄。預設 <ledger 所在目錄>/backups。 */
   dir?: string;
@@ -28,7 +34,7 @@ export function backupLedger(ledgerPath: string, log: Logger, opts: BackupOption
   if (!existsSync(ledgerPath)) return undefined; // 全新安裝，沒有東西可備份
 
   const dir = opts.dir ?? join(dirname(ledgerPath), 'backups');
-  const keep = Math.max(1, opts.keep ?? 10);
+  const keep = Math.max(1, opts.keep ?? 3);
   const stamp = opts.stamp ?? timestamp();
   const target = join(dir, `ledger-${stamp}.db`);
 

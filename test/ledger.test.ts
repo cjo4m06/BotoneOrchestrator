@@ -551,3 +551,142 @@ test('onTaskChanged：觀察者擲錯不得影響資料寫入，也不得往外�
   assert.equal(ledger.getTask('T-1')?.state, 'done', '狀態必須照樣寫進去');
   assert.ok(rec.messages('warn').some((w) => /觀察者擲錯/.test(w)), '應留下 warn 而不是靜默吞掉');
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// check_runs：關卡執行的流水帳
+//
+// 這張表存在的理由是「同一條分支 14:04:45 綠、14:13:51 紅」——那個事實
+// 先前只能靠事後翻 stdout.log 一行一行對時間才發現，而它正是判斷
+// 「這個紅是不是這一群造成的」唯一有用的證據。
+// ─────────────────────────────────────────────────────────────────────
+
+test('check_runs：同一條分支的綠與紅都留著，查得出「什麼時候翻的」', (t) => {
+  const { ledger } = setup(t);
+  const base = { repo: 'o/r', branch: 'orch/g1', workspaceKind: 'merge_tree' as const, command: 'npm test', requestedBy: 'program' as const };
+  ledger.recordCheckRun({ ...base, exitCode: 0, output: '130 passed', startedAt: 1_000, endedAt: 1_100 });
+  ledger.recordCheckRun({ ...base, exitCode: 1, output: '❌ schedule-engine', startedAt: 2_000, endedAt: 2_100 });
+
+  const rows = ledger.listCheckRuns({ repo: 'o/r', branch: 'orch/g1' });
+
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.exitCode), [1, 0], '由新到舊');
+  assert.match(rows[0]!.output, /schedule-engine/, '全文要留著，不截斷不挑行');
+});
+
+test('check_runs：exitCode 未給 = 沒跑起來，與「跑了但失敗」是不同的事實', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordCheckRun({ repo: 'o/r', workspaceKind: 'verify_tree', command: 'make test', requestedBy: 'reviewer' });
+  const [row] = ledger.listCheckRuns({ repo: 'o/r' });
+  assert.equal(row?.exitCode, undefined, '沒跑起來不可以被記成 exit 0');
+});
+
+test('check_runs：prune 回傳被清掉那些列的落地檔路徑（否則全文變孤兒）', (t) => {
+  const { ledger } = setup(t);
+  const old = { repo: 'o/r', branch: 'b', workspaceKind: 'group_tree' as const, command: 'npm test', requestedBy: 'program' as const };
+  for (let i = 0; i < 25; i += 1) {
+    ledger.recordCheckRun({ ...old, exitCode: 0, outputPath: `/tmp/out-${i}.log`, startedAt: 1_000 + i, endedAt: 1_000 + i });
+  }
+
+  const paths = ledger.pruneCheckRuns({ olderThan: 9_999, keepPerBranch: 20 });
+
+  assert.equal(paths.length, 5, '25 筆保底留 20 → 清掉 5 筆');
+  assert.ok(paths.every((p) => p.startsWith('/tmp/out-')), '要把路徑交回去給呼叫端刪檔');
+  assert.equal(ledger.listCheckRuns({ repo: 'o/r' }).length, 20);
+});
+
+test('check_runs：保底筆數內的紀錄不會因為太舊而被清光', (t) => {
+  const { ledger } = setup(t);
+  ledger.recordCheckRun({ repo: 'o/r', branch: 'b', workspaceKind: 'group_tree', command: 'npm test', requestedBy: 'program', exitCode: 1, startedAt: 1, endedAt: 1 });
+  assert.deepEqual(ledger.pruneCheckRuns({ olderThan: 9_999, keepPerBranch: 20 }), []);
+  assert.equal(ledger.listCheckRuns({ repo: 'o/r' }).length, 1, '唯一一筆證據不能因為過期就消失');
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// handoffs：交接單
+//
+// 「停手與說話是同一個寫入動作」。實跑撞到的 bug：兩個群耗盡重試停在
+// changes_requested、16 個任務堵著，而控制台顯示「沒有需要你處理的事項」。
+// ─────────────────────────────────────────────────────────────────────
+
+const HANDOFF = {
+  groupId: 'g1', fromRole: 'merger' as const, toRole: 'human' as const,
+  kind: 'stuck_group' as const, title: '群組停手',
+};
+
+test('handoffs：開不出沒有說明的單（停手與說話是同一個動作）', (t) => {
+  const { ledger } = setup(t);
+  assert.throws(() => ledger.openHandoff({ ...HANDOFF, body: '' }), /說明欄不可為空/);
+  assert.throws(() => ledger.openHandoff({ ...HANDOFF, body: '   \n  ' }), /說明欄不可為空/, '只有空白也不算說明');
+  assert.deepEqual(ledger.listHandoffs({}), [], '擲錯就不該留下半張單');
+});
+
+test('handoffs：to_role=human 且未處理 = 待處理清單（不看群組狀態）', (t) => {
+  const { ledger } = setup(t);
+  ledger.openHandoff({ ...HANDOFF, body: '測試紅了，要你決定' });
+  ledger.openHandoff({ ...HANDOFF, toRole: 'coder', kind: 'review_feedback', body: '審查意見：X 不符規格' });
+
+  const inbox = ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true });
+
+  assert.equal(inbox.length, 1, '給 coder 的審查往返不該出現在人的清單上');
+  assert.equal(inbox[0]!.kind, 'stuck_group');
+});
+
+test('handoffs：處理完就從清單上消失（沒有這個寫入點，清單只會單向增長）', (t) => {
+  const { ledger } = setup(t);
+  const id = ledger.openHandoff({ ...HANDOFF, body: '要你決定' });
+
+  assert.equal(ledger.consumeHandoff(id), true);
+  assert.deepEqual(ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true }), []);
+  assert.equal(ledger.consumeHandoff(id), false, '重複標掉回 false，但不擲錯（收尾動作重放是正常的）');
+  assert.equal(ledger.listHandoffs({ toRole: 'human' }).length, 1, '單本身留著當稽核軌跡');
+});
+
+test('handoffs：kind 是路由碼，UI 靠它決定畫哪組按鈕', (t) => {
+  const { ledger } = setup(t);
+  ledger.openHandoff({ ...HANDOFF, kind: 'clarification', body: '要用哪一種快取？' });
+  ledger.openHandoff({ ...HANDOFF, kind: 'merge_approval', body: '等你核准合併' });
+
+  assert.equal(ledger.listHandoffs({ toRole: 'human', kind: 'merge_approval' }).length, 1);
+  assert.equal(ledger.listHandoffs({ toRole: 'human', kind: 'clarification' }).length, 1);
+});
+
+test('handoffs：blocking=false 的交付說明照樣存得下（給下一棒的脈絡）', (t) => {
+  const { ledger } = setup(t);
+  ledger.openHandoff({
+    groupId: 'g1', taskId: 'T-1', fromRole: 'coder', toRole: 'coder', kind: 'delivery',
+    blocking: false, title: 'T-1 交付', body: '做了 X，放棄了 Y 因為 Z',
+    evidence: ['check_run:12'], blindspots: '沒驗 /settings',
+  });
+  const [row] = ledger.listHandoffs({ groupId: 'g1' });
+  assert.equal(row?.blocking, false);
+  assert.deepEqual(row?.evidence, ['check_run:12']);
+  assert.equal(row?.blindspots, '沒驗 /settings');
+});
+
+test('handoffs：consumeHandoffsFor 一次收掉整群未處理的單', (t) => {
+  const { ledger } = setup(t);
+  ledger.openHandoff({ ...HANDOFF, body: 'a' });
+  ledger.openHandoff({ ...HANDOFF, kind: 'merge_approval', body: 'b' });
+  ledger.openHandoff({ ...HANDOFF, groupId: 'g2', body: '別群的' });
+
+  assert.equal(ledger.consumeHandoffsFor({ groupId: 'g1' }), 2);
+  assert.equal(ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true }).length, 1, '別群的不受影響');
+});
+
+test('停用專案不留孤兒：刪任務／群組要級聯刪掉交接單', (t) => {
+  const { ledger } = setup(t);
+  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1' }));
+  ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+  const gid = ledger.getTask('T-1') && ledger.listGroupsByState('ready')[0]!.id;
+  ledger.openHandoff({ groupId: gid, fromRole: 'merger', toRole: 'human', kind: 'stuck_group', title: 't', body: '要你決定' });
+  ledger.openHandoff({ taskId: 'T-1', fromRole: 'coder', toRole: 'human', kind: 'clarification', title: 't', body: '問題' });
+
+  ledger.deleteGroup(gid!);
+  ledger.deleteTask('T-1');
+
+  assert.deepEqual(
+    ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true }),
+    [],
+    '孤兒單會永遠掛在「等你處理」上，指向一個已經不存在的東西',
+  );
+});

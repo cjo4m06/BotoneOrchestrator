@@ -79,6 +79,124 @@ export interface AgentSessionInput {
   status?: 'active' | 'done' | 'parked' | 'error';
 }
 
+/** 這一次關卡是在哪一種工作區上跑的。後兩種是拋棄式的，內容永遠不是任何東西的來源。 */
+export type WorkspaceKind = 'group_tree' | 'verify_tree' | 'merge_tree';
+
+/** 誰要求跑這一關。`program` = 編排流程自己跑的（不是任何 agent 主動要求）。 */
+export type CheckRequester = 'coder' | 'reviewer' | 'merger' | 'program';
+
+export interface CheckRunInput {
+  repo: string;
+  branch?: string;
+  workspaceKind: WorkspaceKind;
+  command: string;
+  headSha?: string;
+  /** 這一次驗的是對著哪一顆 base（與 groups.base_sha 語意相反，見 schema 的說明）。 */
+  verifiedBaseSha?: string;
+  /** NULL 代表沒跑起來（指令不存在、還沒開始就死）——與「跑了但失敗」是不同的事實。 */
+  exitCode?: number;
+  output?: string;
+  /** 全文太長時的落地檔路徑。寫檔由呼叫端負責，ledger 只存路徑。 */
+  outputPath?: string;
+  requestedBy: CheckRequester;
+  startedAt?: number;
+  endedAt?: number;
+}
+
+export interface CheckRunRow extends Omit<CheckRunInput, 'startedAt' | 'endedAt'> {
+  id: number;
+  startedAt: number;
+  endedAt?: number;
+}
+
+/**
+ * 交接單的路由碼：**這張單要畫哪一組按鈕**，不是「這個失敗是什麼原因」。
+ * 與被刪掉的 MergeVerdict.reason 性質不同——那個是程式替失敗分類。
+ */
+export type HandoffKind =
+  | 'clarification'   // agent 問人一個問題
+  | 'no_change'       // agent 宣告這張卡不用做，等人確認
+  | 'needs_human'     // 一般的「要你處理」
+  | 'reclaim_blocked' // 認領不回來，解法不在這個系統裡（要去任務板改狀態）
+  | 'merge_approval'  // 等人核准合併
+  | 'stuck_group'     // 群組停手，等人決定要不要重試
+  | 'review_feedback' // 審查意見回灌給實作者
+  | 'delivery';       // 交付說明（給下一棒的脈絡，通常 blocking=false）
+
+export type HandoffRole = 'planner' | 'coder' | 'reviewer' | 'merger' | 'program' | 'human';
+
+export interface HandoffInput {
+  groupId?: string;
+  taskId?: string;
+  fromRole: HandoffRole;
+  toRole: HandoffRole;
+  kind: HandoffKind;
+  title: string;
+  /** **不可為空**——空字串會擲錯，見 openHandoff 的說明。 */
+  body: string;
+  /** agent 自己寫的一句結論。程式不解析。 */
+  verdict?: string;
+  /** false = 只是留個紀錄，不擋流程（例如交付說明）。預設 true。 */
+  blocking?: boolean;
+  options?: string[];
+  ifIgnored?: string;
+  /** 「我沒驗到什麼」。放行書必填，空白不合法（由呼叫端的 schema 保證）。 */
+  blindspots?: string;
+  /** check_runs id、截圖路徑之類的證據引用。 */
+  evidence?: string[];
+  /** 人的答覆適用到哪：這張卡／這一群／以後都這樣。 */
+  scope?: string;
+  sessionId?: string;
+}
+
+export interface HandoffRow extends Omit<HandoffInput, 'blocking'> {
+  id: string;
+  blocking: boolean;
+  createdAt: number;
+  consumedAt?: number;
+}
+
+function toCheckRun(r: Row): CheckRunRow {
+  return {
+    id: r.id as number,
+    repo: r.repo as string,
+    ...((r.branch as string) ? { branch: r.branch as string } : {}),
+    workspaceKind: r.workspace_kind as WorkspaceKind,
+    command: r.command as string,
+    ...((r.head_sha as string) ? { headSha: r.head_sha as string } : {}),
+    ...((r.verified_base_sha as string) ? { verifiedBaseSha: r.verified_base_sha as string } : {}),
+    ...(r.exit_code === null || r.exit_code === undefined ? {} : { exitCode: r.exit_code as number }),
+    output: (r.output as string) ?? '',
+    ...((r.output_path as string) ? { outputPath: r.output_path as string } : {}),
+    requestedBy: r.requested_by as CheckRequester,
+    startedAt: r.started_at as number,
+    ...(r.ended_at === null || r.ended_at === undefined ? {} : { endedAt: r.ended_at as number }),
+  };
+}
+
+function toHandoff(r: Row): HandoffRow {
+  return {
+    id: r.id as string,
+    ...((r.group_id as string) ? { groupId: r.group_id as string } : {}),
+    ...((r.task_id as string) ? { taskId: r.task_id as string } : {}),
+    fromRole: r.from_role as HandoffRole,
+    toRole: r.to_role as HandoffRole,
+    kind: r.kind as HandoffKind,
+    title: r.title as string,
+    body: r.body as string,
+    ...((r.verdict as string) ? { verdict: r.verdict as string } : {}),
+    blocking: (r.blocking as number) !== 0,
+    ...((r.options as string) ? { options: JSON.parse(r.options as string) as string[] } : {}),
+    ...((r.if_ignored as string) ? { ifIgnored: r.if_ignored as string } : {}),
+    ...((r.blindspots as string) ? { blindspots: r.blindspots as string } : {}),
+    ...((r.evidence as string) ? { evidence: JSON.parse(r.evidence as string) as string[] } : {}),
+    ...((r.scope as string) ? { scope: r.scope as string } : {}),
+    ...((r.session_id as string) ? { sessionId: r.session_id as string } : {}),
+    createdAt: r.created_at as number,
+    ...(r.consumed_at === null || r.consumed_at === undefined ? {} : { consumedAt: r.consumed_at as number }),
+  };
+}
+
 export interface AgentSessionRow {
   taskId: string;
   sessionId: string;
@@ -537,12 +655,17 @@ export class Ledger {
     this.db.prepare('DELETE FROM agent_sessions WHERE task_id = ?').run(id);
     this.db.prepare('DELETE FROM clarifications WHERE task_id = ?').run(id);
     this.db.prepare("DELETE FROM events WHERE scope = 'task' AND ref_id = ?").run(id);
+    // 手寫級聯（這個 schema 刻意不用 FOREIGN KEY）。漏掉的話停用專案會留下孤兒交接單，
+    // 而「等你處理」是一條 `to_role='human' AND consumed_at IS NULL` 的查詢——
+    // 孤兒單會永遠掛在清單上，指向一個已經不存在的任務。
+    this.db.prepare('DELETE FROM handoffs WHERE task_id = ?').run(id);
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
   }
 
   /** 刪掉一個群組與它的事件（停用專案時用）。 */
   deleteGroup(id: string): void {
     this.db.prepare("DELETE FROM events WHERE scope = 'group' AND ref_id = ?").run(id);
+    this.db.prepare('DELETE FROM handoffs WHERE group_id = ?').run(id);
     this.db.prepare('DELETE FROM groups WHERE id = ?').run(id);
   }
 
@@ -801,6 +924,196 @@ export class Ledger {
       createdAt: r.created_at as number,
       updatedAt: r.updated_at as number,
     };
+  }
+
+  // ── check_runs：關卡執行的流水帳（純記帳、零解讀） ──────────────────
+
+  /**
+   * 記一次關卡執行。**這個方法不判斷任何事**——它不看 exit code 代表什麼、
+   * 不從輸出裡抽失敗測試名、不算簽章。那些都是讀的人（agent 或人）的事。
+   *
+   * 全文超過 maxInline 時 spill 成檔案：DB 只留頭尾，`output_path` 指到落地檔。
+   * 呼叫端負責寫檔（ledger 不碰檔案系統），這裡只存路徑。
+   */
+  recordCheckRun(input: CheckRunInput): number {
+    const ts = this.now();
+    const r = this.db
+      .prepare(
+        `INSERT INTO check_runs
+           (repo, branch, workspace_kind, command, head_sha, verified_base_sha,
+            exit_code, output, output_path, requested_by, started_at, ended_at)
+         VALUES
+           (@repo, @branch, @workspaceKind, @command, @headSha, @verifiedBaseSha,
+            @exitCode, @output, @outputPath, @requestedBy, @startedAt, @endedAt)`,
+      )
+      .run({
+        repo: input.repo,
+        branch: input.branch ?? null,
+        workspaceKind: input.workspaceKind,
+        command: input.command,
+        headSha: input.headSha ?? null,
+        verifiedBaseSha: input.verifiedBaseSha ?? null,
+        exitCode: input.exitCode ?? null,
+        output: input.output ?? '',
+        outputPath: input.outputPath ?? null,
+        requestedBy: input.requestedBy,
+        startedAt: input.startedAt ?? ts,
+        endedAt: input.endedAt ?? ts,
+      });
+    return Number(r.lastInsertRowid);
+  }
+
+  /**
+   * 查關卡歷史。這是「同一條分支 14:04:45 綠、14:13:51 紅」變成一次查詢的地方——
+   * 先前那個事實只能靠事後翻 stdout.log 一行一行對時間才發現。
+   */
+  listCheckRuns(q: { repo?: string; branch?: string; command?: string; since?: number; limit?: number } = {}): CheckRunRow[] {
+    const where: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (q.repo) { where.push('repo = @repo'); params.repo = q.repo; }
+    if (q.branch) { where.push('branch = @branch'); params.branch = q.branch; }
+    if (q.command) { where.push('command = @command'); params.command = q.command; }
+    if (q.since !== undefined) { where.push('started_at >= @since'); params.since = q.since; }
+    const sql =
+      `SELECT * FROM check_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}` +
+      ` ORDER BY started_at DESC, id DESC LIMIT @limit`;
+    const rows = this.db.prepare(sql).all({ ...params, limit: q.limit ?? 200 }) as Row[];
+    return rows.map(toCheckRun);
+  }
+
+  /**
+   * 清掉舊的關卡紀錄。**回傳被清掉那些列的 output_path**——呼叫端要據此刪檔案，
+   * 否則 spill 出去的全文會變成沒有人指得到、也沒有人會清的孤兒（DB 瘦了、磁碟沒有）。
+   *
+   * `keepPerBranch` 是保底：就算某條分支的紀錄全都過期了，也留最近幾筆，
+   * 免得「這個關卡在這條分支上從來沒綠過嗎」這種問題連一筆證據都查不到。
+   */
+  pruneCheckRuns(opts: { olderThan: number; keepPerBranch?: number }): string[] {
+    const keep = opts.keepPerBranch ?? 20;
+    const doomed = this.db
+      .prepare(
+        `SELECT id, output_path FROM check_runs
+          WHERE started_at < @olderThan
+            AND id NOT IN (
+              SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (
+                  PARTITION BY repo, branch ORDER BY started_at DESC, id DESC
+                ) AS rn FROM check_runs
+              ) WHERE rn <= @keep
+            )`,
+      )
+      .all({ olderThan: opts.olderThan, keep }) as Row[];
+    if (doomed.length === 0) return [];
+    const ids = doomed.map((r) => r.id as number);
+    this.db.prepare(`DELETE FROM check_runs WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+    return doomed.map((r) => (r.output_path as string) ?? '').filter((p) => p !== '');
+  }
+
+  // ── handoffs：交接單 ────────────────────────────────────────────────
+
+  /**
+   * 開一張交接單。**空白的 body 會擲錯**——這是刻意破例。
+   *
+   * ledger 其餘寫入方法的統一契約是「找不到就 warn + 回 false，絕不擲錯」
+   * （常駐 daemon 不該因為一筆寫入失敗就倒）。但這一條不同：body 是「停手時要說的話」，
+   * 而**停手與說話必須是同一個寫入動作**。允許空 body 就等於允許「停了但沒說」，
+   * 那正是實跑撞到的那個 bug——兩個群在等人、控制台顯示「沒有需要你處理的事項」。
+   * 擲錯讓它在寫程式階段就爆掉，而不是在正式環境變成一行看不見的 WARN。
+   */
+  openHandoff(input: HandoffInput): string {
+    const body = (input.body ?? '').trim();
+    if (body === '') {
+      throw new Error(
+        `交接單的說明欄不可為空（from=${input.fromRole} to=${input.toRole} kind=${input.kind}）。` +
+          '停手與說話是同一個動作：開不出沒有說明的單，也就停不了一個沒開單的群。',
+      );
+    }
+    const ts = this.now();
+    const id =
+      'h_' +
+      createHash('sha1')
+        .update(`${input.groupId ?? ''}|${input.taskId ?? ''}|${input.kind}|${input.toRole}|${ts}|${body}`)
+        .digest('hex')
+        .slice(0, 16);
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO handoffs
+           (id, group_id, task_id, from_role, to_role, kind, verdict, blocking,
+            title, body, options, if_ignored, blindspots, evidence, scope, session_id,
+            created_at, consumed_at)
+         VALUES
+           (@id, @groupId, @taskId, @fromRole, @toRole, @kind, @verdict, @blocking,
+            @title, @body, @options, @ifIgnored, @blindspots, @evidence, @scope, @sessionId,
+            @createdAt, NULL)`,
+      )
+      .run({
+        id,
+        groupId: input.groupId ?? null,
+        taskId: input.taskId ?? null,
+        fromRole: input.fromRole,
+        toRole: input.toRole,
+        kind: input.kind,
+        verdict: input.verdict ?? null,
+        blocking: input.blocking === false ? 0 : 1,
+        title: input.title,
+        body,
+        options: input.options ? JSON.stringify(input.options) : null,
+        ifIgnored: input.ifIgnored ?? null,
+        blindspots: input.blindspots ?? null,
+        evidence: input.evidence ? JSON.stringify(input.evidence) : null,
+        scope: input.scope ?? null,
+        sessionId: input.sessionId ?? null,
+        createdAt: ts,
+      });
+    return id;
+  }
+
+  /**
+   * 查交接單。`{ toRole: 'human', unconsumedOnly: true }` **就是待處理清單**——
+   * 控制台、Slack、CLI 共用這一條查詢。
+   *
+   * 先前這件事是從「群組狀態＋事件」推論出來的，而推論綁在一張寫死的狀態清單上：
+   * 漏一項就是一次靜默（實跑：群組停在 changes_requested，清單只掃 failed）。
+   * 查詢不會漏。
+   */
+  listHandoffs(q: { toRole?: string; kind?: string; groupId?: string; taskId?: string; unconsumedOnly?: boolean; limit?: number } = {}): HandoffRow[] {
+    const where: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (q.toRole) { where.push('to_role = @toRole'); params.toRole = q.toRole; }
+    if (q.kind) { where.push('kind = @kind'); params.kind = q.kind; }
+    if (q.groupId) { where.push('group_id = @groupId'); params.groupId = q.groupId; }
+    if (q.taskId) { where.push('task_id = @taskId'); params.taskId = q.taskId; }
+    if (q.unconsumedOnly) where.push('consumed_at IS NULL');
+    const sql =
+      `SELECT * FROM handoffs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}` +
+      ' ORDER BY created_at ASC, id ASC LIMIT @limit';
+    const rows = this.db.prepare(sql).all({ ...params, limit: q.limit ?? 500 }) as Row[];
+    return rows.map(toHandoff);
+  }
+
+  /**
+   * 標記一張單已被處理。**沒有這個寫入點，清單只會單向增長**——
+   * 人回答了澄清、任務回到 queued，但那張單永遠留在「等你處理」上。
+   *
+   * @returns 是否真的標到（已標過或找不到 → false，不擲錯：這是收尾動作，
+   *          重複呼叫是正常的，不該讓呼叫端的主要流程失敗）。
+   */
+  consumeHandoff(id: string): boolean {
+    const r = this.db
+      .prepare('UPDATE handoffs SET consumed_at = @ts WHERE id = @id AND consumed_at IS NULL')
+      .run({ id, ts: this.now() });
+    return r.changes > 0;
+  }
+
+  /** 把某個範圍內還沒處理的單一次標掉（例如群組結案時收掉它底下所有的單）。 */
+  consumeHandoffsFor(q: { groupId?: string; taskId?: string; kind?: string }): number {
+    const where: string[] = ['consumed_at IS NULL'];
+    const params: Record<string, unknown> = { ts: this.now() };
+    if (q.groupId) { where.push('group_id = @groupId'); params.groupId = q.groupId; }
+    if (q.taskId) { where.push('task_id = @taskId'); params.taskId = q.taskId; }
+    if (q.kind) { where.push('kind = @kind'); params.kind = q.kind; }
+    const r = this.db.prepare(`UPDATE handoffs SET consumed_at = @ts WHERE ${where.join(' AND ')}`).run(params);
+    return r.changes;
   }
 
   private toGroup(r: Row): Group {

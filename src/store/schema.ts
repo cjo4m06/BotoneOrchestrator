@@ -164,6 +164,80 @@ CREATE TABLE IF NOT EXISTS activity (
   heartbeat_at INTEGER NOT NULL   -- 最後一次還活著的時間；daemon 被 kill 的殘留列靠它判死
 );
 CREATE INDEX IF NOT EXISTS idx_activity_started ON activity(started_at);
+
+-- 關卡執行的流水帳。**純記帳、零解讀**——這張表不判斷任何事，只記「跑了什麼、結果是什麼」。
+--
+-- 為什麼需要：先前每次跑完 build/test 就把輸出丟掉，只在 log 裡留一行綠或紅。
+-- 於是「同一條分支 14:04:45 綠、14:13:51 紅」這種**只有橫跨時間才看得見**的事實，
+-- 事後只能靠翻 stdout.log 一行一行對時間才發現——而那正是判斷「這個紅是不是這一群造成的」
+-- 唯一有用的證據（實跑：PR #54 被一個完全無關的不穩定測試擋下，回灌三輪，16 個任務堵住）。
+--
+-- output 存**全文不截斷**：哪幾行有用只有讀的人（agent 或人）判斷得出來，
+-- 程式用正則猜「哪行像失敗」換一個測試框架就會抓錯，而且沒有人會知道。
+-- 超過 MAX_INLINE_OUTPUT 的部分 spill 成 dataRoot 底下的檔案（output_path），DB 只留頭尾。
+CREATE TABLE IF NOT EXISTS check_runs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo           TEXT NOT NULL,
+  branch         TEXT,
+  -- 這一次是在哪一種工作區上跑的。group_tree 可寫可提交；verify_tree 與 merge_tree
+  -- 是拋棄式的，跑完就刪，**它們的內容永遠不是任何東西的來源**。
+  workspace_kind TEXT NOT NULL,            -- group_tree | verify_tree | merge_tree
+  command        TEXT NOT NULL,
+  head_sha       TEXT,                     -- 執行當下的 HEAD
+  -- 這一次驗的是「對著哪一顆 base」。與 groups.base_sha（開工基準、永不重算）語意相反，
+  -- 命名刻意分家：一旦有人把它寫進「永不重算」的欄位，擋「人在 GitHub 上自己按合併」
+  -- 的那道防線就變成自己跟自己比。
+  verified_base_sha TEXT,
+  exit_code      INTEGER,                  -- NULL = 沒跑起來（指令不存在／逾時前就死）
+  output         TEXT NOT NULL DEFAULT '',
+  output_path    TEXT,                     -- 全文太長時的落地檔；prune 時要一起刪
+  requested_by   TEXT NOT NULL,            -- coder | reviewer | merger | program
+  started_at     INTEGER NOT NULL,
+  ended_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_check_runs_repo_branch ON check_runs(repo, branch, started_at);
+CREATE INDEX IF NOT EXISTS idx_check_runs_started ON check_runs(started_at);
+
+-- 交接單：一個角色停下來、把事情交給下一個角色（或人）時開的單。
+--
+-- **停手與說話是同一個寫入動作。** body NOT NULL 就是這件事的實作——
+-- 開不出一張沒有說明的單，也就停不了一個沒開單的群。先前那是兩件要「記得同步」的事，
+-- 於是實跑撞到：兩個群耗盡重試停在 changes_requested、16 個任務堵著，
+-- 而控制台顯示「沒有需要你處理的事項」（待處理清單只掃 failed，推論漏了一種狀態）。
+--
+-- **「等人」從推論變成資料**：'to_role='human' AND consumed_at IS NULL' 就是待處理清單，
+-- 控制台／Slack／CLI 共用這一條查詢。推論會漏，查詢不會。
+--
+-- 機器可讀的**只有 to_role 與 kind 兩欄**：前者決定送給誰，後者決定 UI 畫哪幾顆按鈕。
+-- 成因分類、判斷內容、該怎麼辦一律在 body 裡，程式不讀也不解析——
+-- 這是為了不再長出第二個 semantic_drift（程式替失敗分類，然後假設失敗只有那幾種形狀）。
+CREATE TABLE IF NOT EXISTS handoffs (
+  id          TEXT PRIMARY KEY,
+  group_id    TEXT,
+  task_id     TEXT,
+  from_role   TEXT NOT NULL,             -- planner | coder | reviewer | merger | program
+  to_role     TEXT NOT NULL,             -- planner | coder | reviewer | merger | human
+  -- UI 路由碼：這張單要畫哪一組按鈕、按下去打到哪個 handler。
+  -- **這是「排版」不是「判斷」**——與被刪掉的 MergeVerdict.reason 性質不同：
+  -- 那個是程式替失敗分類，這個是「這張單長什麼樣」。
+  kind        TEXT NOT NULL,             -- clarification | no_change | needs_human | reclaim_blocked
+                                         -- | merge_approval | stuck_group | review_feedback | delivery
+  verdict     TEXT,                      -- agent 自己寫的一句結論（給人看，程式不解析）
+  blocking    INTEGER NOT NULL DEFAULT 1, -- 0 = 只是留個紀錄，不擋流程
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL,             -- 見上：NOT NULL 是刻意的，空字串由 openHandoff 擋
+  options     TEXT,                      -- JSON：給人的選項
+  if_ignored  TEXT,                      -- 不處理會怎樣
+  blindspots  TEXT,                      -- 「我沒驗到什麼」——放行書必填，空白不合法
+  evidence    TEXT,                      -- JSON：check_runs id／截圖路徑
+  scope       TEXT,                      -- 這個答覆適用範圍：這張卡／這一群／以後都這樣
+  session_id  TEXT,
+  created_at  INTEGER NOT NULL,
+  consumed_at INTEGER                    -- 人／下一棒處理完的時間。NULL = 還在等
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_inbox ON handoffs(to_role, consumed_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_group ON handoffs(group_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
 `;
 
 /**
@@ -173,6 +247,10 @@ CREATE INDEX IF NOT EXISTS idx_activity_started ON activity(started_at);
  * 常駐系統的 DB 是連續使用的，加欄位若沒有這一段，升級後每個查詢都會 `no such column` 炸掉。
  * 只做「加欄位」這一種遷移（不改型別、不刪欄位），所以無條件安全、可重複執行。
  */
+// **新表只有「第一次部署之前」是免費的。**
+// SCHEMA 裡的 CREATE TABLE IF NOT EXISTS 對已存在的表完全無效——正式 DB 一旦長出
+// check_runs／handoffs，之後想加欄位就只能走下面這張清單。所以那兩張表的欄位是
+// 一次建齊的（含目前還沒有寫入者的 verdict／blindspots／scope），寧可容忍 NULL。
 export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[] = [
   { table: 'tasks', column: 'source_updated_at', ddl: 'ALTER TABLE tasks ADD COLUMN source_updated_at INTEGER' },
   // 執行階段：這個群要等哪些群結束才能開跑（規劃 agent 排出來的順序）
