@@ -549,8 +549,20 @@ export function mergeGuardFeedback(
   }
 
   if (caveats.length > 0) parts.push('', `⚠ 但書：${caveats.join('；')}`);
-  if (detail) parts.push('', '── 原始輸出 ──', detail);
+  // **給 agent 全文，不要替它挑。** 它需要哪一行只有它自己知道——挑錯就是無聲地
+  // 拿掉它需要的資訊。只清 ANSI 色碼：那在純文字裡沒有意義，還會讓 ✓ 和 ✗ 難分辨。
+  if (detail) parts.push('', '── 原始輸出 ──', stripAnsi(detail));
   return parts.join('\n');
+}
+
+/**
+ * 清掉測試框架的 ANSI 色碼。
+ *
+ * 只做這一件事。**不挑行、不截斷**——哪幾行有用是讀的人（agent 或你）才判斷得出來的，
+ * 程式挑錯就是無聲地拿掉需要的資訊，而症狀會是「它看了輸出卻修錯方向」。
+ */
+export function stripAnsi(raw: string): string {
+  return raw.replace(/\x1b\[[0-9;]*m/g, '').trimEnd();
 }
 
 export function reviewFeedbackGate(fb: ReviewFeedback): GateReport {
@@ -905,7 +917,7 @@ export class GroupRunner {
       });
       if (!verdict.ok) {
         log.warn({ group: group.id, reason: verdict.reason }, 'Merge Guard 擋下');
-        ledger.logEvent('group', group.id, 'merge_guard_blocked', `${verdict.reason}: ${verdict.detail}`);
+        ledger.logEvent('group', group.id, 'merge_guard_blocked', `${verdict.reason}: ${stripAnsi(verdict.detail ?? '')}`);
 
         // 把判決**交回 agent 修**，而不是宣告失敗。
         //

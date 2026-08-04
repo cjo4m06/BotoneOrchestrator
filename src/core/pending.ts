@@ -25,6 +25,23 @@ export type PendingKind =
   | 'merge_approval'
   | 'stuck_group';
 
+/**
+ * 群組「停手交人」時可能停在哪些狀態（failed 以外的）。
+ *
+ * 為什麼要列這些而不是掃全部：merged 已經結束了，ready/forming 還在排隊，
+ * in_review 由上面的 merge_approval 負責。剩下這幾個才是「跑到一半停住、
+ * 而且系統不會自己再動它」的形狀。
+ */
+const HANDOFF_STATES = ['changes_requested', 'pr_open', 'merge_guard'] as const;
+
+/**
+ * 代表「這一群需要人介入」的事件。
+ *
+ * 判準放在事件而不是狀態：狀態是系統的內部分類（停在哪一步就是哪個狀態），
+ * 事件才是「有人得來處理」這件事實本身。
+ */
+const HANDOFF_EVENTS = ['requeue_exhausted', 'reconcile_needs_human'] as const;
+
 export interface PendingItem {
   kind: PendingKind;
   /** 任務或群組 id。 */
@@ -128,11 +145,35 @@ export function collectPending(ledger: AskLedger): PendingItem[] {
     }
   }
 
-  for (const g of ledger.listGroupsByState('failed')) {
+  // **不能只掃 failed。** 群組「停手交人」有兩種收尾：進 failed，或**留在原本的狀態**。
+  //
+  // 實跑撞到：g_1fb6a29e1a0c 重新派工用完 3 次，事件寫著「停手交人處理｜停在
+  // changes_requested」——它不在 failed，所以整段掃描看不到它。同一時間 g_5dc7cbe807d4
+  // 有 reconcile_needs_human 也停在 changes_requested。兩群在等人、16 個任務堵在它們後面，
+  // 控制台的「等你處理」是空的，什麼都沒發生也沒有人知道。
+  //
+  // 所以判準改成「有沒有留下**停手交人**的事件」，而不是「狀態是不是 failed」。
+  // 狀態是系統的內部分類，會因為停在哪一步而不同；事件才是「這件事需要人」的事實。
+  const stopped = new Map<string, Group>();
+  for (const g of ledger.listGroupsByState('failed')) stopped.set(g.id, g);
+  for (const st of HANDOFF_STATES) {
+    for (const g of ledger.listGroupsByState(st)) {
+      if (stopped.has(g.id)) continue;
+      const handoff = HANDOFF_EVENTS.some((k) => ledger.latestEvent?.('group', g.id, k));
+      if (handoff) stopped.set(g.id, g);
+    }
+  }
+
+  for (const g of stopped.values()) {
+    // 兩種停手講的是不同的事，標題不能混用：
+    // requeue_exhausted     = 試過 N 次都不成，你要決定還要不要再試
+    // reconcile_needs_human = 系統根本沒有自動路徑，再按重試也不會有事發生
     const exhausted = ledger.latestEvent?.('group', g.id, 'requeue_exhausted')?.detail;
-    // 最後一則失敗原因：優先用 requeue 耗盡的說明，否則找最近一次 blocked／失敗事件
+    const noAutoPath = ledger.latestEvent?.('group', g.id, 'reconcile_needs_human')?.detail;
+    // 最後一則失敗原因：優先用停手的說明，否則找最近一次 blocked／失敗事件
     const lastReason =
       exhausted ??
+      noAutoPath ??
       ledger.latestEvent?.('group', g.id, 'merge_guard_blocked')?.detail ??
       // 「已核准卻無路可走」也走這裡：它的原因寫在 merge_blocked
       ledger.latestEvent?.('group', g.id, 'merge_blocked')?.detail ??
@@ -145,8 +186,10 @@ export function collectPending(ledger: AskLedger): PendingItem[] {
       repo: g.repo,
       detail:
         (exhausted
-          ? `重新派工已達上限：${exhausted}`
-          : `群組失敗，需要你決定要不要重試：${firstLine(lastReason) || '（沒有留下原因，請看 log）'}`)
+          ? `重新派工已達上限：${firstLine(exhausted)}`
+          : noAutoPath
+            ? `沒有自動處理的路徑，要你親自處理：${firstLine(noAutoPath)}`
+            : `群組失敗，需要你決定要不要重試：${firstLine(lastReason) || '（沒有留下原因，請看 log）'}`)
         + waitingSuffix(blockedBy.get(g.id)),
       actions: ['retry'],
     });

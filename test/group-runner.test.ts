@@ -17,6 +17,7 @@ import {
   reworkProducedChanges,
   prepareLocalFiles,
   DEFAULT_LOCAL_FILES,
+  stripAnsi,
 } from '../src/core/group-runner.js';
 import type { AgentLike, McpTaskClient, Notifier, VerifierLike } from '../src/contracts.js';
 import type { PolicyInput } from '../src/policy/policy-engine.js';
@@ -1428,5 +1429,32 @@ describe('prepareLocalFiles', () => {
 
     assert.deepEqual(done, ['.npmrc'], '一個失敗不該影響其他');
     assert.ok(rec.messages('warn').some((m) => /本機設定檔複製失敗/.test(m)));
+  });
+});
+
+/**
+ * ANSI 色碼是終端標準，不是使用者專案的格式——清掉它不需要猜任何事。
+ *
+ * 這裡**刻意只做這一件事**：不挑行、不截斷。哪幾行有用只有讀的人（agent 或人）
+ * 判斷得出來；程式用正則猜「哪行像失敗」換一個測試框架就會抓錯，而且沒有人會知道。
+ */
+describe('stripAnsi：只清色碼，不動內容', () => {
+  it('清掉色碼，其餘一字不動', () => {
+    const raw = [
+      ` \x1b[32m✓\x1b[39m tests/e2e/a.spec.ts (7 tests) 873ms`,
+      '  Test Files  15 passed (15)',
+      '[test] ❌ 有測試失敗（排程回覆不記名, MOD-22 平台 chat 排程）',
+    ].join('\n');
+
+    const out = stripAnsi(raw);
+
+    assert.equal(out.includes('\x1b'), false, '色碼要清掉');
+    assert.match(out, /✓ tests\/e2e\/a\.spec\.ts/);
+    assert.match(out, /❌ 有測試失敗（排程回覆不記名/);
+    assert.equal(out.split('\n').length, 3, '一行都不能少——挑行是讀的人的事');
+  });
+
+  it('沒有色碼就原樣回來', () => {
+    assert.equal(stripAnsi('AssertionError: expected 1 to be 2'), 'AssertionError: expected 1 to be 2');
   });
 });

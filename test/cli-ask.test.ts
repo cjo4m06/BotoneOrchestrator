@@ -75,6 +75,59 @@ describe('CLI ask — 本機互動入口', () => {
     });
   });
 
+  /**
+   * 停手交人**不一定會進 failed**——群組可能就停在原本的狀態。
+   *
+   * 實跑撞到：g_1fb6a29e1a0c 重新派工用完 3 次，事件寫著「停手交人處理｜停在
+   * changes_requested」；同時 g_5dc7cbe807d4 有 reconcile_needs_human 也停在
+   * changes_requested。兩群在等人、16 個任務堵在它們後面，而控制台的
+   * 「等你處理」是空的——上面那個「一律要浮出來」的修正只套用到 failed。
+   */
+  describe('停在 failed 以外的狀態、但已經交人的群組也要浮出來', () => {
+    function stoppedGroup(id: string, taskId: string, state: 'changes_requested' | 'pr_open' | 'merge_guard') {
+      seedTask(taskId, '某任務');
+      const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: [taskId], footprint: [] });
+      tmp.ledger.updateGroupState(g.id, state);
+      return g.id;
+    }
+
+    it('requeue 耗盡但停在 changes_requested → 要列出來', () => {
+      const gid = stoppedGroup('g-d', 'T-D', 'changes_requested');
+      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '群組重新派工已達上限（3 次），停手交人處理｜停在 changes_requested');
+
+      const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
+
+      assert.equal(stuck.length, 1, '狀態不是 failed 不代表它不需要人');
+      assert.equal(stuck[0]!.id, gid);
+      assert.match(stuck[0]!.detail, /重新派工已達上限/);
+    });
+
+    it('reconcile_needs_human → 要列出來，而且說法要跟「重試用完」分開', () => {
+      const gid = stoppedGroup('g-e', 'T-E', 'changes_requested');
+      tmp.ledger.logEvent('group', gid, 'reconcile_needs_human', '審查要求修改：目前沒有自動回頭改的路徑，需人工處理');
+
+      const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
+
+      assert.equal(stuck.length, 1);
+      assert.match(stuck[0]!.detail, /沒有自動處理的路徑/);
+      // 這兩件事處境不同：一個是「還要不要再試」，一個是「再按重試也不會有事發生」
+      assert.equal(/重新派工已達上限/.test(stuck[0]!.detail), false);
+    });
+
+    it('沒有交人事件的 changes_requested 群組不要列（它還在正常流程裡）', () => {
+      stoppedGroup('g-f', 'T-F', 'changes_requested');
+      assert.deepEqual(collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group'), []);
+    });
+
+    it('同一群同時是 failed 又有交人事件 → 只列一次', () => {
+      const gid = stoppedGroup('g-g', 'T-G', 'changes_requested');
+      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '已重試 3 次');
+      tmp.ledger.updateGroupState(gid, 'failed');
+
+      assert.equal(collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group').length, 1);
+    });
+  });
+
   describe('collectPending：掃出等人處理的事項', () => {
     it('澄清：抓出問題並解析 agent 建議的預設', () => {
       seedTask('T-1', '登入頁');

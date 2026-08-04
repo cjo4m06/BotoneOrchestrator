@@ -166,8 +166,42 @@ export type WatchedReviewEvent =
   | { type: 'changes_requested'; group: string; comments: string[] };
 
 /**
- * Review Watcher（DESIGN §3 步驟 7 / D13）：週期性以 `gh` 查看處於 pr_open / in_review 的
- * 群組 PR，把 GitHub 上的審查結果轉成 ReviewEvent 回報給呼叫端。
+ * 還開著 PR、需要追 GitHub 狀態的群組。
+ *
+ * **判準是「有沒有 PR 編號」，不是「狀態在不在某張清單上」。**
+ *
+ * 先前寫死 `['pr_open', 'in_review']`，於是被 Merge Guard 退回 `changes_requested` 的群組
+ * 就從此不再被輪詢。實跑撞到：兩個 PR 在 GitHub 上被人合併了，群組卻永遠停在
+ * changes_requested，下游 4 個群一直說「前置任務的成果還沒進 base」——**16 個任務
+ * 永久死結**，而且每輪只有一行 WARN，看起來像在正常等待。
+ *
+ * 反過來寫（列出「已經結束、不用再追」的終態）才安全：日後多一個中間狀態，
+ * 預設是會被追到，而不是默默漏掉。
+ */
+const TERMINAL_GROUP_STATES: GroupState[] = ['merged', 'failed'];
+const LIVE_GROUP_STATES: GroupState[] = (
+  ['forming', 'ready', 'pr_open', 'in_review', 'changes_requested', 'merge_guard'] as GroupState[]
+).filter((s) => !TERMINAL_GROUP_STATES.includes(s));
+
+export function groupsWithLivePr(ledger: { listGroupsByState(state: GroupState): Group[] }): Group[] {
+  const seen = new Set<string>();
+  const out: Group[] = [];
+  for (const st of LIVE_GROUP_STATES) {
+    for (const g of ledger.listGroupsByState(st)) {
+      // 沒有 PR 編號的（forming/ready 多半如此）本來就沒東西可追，pollGroup 也會早退
+      if (!g.prNumber || seen.has(g.id)) continue;
+      seen.add(g.id);
+      out.push(g);
+    }
+  }
+  return out;
+}
+
+
+/**
+ * Review Watcher（DESIGN §3 步驟 7 / D13）：週期性以 `gh` 查看**所有還開著 PR 的群組**
+ * （見 groupsWithLivePr——不是只有 pr_open / in_review），把 GitHub 上的審查結果轉成
+ * ReviewEvent 回報給呼叫端。
  *
  *   approved          → 回報事件（**帶上核准者**，由呼叫端交給 Merge Guard；本模組**不會**自己合併）
  *   changes_requested → 群組轉 changes_requested，並把 reviewer 意見整理成可回灌 agent 的 feedback
@@ -202,7 +236,7 @@ export class ReviewWatcher {
 
   /** 掃一輪所有待審群組，回傳本輪新產生的審查事件（沒有就是空陣列）。 */
   async poll(): Promise<WatchedReviewEvent[]> {
-    const groups = [...this.ledger.listGroupsByState('pr_open'), ...this.ledger.listGroupsByState('in_review')];
+    const groups = groupsWithLivePr(this.ledger);
     if (groups.length === 0) return [];
 
     if (this.now() < this.unavailableUntil) {

@@ -6,6 +6,7 @@ import {
   GROUP_PARKED_EVENT,
   PARKED_GROUP_STATE,
   shouldRequeueGroup,
+  stripAnsi,
 } from './group-runner.js';
 import { DEFAULT_QUIET_MINUTES, splitByQuietPeriod } from './quiet-period.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from './merge-credential.js';
@@ -1316,7 +1317,7 @@ export class Orchestrator {
     if (!verdict.ok) {
       // 核准是對「當時那份程式碼」的核准；守衛擋下代表狀況已改變 → 憑證作廢
       this.clearApproval(group.id, `merge_guard:${verdict.reason}`);
-      ledger.logEvent('group', group.id, 'merge_guard_blocked', `${verdict.reason}: ${verdict.detail}`);
+      ledger.logEvent('group', group.id, 'merge_guard_blocked', `${verdict.reason}: ${stripAnsi(verdict.detail ?? '')}`);
       if (verdict.reason === 'precondition_failed') {
         // 「根本沒驗到」不可當成「要修」——沒有具體意見可以回灌，只能交人
         log.error({ group: group.id, detail: verdict.detail }, 'Merge Guard 前置條件不成立，群組標記 failed');

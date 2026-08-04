@@ -8,6 +8,7 @@ import {
   formatReviewFeedback,
   SEEN_EVENT_KIND,
   type ReviewLedgerLike,
+  groupsWithLivePr,
 } from '../src/pr/review-watcher.js';
 import type { CommandResult, CommandRunner } from '../src/pr/pr-manager.js';
 import type { Group, GroupState } from '../src/types.js';
@@ -108,8 +109,13 @@ function fakeLedger(groups: Group[], opts: { withEventQuery?: boolean } = {}) {
 // ── 測試 ──────────────────────────────────────────────────────────────
 
 describe('ReviewWatcher — 事件解析', () => {
-  it('沒有待審群組 → 直接回空，連 gh 都不呼叫', async () => {
-    const { ledger } = fakeLedger([makeGroup({ state: 'ready' })]);
+  // 「沒東西可追」的判準是**沒有 PR 編號**，不是「狀態不是 pr_open/in_review」。
+  // 被 requeue 的群組會回到 ready，但它的 PR 還開在 GitHub 上——那正是先前被漏掉、
+  // 造成 16 個任務永久死結的情況（見 groupsWithLivePr 的說明）。
+  it('沒有 PR 的群組 → 直接回空，連 gh 都不呼叫', async () => {
+    const g = makeGroup({ state: 'ready' });
+    delete (g as { prNumber?: number }).prNumber;
+    const { ledger } = fakeLedger([g]);
     const gh = fakeGh([]);
     const events = await new ReviewWatcher({ ledger, log: createSilentLogger(), run: gh.run }).poll();
 
@@ -534,5 +540,53 @@ describe('ReviewWatcher — 查 PR 用的是 group.repo', () => {
     });
     await w.poll();
     assert.equal(calls[0]![calls[0]!.indexOf('--repo') + 1], 'acme/web');
+  });
+});
+
+/**
+ * 被 Merge Guard 退回 changes_requested 的群組，PR 還開著、還會被人在 GitHub 上合併。
+ *
+ * 實跑撞到的死結：poll() 寫死只掃 ['pr_open','in_review']，於是那兩個群永遠不再被輪詢——
+ * 使用者手動合併了 PR #54/#46，群組卻永遠停在 changes_requested，
+ * 下游 4 個群一直回報「前置任務的成果還沒進 base」，16 個任務永久卡住，
+ * 而每輪只有一行 WARN，看起來跟正常等待一模一樣。
+ */
+describe('ReviewWatcher — 還開著 PR 的群組都要被追', () => {
+  for (const state of ['changes_requested', 'merge_guard', 'pr_open', 'in_review'] as const) {
+    it(`${state} 的群組，PR 在 GitHub 被合併 → 收斂成 merged`, async () => {
+      const group = makeGroup({ id: 'g1', state, prNumber: 42 });
+      const { ledger } = fakeLedger([group]);
+      const watcher = new ReviewWatcher({
+        ledger,
+        log: createSilentLogger(),
+        run: async () => ({ exitCode: 0, stdout: JSON.stringify({ number: 42, state: 'MERGED', url: 'u' }), stderr: '' }),
+      });
+
+      await watcher.poll();
+
+      assert.equal(group.state, 'merged', `${state} 的群組沒有被追到——PR 合了它卻永遠停在原地`);
+    });
+  }
+
+  it('沒有 PR 編號的群組不會被輪詢（forming/ready 本來就沒東西可追）', async () => {
+    const group = makeGroup({ id: 'g2', state: 'ready' });
+    delete (group as { prNumber?: number }).prNumber;
+    const { ledger } = fakeLedger([group]);
+    let called = 0;
+    const watcher = new ReviewWatcher({
+      ledger,
+      log: createSilentLogger(),
+      run: async () => { called += 1; return { exitCode: 0, stdout: '{}', stderr: '' }; },
+    });
+
+    await watcher.poll();
+
+    assert.equal(called, 0, '沒有 PR 就不該去問 GitHub');
+  });
+
+  it('同一群同時符合多個狀態查詢時只列一次', () => {
+    const g = makeGroup({ id: 'dup', state: 'changes_requested', prNumber: 7 });
+    const ledger = { listGroupsByState: (_s: GroupState) => [g] };
+    assert.equal(groupsWithLivePr(ledger).length, 1);
   });
 });
