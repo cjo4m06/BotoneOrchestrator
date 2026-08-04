@@ -296,24 +296,17 @@ export interface AppConfig {
 export function visualGateConfigOf(p: ProjectConfig): VisualGateConfig | undefined {
   if (!p.commands.devServer) return undefined;
   const v = p.visual;
+  // 量測用的旋鈕（maxDiffRatio / pixelTolerance / updateBaseline / maxElements）
+  // 隨截圖比對堆疊一起退場（第 15 片）。留下的都是「審查者要導到哪裡、看多寬」。
   return {
     devServer: p.commands.devServer,
-    devPort: p.commands.devPort,
-    routes: v.routes,
-    when: v.when,
-    categories: v.categories,
-    breakpoints: v.breakpoints,
-    screenshotRoot: v.screenshotRoot,
-    baselineRoot: v.baselineRoot,
-    maxDiffRatio: v.maxDiffRatio,
-    pixelTolerance: v.pixelTolerance,
-    updateBaseline: v.updateBaseline,
-    browserChannel: v.browserChannel,
-    serverReadyTimeoutMs: v.serverReadyTimeoutMs,
-    navTimeoutMs: v.navTimeoutMs,
-    settleMs: v.settleMs,
-    maxElements: v.maxElements,
-    thresholds: v.thresholds,
+    ...(p.commands.devPort === undefined ? {} : { devPort: p.commands.devPort }),
+    ...(v.routes ? { routes: v.routes } : {}),
+    ...(v.when ? { when: v.when } : {}),
+    ...(v.categories ? { categories: v.categories } : {}),
+    ...(v.breakpoints ? { breakpoints: v.breakpoints } : {}),
+    ...(v.screenshotRoot ? { screenshotRoot: v.screenshotRoot } : {}),
+    ...(v.baselineRoot ? { baselineRoot: v.baselineRoot } : {}),
   };
 }
 

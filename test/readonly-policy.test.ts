@@ -195,13 +195,12 @@ test('evaluateReadonlyCommand 空字串不當機', () => {
 
 import { readFileSync } from 'node:fs';
 
-test('四個唯讀角色都把 PreToolUse hook 接到 query 上', () => {
+test('每個唯讀角色都把 PreToolUse hook 接到 query 上', () => {
   const roles = [
     ['src/core/plan-agent.ts', '規劃 agent（cwd 是使用者真正的 checkout）'],
     ['src/worker/reviewer.ts', 'reviewer'],
     ['src/pr/drift-judge.ts', '飄移判斷者'],
     ['src/core/merge-risk-judge.ts', '合併風險判斷者'],
-    ['src/worker/ui-judge.ts', '介面判斷者'],
   ] as const;
 
   for (const [file, who] of roles) {
@@ -236,9 +235,6 @@ test('要查證的角色都必須有 Bash', () => {
   }
 });
 
-/** 介面判斷者是例外：它有專屬的唯讀 git 工具，不需要 Bash（刻意的設計）。 */
-test('介面判斷者用專屬的唯讀 git 工具，不需要 Bash', () => {
-  const src = readFileSync('src/worker/ui-judge.ts', 'utf8');
-  assert.match(src, /mcp__git__git_diff/, '沒有 Bash 就一定要有唯讀 git，否則它查不出「這次改了什麼」');
-  assert.match(src, /mcp__git__git_log/);
-});
+// 「介面判斷者」（ui-judge.ts）連同整套截圖量測堆疊已於第 15 片退場。
+// 畫面改由審查者自己開瀏覽器判斷，它拿的是 READONLY_BROWSER_TOOLS——
+// 那條「唯讀角色不得拿到 file_upload」的界線在 test/reviewer.test.ts 守著。

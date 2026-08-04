@@ -6,8 +6,6 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CheckResult, GateReport, TaskCategory } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { decomposeShellCommand, evaluateCommandRedline } from './agent-runtime.js';
-import { uiCheck, type UiVerdict } from './ui-judge.js';
-import { DEFAULT_BREAKPOINTS, VisualVerifier, classifyVisualError, toGateFragment, type VisualConfig, type VisualResult } from './visual.js';
 import { EMPTY_TREE, changedSince } from '../git/status.js';
 
 /** 指令型關卡（跑得到 exit code 的那種）。 */
@@ -43,18 +41,28 @@ export interface VisualTaskHint {
 }
 
 /**
- * 視覺關卡設定。沿用 VisualConfig 的所有旋鈕，但把「截圖／基準目錄」換成 *Root：
- * 實際目錄由 Verifier 依任務再開一層，而且**強制落在 worktree 之外**——
- * 截圖若寫進 worktree 會被算進 git diff，既污染 PR 也讓「diff 非空」的 DoD 判定失真。
+ * 視覺設定：**這個專案的畫面要看哪幾個頁面、哪些寬度**。
+ *
+ * 量測堆疊（截圖比對、版面稽核、UiJudge）已於第 15 片整套退場，畫面由審查者自己
+ * 開瀏覽器判斷。但 routes 留著——那是專案在說「這個 repo 的畫面在哪裡」，
+ * 審查者需要它才知道要導到哪一頁；`when`/`categories` 則是專案層唯一的關閉開關
+ * （沒列 routes ＝ 這個專案不做視覺驗證）。
  */
-export interface VisualGateConfig extends Omit<VisualConfig, 'screenshotDir' | 'baselineDir'> {
+export interface VisualGateConfig {
+  /** 要看的路由（相對 dev server 根路徑）。空的 ＝ 這個專案不做視覺驗證。 */
+  routes?: string[];
+  /** 要看的視窗寬度。 */
+  breakpoints?: { name: string; width: number; height?: number }[];
+  /** 起 dev server 的指令與埠（審查者要靠它把畫面跑起來）。 */
+  devServer?: string;
+  devPort?: number;
   /** 截圖根目錄（相對路徑以 daemon 的 process.cwd() 為基準）。預設 ./data/screenshots */
   screenshotRoot?: string;
-  /** 基準截圖根目錄；未設 → 不做視覺回歸（只截圖 + 爆版偵測） */
+  /** 基準截圖根目錄。 */
   baselineRoot?: string;
   /** 何時跑。預設 'auto' */
   when?: VisualGateWhen;
-  /** when='auto' 時視為「視覺任務」的類別。預設 ['design'] */
+  /** when='auto' 時視為「視覺任務」的類別。 */
   categories?: string[];
 }
 
@@ -87,20 +95,6 @@ export interface VerifierConfig {
   timeoutMs?: number;
 }
 
-/** VisualVerifier 的結構介面（供注入假件；單元測試不該真的開瀏覽器）。 */
-export interface VisualVerifierLike {
-  verify(input: {
-    cwd: string;
-    config: VisualConfig;
-    /** dev server 還活著時要做的事（判斷者要導頁互動）；回傳的關卡會併進結果。 */
-    whileServerUp?: (ctx: {
-      baseUrl: string;
-      screenshots: string[];
-      hints: CheckResult[];
-    }) => Promise<CheckResult[]>;
-  }): Promise<VisualResult>;
-}
-
 /**
  * 從任務與專案設定組出完整的 VisualTaskHint。
  * 呼叫端一律用它，不要自己拼欄位——漏一個就是一次靜默降級（見 VisualTaskHint 說明）。
@@ -118,36 +112,9 @@ export function taskHintOf(
   };
 }
 
-/** 介面判斷者的最小介面（供注入假件）。 */
-export interface UiJudgeLike {
-  judge(input: {
-    cwd: string;
-    baseRef?: string;
-    taskId?: string;
-    screenshots: string[];
-    baseUrl?: string;
-    routes?: string[];
-    hints?: string[];
-    taskTitle: string;
-    taskDescription?: string;
-  }): Promise<UiVerdict>;
-}
-
 export interface VerifierDeps {
-  /** 注入假的視覺驗證器；未注入時才 lazy 建立真的（避免無視覺任務也付出成本） */
-  visual?: VisualVerifierLike;
-  /**
-   * 截圖判斷者：量測之外，讓 agent 實際看那張圖。未注入就不跑這層，量測不受影響。
-   */
-  uiJudge?: UiJudgeLike;
   /** daemon 層的指令逾時預設（毫秒）；專案可用 VerifierConfig.timeoutMs 覆寫。 */
   commandTimeoutMs?: number;
-  /**
-   * 視覺關卡「執行期例外」（量測端自己壞掉，不是環境缺件）的通知鉤子。
-   * 未注入 → 只寫 error log（優雅降級：沒接通知的環境不能因此壞掉）。
-   * 這種故障靠 agent 修不好（問題在調度器/量測程式），必須讓人知道。
-   */
-  onVisualError?: (info: { cwd: string; detail: string }) => void | Promise<void>;
   /**
    * 關卡執行的記帳出口。未注入 → 不記（測試與還沒接線的呼叫端）。
    *
@@ -304,8 +271,6 @@ export function resolveVisualDirs(input: {
  *  - 簽章只吃「關卡名 + 穩定 failingIds」，不吃像素差百分比／耗時，否則無進展偵測會失效。
  */
 export class Verifier {
-  private lazyVisual?: VisualVerifierLike;
-
   constructor(private log: Logger, private deps: VerifierDeps = {}) {}
 
   async check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint; signal?: AbortSignal }): Promise<GateReport> {
@@ -337,18 +302,6 @@ export class Verifier {
       effective += 1;
     }
 
-    let screenshots: string[] | undefined;
-    let visualRan = false;
-
-    const visual = await this.runVisualGate(input, checks.every((c) => c.ok));
-    if (visual) {
-      checks.push(...visual.checks);
-      if (visual.screenshots.length > 0) screenshots = visual.screenshots;
-      if (visual.status !== 'skipped') {
-        effective += visual.checks.length;
-        visualRan = true;
-      }
-    }
 
     // 專案沒設任何驗證指令時的兩種處置（缺陷 3：以前一律不綠且無回饋 → Worker 永遠跑不完）：
     if (effective === 0) {
@@ -362,7 +315,7 @@ export class Verifier {
       // 「這個專案沒設關卡」與「關卡還沒跑」在一張空表上長得一模一樣——
       // 前者代表「這裡永遠不會有把關」，後者代表「再等一下」，處置完全相反。
       this.recordConfigFact(NO_GATES_COMMAND, NO_GATES_DETAIL);
-    } else if (commandsRun === 0 && !visualRan) {
+    } else if (commandsRun === 0) {
       // 只剩 diff 關卡且它過了 → 算綠（否則任務永遠跑不完），但驗證強度很弱，必須留痕。
       checks.push({ name: 'config', ok: true, detail: ONLY_DIFF_DETAIL });
       this.log.warn({ cwd: input.cwd }, 'DoD：本專案未設定驗證指令，僅以「diff 非空」判定完成（把關強度很弱）');
@@ -370,7 +323,7 @@ export class Verifier {
     }
 
     const green = effective > 0 && checks.every((c) => c.ok);
-    return this.finish(green, checks, screenshots);
+    return this.finish(green, checks);
   }
 
   /**
@@ -426,185 +379,24 @@ export class Verifier {
     return { name: 'diff', ok: true, detail: `${r.files.length} 個檔案有變更` };
   }
 
-  /** 回傳 undefined 代表「這輪根本沒跑視覺」（不列 check、不影響簽章）。 */
-  private async runVisualGate(
-    input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint },
-    commandsGreen: boolean,
-  ): Promise<{ checks: CheckResult[]; screenshots: string[]; status: VisualResult['status'] } | undefined> {
-    const config = input.config.visual;
-    const decision = decideVisualGate(config, input.task);
-    if (!decision.run) {
-      // **跳過一定要留下可見的痕跡。**
-      //
-      // 先前這裡只寫 debug log，於是「視覺從來沒驗過」在 GateReport 上完全看不出來
-      // ——一張把畫面改破版的卡，其他關卡全綠就一路走到 complete_task 與開 PR，
-      // 而報告上沒有任何一個字提到這件事。
-      //
-      // `ok: true` 是刻意的（跳過不等於失敗，不該擋住 DoD），但它會出現在報告裡，
-      // 人與下游 agent 都看得到「這次沒驗畫面，理由是 X」。
-      // 專案根本沒設視覺（最常見的情況）就不必吵——那不是缺口，是沒有這個需求。
-      const configured = Boolean(config?.devServer && config.routes?.length);
-      this.log.debug({ reason: decision.reason }, '視覺關卡：不需執行');
-      return configured
-        ? {
-            checks: [{ name: 'visual', ok: true, detail: `未驗畫面：${decision.reason ?? '未指定原因'}` }],
-            screenshots: [],
-            status: 'skipped',
-          }
-        : undefined;
-    }
-    if (!commandsGreen) {
-      // 指令關卡就紅了：dev server 多半也起不來，白花一次逾時；先把回饋集中在該修的東西上
-      this.log.info('指令關卡未綠，本輪略過視覺關卡');
-      return undefined;
-    }
-
-    const cfg = config as VisualGateConfig; // decision.run === true 保證存在
-
-    // 目錄解析與建立驗證器也放進 try：這段若丟例外同樣是「量測端壞掉」，
-    // 不能讓它冒到 check() 外面（那條路一樣不會有人判紅）。
-    try {
-      const dirs = resolveVisualDirs({ cwd: input.cwd, config: cfg, key: input.task?.id ?? basename(input.cwd), log: this.log });
-      const visualConfig: VisualConfig = { ...stripGateOnly(cfg), ...dirs };
-      // 判斷者在 dev server 還活著時跑：它要自己導頁、自己操作，
-      // 而不是只看某個路由某一瞬間的靜態截圖（按下去之後長怎樣，PNG 上永遠看不到）。
-      const r = await this.visual().verify({
-        cwd: input.cwd,
-        config: visualConfig,
-        whileServerUp: async (ctx) => {
-          const judged = await this.judgeUi(input, {
-            ...ctx,
-            routes: visualConfig.routes,
-            // 判斷者要知道「證據只涵蓋這幾個寬度」，才有辦法去看縫隙
-            capturedWidths: (visualConfig.breakpoints ?? DEFAULT_BREAKPOINTS).map((b) => b.width),
-          });
-          return judged ? [judged] : [];
-        },
-      });
-      const fragment = toGateFragment(r);
-      // 防呆：回報 failed 卻沒有任何 ok:false 的 check，green 會照樣是 true（靜默綠燈）。
-      // 這是 VisualVerifier 與 Verifier 之間的契約，寧可多一條紅燈也不能讓它默默通過。
-      const checks =
-        r.status === 'failed' && fragment.checks.every((c) => c.ok)
-          ? [...fragment.checks, { name: 'visual', ok: false, detail: VISUAL_INCONSISTENT_DETAIL, failingIds: [ID_VISUAL_ERROR] }]
-          : fragment.checks;
-      return { checks, screenshots: fragment.screenshots, status: r.status };
-    } catch (e) {
-      const detail = errText(e);
-      // 分兩類處置。以前這裡是 catch-all → 一律「跳過（綠）」，等於：只要量測程式丟例外，
-      // 爆版頁面就能靜默過關——這是最危險的誤判，必須拆開。
-      if (classifyVisualError(e) === 'environment') {
-        // 環境缺件（沒 playwright／沒瀏覽器／dev server 的執行檔不存在）：跳過但講明白，
-        // 不能因為這台機器沒瀏覽器就誤殺整個 DoD。
-        this.log.info({ err: detail }, '視覺關卡：環境缺件（不影響 DoD），視為跳過');
-        return {
-          checks: [{ name: 'visual', ok: true, detail: `跳過（環境缺件，非程式碼問題）：${detail}` }],
-          screenshots: [],
-          status: 'skipped',
-        };
-      }
-      // 執行期例外：量測/比對/截圖程式自己壞了，這一輪根本沒驗到頁面 → 不算通過。
-      // failingIds 用固定字串，反覆發生時簽章一致，才會被無進展偵測抓到（不會無限重試）。
-      await this.notifyVisualError(input.cwd, detail);
-      return {
-        checks: [
-          {
-            name: 'visual',
-            ok: false,
-            detail:
-              `視覺關卡執行期例外（量測端故障，不是頁面本身的問題）：${detail}\n` +
-              '這一輪沒有任何頁面被真正量測到，因此不能算通過。這通常是調度器/量測程式的問題，' +
-              '不是被驗專案的程式碼問題——請不要為了讓這關變綠而修改程式碼。',
-            failingIds: [ID_VISUAL_ERROR],
-          },
-        ],
-        screenshots: [],
-        status: 'failed',
-      };
-    }
-  }
-
   /**
-   * 通知「量測端壞掉」。這種故障 agent 修不好（問題在調度器），只能讓人知道。
-   * 沒注入鉤子 → 只寫 error log（優雅降級）；鉤子自己丟錯也不能反過來炸掉 DoD。
-   */
-  private async notifyVisualError(cwd: string, detail: string): Promise<void> {
-    this.log.error({ cwd, err: detail }, '視覺關卡執行期例外（量測端故障）：判定未通過並通知');
-    const hook = this.deps.onVisualError;
-    if (!hook) return;
-    try {
-      await hook({ cwd, detail });
-    } catch (e) {
-      this.log.warn({ err: errText(e) }, '視覺關卡例外通知失敗（不影響 DoD 判定）');
-    }
-  }
-
-  /**
-   * 讓 agent 看截圖判斷畫面。回傳 undefined 代表這一層不適用（沒注入判斷者、沒截圖）。
+   * ── 視覺關卡整段退場（第 15 片）──
    *
-   * 全程不擲錯：這是量測之外的主觀判斷層，任何失敗都不該讓量測結果被推翻。
-   */
-  private async judgeUi(
-    input: { cwd: string; task?: VisualTaskHint },
-    ctx: { baseUrl?: string; screenshots: string[]; hints?: CheckResult[]; routes?: string[]; capturedWidths?: number[] },
-  ): Promise<CheckResult | undefined> {
-    // 沒有材料就談不上判斷（量測本身失敗時另有紅燈）
-    if (ctx.screenshots.length === 0 && !ctx.baseUrl) return undefined;
-
-    const judge = this.deps.uiJudge;
-    if (!judge) {
-      // 視覺關卡跑了、也拿到畫面，卻沒有任何判斷者——那這一關等於沒有把關者。
-      // 這是接線問題，要吵出來，不能安靜地綠燈通過。
-      return {
-        name: 'visual:judge',
-        ok: false,
-        detail: '視覺關卡已啟用，但沒有接上介面判斷者（uiJudge）。沒有把關者的關卡不放行。',
-      };
-    }
-    try {
-      const verdict = await judge.judge({
-        cwd: input.cwd,
-        ...(input.task?.id ? { taskId: input.task.id } : {}),
-        // 判斷者在 worktree 裡，但沒有 Bash——給它唯讀的 git，它才查得到新舊
-        ...(input.task?.baseRef ? { baseRef: input.task.baseRef } : {}),
-        screenshots: ctx.screenshots,
-        // 有 dev server 就讓它自己導頁、自己互動——靜態截圖看不到「按下去之後」
-        ...(ctx.baseUrl ? { baseUrl: ctx.baseUrl } : {}),
-        ...(ctx.routes?.length ? { routes: ctx.routes } : {}),
-        ...(ctx.capturedWidths?.length ? { capturedWidths: ctx.capturedWidths } : {}),
-        // 量測到的可疑之處只當線索，不當結論
-        ...(ctx.hints?.length ? { hints: ctx.hints.map((h) => h.detail) } : {}),
-        taskTitle: input.task?.title ?? input.task?.id ?? '（未提供任務標題）',
-        ...(input.task?.description ? { taskDescription: input.task.description } : {}),
-      });
-      return uiCheck(verdict);
-    } catch (e) {
-      this.log.warn({ err: errText(e) }, '介面判斷失敗，略過（不影響量測結果）');
-      return undefined;
-    }
-  }
-
-  /** 真的要用時才建立（沒視覺任務的專案完全不碰 playwright）。 */
-  private visual(): VisualVerifierLike {
-    this.lazyVisual ??= this.deps.visual ?? new VisualVerifier({ log: this.log });
-    return this.lazyVisual;
-  }
-
-  /**
-   * 跑一個專案指令。**一定要有逾時**：hang 住的 test/build（等待輸入、watch 模式、
-   * 等不到的 port）會永久凍結整個 daemon。逾時視為該關卡失敗並在 detail 明說原因，
-   * 讓 agent 知道是「跑不完」而不是「測試紅」。
+   * 這裡原本有一套量測堆疊：起 dev server、逐斷點截圖、算像素差、跑版面稽核規則、
+   * 再交給一個 UiJudge 判「這樣算不算破版」（visual.ts 1005 行 ＋ layout-audit.ts 860 行
+   * ＋ ui-judge.ts 535 行）。
    *
-   * 註：shell:true 時 execa 殺的是 shell；孫行程理論上可能殘留（子行程自己 detach 的情況），
-   * 但至少監督迴圈能繼續走，不會整個調度器卡死。
-   */
-  /**
-   * 跑一個專案指令，**並把這一次執行記進 check_runs**。
+   * 換掉它的是**審查者自己開瀏覽器去看**（第 12 片）：它拿唯讀的瀏覽器工具、自己導頁、
+   * 自己判斷，而且放行時必須填 uiChecked（看了哪幾條路由與哪些寬度，或為什麼沒看），
+   * 空白會被退回。
    *
-   * 記帳是旁路：任何一條回傳路徑都要記到，而且記帳失敗不改變關卡結果。
-   * 這裡把「跑」與「記」分開——runCheckInner 只負責跑並回報原始事實
-   * （exit code 與全文輸出），解讀留給讀的人。
+   * 為什麼不是兩個都留：同一個畫面跑兩套判斷、付兩次 LLM 的錢，而且舊的那套可以把
+   * 新放行書已經放行的東西判紅——兩個閘門互相打架，人分不出到底是誰擋的。
+   *
+   * `visual` 設定裡的 routes 沒有跟著刪：那是專案在說「這個 repo 要看哪幾個頁面」，
+   * 審查者需要它。
    */
+
   private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<CheckResult> {
     const startedAt = Date.now();
     const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, signal);
@@ -865,13 +657,6 @@ export async function gitHeadRef(cwd: string): Promise<string | undefined> {
 // changedSince 的定義搬到 src/git/status.ts（那裡是「相對基準有沒有變更」的唯一來源）。
 // 這裡 re-export 讓既有的 `import { changedSince } from './verifier.js'` 不必改。
 export { changedSince, type WorkspaceChanges } from '../git/status.js';
-
-/** 去掉只有 Verifier 看得懂的欄位（*Root/when/categories），剩下的才是 VisualVerifier 的設定。 */
-function stripGateOnly(config: VisualGateConfig): VisualConfig {
-  const rest: Record<string, unknown> = { ...config };
-  for (const k of ['screenshotRoot', 'baselineRoot', 'when', 'categories']) delete rest[k];
-  return rest as VisualConfig;
-}
 
 /** 解成絕對路徑，並確保不在 worktree 內；若在，改導到預設根目錄（再不行就用系統暫存）。 */
 function outsideWorktree(dir: string, cwd: string, log?: Logger): string {

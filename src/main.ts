@@ -38,7 +38,6 @@ import { browserServerConfig } from './worker/agent-runtime.js';
 import { PlanAgent, type InFlightGroup } from './core/plan-agent.js';
 import { MergeRiskJudge } from './core/merge-risk-judge.js';
 import { DriftJudge } from './pr/drift-judge.js';
-import { UiJudge } from './worker/ui-judge.js';
 import { hasClaudeAuth } from './worker/reviewer.js';
 import { withFetchLock } from './git/fetch-lock.js';
 import { InboundRouter, type CompleteTaskFn } from './notify/notifier.js';
@@ -117,25 +116,11 @@ export function verifierDepsOf(
   /** 記帳出口。介面判斷者會開瀏覽器跑很多輪，先前它的花費完全沒被記。 */
   usage?: UsageSink,
 ): VerifierDeps {
+  // 介面判斷者（UiJudge）與整套截圖量測堆疊已於第 15 片退場——畫面由審查者
+  // 自己開瀏覽器看，放行時必須填 uiChecked。驗證器現在只剩「跑指令、記帳」。
   const sec = orch.commandTimeoutSec;
-  // 判斷者自己開瀏覽器去看、去操作。輸出目錄必須在 worktree 之外，
-  // 否則它的截圖會被當成 agent 的成果 commit 進 PR。
-  const browser = browserServerConfig(browserOutputRoot, 'ui-judge');
   return {
     ...(sec > 0 ? { commandTimeoutMs: sec * 1000 } : {}),
-    ...(log
-      ? {
-          uiJudge: new UiJudge({
-            log,
-            ...(orch.agent?.models?.uiJudge ? { model: orch.agent.models.uiJudge } : {}),
-            ...(browser ? { browser } : {}),
-            // 判斷者最常撞到「我看到問題但查不下去」——給它一個說出口的地方
-            ...(frictionSink ? { frictionSink } : {}),
-            // 它會開瀏覽器跑很多輪，是判斷者裡最貴的一個。先前完全沒記帳
-            ...(usage ? { usage } : {}),
-          }),
-        }
-      : {}),
   };
 }
 

@@ -113,11 +113,10 @@ test('同一個 session 多次記錄要累加，不是長出兩列', (t) => {
 // 這一段才是重點。函式本身好好的但某個角色忘了接，症狀就是「那個角色的花費永遠是 0」，
 // 而畫面上看起來完全正常——那正是這個 bug 原本的形狀。
 
-test('五個 agent 角色都在 runQuery 裡記帳', () => {
+test('每個 agent 角色都在 runQuery 裡記帳', () => {
   const roles = [
     ['src/core/plan-agent.ts', 'plan', '規劃 agent（單次十幾分鐘，最貴的之一）'],
     ['src/worker/reviewer.ts', 'reviewer', 'reviewer'],
-    ['src/worker/ui-judge.ts', 'ui_judge', '介面判斷者（開瀏覽器跑很多輪）'],
     ['src/pr/drift-judge.ts', 'drift_judge', '飄移判斷者'],
     ['src/core/merge-risk-judge.ts', 'merge_risk_judge', '合併風險判斷者'],
   ] as const;
@@ -129,16 +128,14 @@ test('五個 agent 角色都在 runQuery 裡記帳', () => {
   }
 });
 
-/** 漏掉這個接線，五個角色的 usage sink 都是 undefined，記帳等於沒做。 */
-test('main 有把 ledger 當成 usage sink 注入五個角色', () => {
+/** 漏掉這個接線，那個角色的 usage sink 就是 undefined，記帳等於沒做。 */
+test('main 有把 ledger 當成 usage sink 注入每個角色', () => {
   const src = readFileSync('src/main.ts', 'utf8');
   for (const ctor of ['new PlanAgent({', 'new Reviewer({', 'new DriftJudge({', 'new MergeRiskJudge({']) {
     const i = src.indexOf(ctor);
     assert.ok(i >= 0, `找不到 ${ctor}`);
     assert.match(src.slice(i, i + 200), /usage: ledger/, `${ctor} 沒有注入 usage sink`);
   }
-  // 介面判斷者走 verifierDepsOf
-  assert.match(src, /usage \? \{ usage \} : \{\}/, 'UiJudge 沒有接 usage');
 });
 
 /** 預算閘門與帳面用的是同一個查詢——這正是這個 bug 之所以危險的原因。 */
@@ -146,7 +143,7 @@ test('預算閘門讀的是含全部角色的總額', (t) => {
   const h = createTmpLedger();
   t.after(() => h.cleanup());
   recordAgentUsage(h.ledger, createSilentLogger(), { kind: 'plan', repo: 'a/b' }, RESULT);
-  recordAgentUsage(h.ledger, createSilentLogger(), { kind: 'ui_judge', repo: 'a/b' }, { ...RESULT, session_id: 's-2' });
+  recordAgentUsage(h.ledger, createSilentLogger(), { kind: 'merge_risk_judge', repo: 'a/b' }, { ...RESULT, session_id: 's-2' });
 
   assert.equal(h.ledger.costSummary().costUsd, 2.5, '判斷者的錢也要進總額，否則上限擋不住');
 });

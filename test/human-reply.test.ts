@@ -135,7 +135,6 @@ describe('Worker — 人回覆後接回原 session', () => {
 
   it('有未消費的回覆 → resume 舊 session 並注入答覆；沒有則從新 session 開始', async () => {
     const { Worker } = await import('../src/worker/worker.js');
-    const { ProgressMonitor } = await import('../src/worker/progress.js');
     const { makeTaskDetail } = await import('./helpers/index.js');
 
     const task = makeTaskDetail({ id: 'T-1', status: 'todo', docRefs: [] });
@@ -195,7 +194,6 @@ describe('Worker — 人回覆後接回原 session', () => {
    */
   it('沒有人類回覆 → 照樣續接同一個 session，但不注入答覆', async () => {
     const { Worker } = await import('../src/worker/worker.js');
-    const { ProgressMonitor } = await import('../src/worker/progress.js');
     const { makeTaskDetail } = await import('./helpers/index.js');
 
     const task = makeTaskDetail({ id: 'T-2', status: 'todo', docRefs: [] });
