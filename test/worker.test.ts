@@ -21,11 +21,10 @@ import {
 const makeTask = (over: Partial<TaskDetail> = {}): TaskDetail =>
   makeTaskDetail({ id: 'T-1', title: '做一個按鈕', status: 'todo', description: '描述', docRefs: ['spec/ui.md#按鈕'], ...over });
 
-const green = (sig = 'green'): GateReport => ({ green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }], signature: sig });
+const green = (): GateReport => ({ green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }] });
 const red = (sig = 'red', ids: string[] = ['alpha']): GateReport => ({
   green: false,
   checks: [{ name: 'test', ok: false, detail: 'not ok 1 - alpha', failingIds: ids }],
-  signature: sig,
 });
 
 interface FakeMcp extends McpTaskClient {
@@ -579,7 +578,7 @@ describe('Worker — 單任務監督迴圈', () => {
     seed(task);
     const agent = fakeAgent([{}]);
     // green=false 但沒有任何 ok=false 的 check：沒東西可講，不該回灌
-    const { worker } = build({ agent, verifier: fakeVerifier([{ green: false, checks: [], signature: 'empty' }, green()]) });
+    const { worker } = build({ agent, verifier: fakeVerifier([{ green: false, checks: [] }, green()]) });
 
     await worker.runTask({ task, ...cfg });
 
@@ -1380,9 +1379,7 @@ describe('Worker — 單任務監督迴圈', () => {
 
       assert.deepEqual(out, { status: 'done' }, '過載是暫時的，退避後應該要能完成');
       assert.equal(agent.inputs.length, 2);
-      // SDK 的重試資訊要落進 lastError，人才知道是 API 在退避而不是 agent 卡住
-      const events = tmp.ledger.recentSignatures('T-1', 5);
-      assert.ok(events.length >= 0);
+
     });
 
     it('沒有 errorKind（舊行為/分不出來）→ 維持退避重試，不可因此永久停下', async () => {

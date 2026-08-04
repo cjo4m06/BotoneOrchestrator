@@ -305,7 +305,6 @@
               <tr><td>寫程式<div class="why">實作任務、依審查意見修正</div></td><td><select id="m-coder"></select></td></tr>
               <tr><td>審查者<div class="why">對照規格逐項檢查 diff</div></td><td><select id="m-reviewer"></select></td></tr>
               <tr><td>分群<div class="why">判斷任務怎麼分群、排執行順序</div></td><td><select id="m-planner"></select></td></tr>
-              <tr><td>介面判斷<div class="why">開瀏覽器看畫面行不行</div></td><td><select id="m-uiJudge"></select></td></tr>
               <tr><td>語意飄移<div class="why">rebase 後判斷有沒有跟別人打架</div></td><td><select id="m-driftJudge"></select></td></tr>
               <tr><td>合併風險<div class="why">「做錯了救得回來嗎」</div></td><td><select id="m-riskJudge"></select></td></tr>
             </table>
@@ -714,7 +713,9 @@ $('newProject').onclick = () => openEditor(null);
 $('closeDialog').onclick = () => $('projectDialog').close();
 
 const CMD_KEYS = ['typecheck', 'lint', 'build', 'test', 'devServer', 'devPort'];
-const MODEL_ROLES = ['coder', 'reviewer', 'planner', 'uiJudge', 'driftJudge', 'riskJudge'];
+// 介面判斷者已退場（畫面改由審查者自己開瀏覽器看），設定頁不再顯示它。
+// 設定 schema 仍容忍舊的 uiJudge 鍵，免得使用者存過的值被靜默丟棄。
+const MODEL_ROLES = ['coder', 'reviewer', 'planner', 'driftJudge', 'riskJudge'];
 // 只有別名、不帶版本號：寫 opus 就永遠是最新的 opus，不必每次出新版回來改設定
 const MODEL_ALIASES = ['opus', 'sonnet', 'haiku'];
 for (const role of MODEL_ROLES) {

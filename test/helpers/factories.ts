@@ -46,7 +46,6 @@ export function makeGateReport(overrides: Partial<GateReport> = {}): GateReport 
   return {
     green: overrides.green ?? checks.every((c) => c.ok),
     checks,
-    signature: overrides.signature ?? checks.map((c) => `${c.name}:${c.ok ? 1 : 0}`).join('|'),
     ...(overrides.screenshots ? { screenshots: overrides.screenshots } : {}),
   };
 }

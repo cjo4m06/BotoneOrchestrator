@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { SCHEMA, applyColumnMigrations } from './schema.js';
+import { SCHEMA, applyColumnMigrations, applyOneTimeDdl } from './schema.js';
 import type { Task, TaskState, Group, GroupState, BlockReason } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { HANDOFF_ACTIONS, handoffKindOfBlock } from '../core/handoff.js';
@@ -61,6 +61,13 @@ export type ActivityInput = Omit<Activity, 'startedAt' | 'heartbeatAt'>;
 
 /** 一次 agent 執行的紀錄（同一 session 多輪會累加）。 */
 /** agent 角色。記帳要分得出「寫程式的錢」與「判斷者的錢」。 */
+/**
+ * 記帳時的角色標記。
+ *
+ * `ui_judge` 已經沒有產生者（介面判斷者於第 15 片退場），但**保留成合法值**：
+ * agent_sessions 裡有歷史列帶著這個 kind，拿掉它會讓那些列對不上任何角色，
+ * 而成本報表是要回頭看的東西。
+ */
 export type AgentKind = 'worker' | 'plan' | 'reviewer' | 'ui_judge' | 'drift_judge' | 'merge_risk_judge';
 
 export interface AgentSessionInput {
@@ -325,6 +332,11 @@ export class Ledger {
     const migrated = applyColumnMigrations(this.db); // 先補欄位，再跑 SCHEMA（新表由 SCHEMA 建）
     this.db.exec(SCHEMA);
     if (migrated > 0) this.log.info({ migrated }, 'ledger 補上新欄位');
+    // 一次性 DDL 要在 SCHEMA **之後**跑：DROP 掉的表如果先執行，
+    // 緊接著的 CREATE TABLE IF NOT EXISTS 會立刻把它建回來（順序反了等於沒刪）。
+    // 記帳與 DDL 同一個交易，見 applyOneTimeDdl 的說明。
+    const ran = this.db.transaction(() => applyOneTimeDdl(this.db))();
+    if (ran.length > 0) this.log.warn({ ddl: ran }, 'ledger 執行了一次性結構變更（不可逆，請確認已有備份）');
     this.log.debug('ledger schema 已套用');
   }
 
@@ -687,22 +699,7 @@ export class Ledger {
 
   // ── Iterations（無進展偵測用） ──
 
-  recordIteration(taskId: string, round: number, signature: string, green: boolean, diffHash?: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO task_iterations (task_id, round, signature, green, diff_hash, created_at)
-         VALUES (@taskId, @round, @signature, @green, @diffHash, @ts)`,
-      )
-      .run({ taskId, round, signature, green: green ? 1 : 0, diffHash: diffHash ?? null, ts: this.now() });
-  }
 
-  /** 取最近 n 輪的結果簽章（新到舊）。 */
-  recentSignatures(taskId: string, n: number): string[] {
-    const rows = this.db
-      .prepare('SELECT signature FROM task_iterations WHERE task_id = ? ORDER BY round DESC LIMIT ?')
-      .all(taskId, n) as { signature: string }[];
-    return rows.map((r) => r.signature);
-  }
 
   // ── Groups ──
 
@@ -758,7 +755,6 @@ export class Ledger {
    * 任務板那邊可能已經改過描述、刪掉、或加了新的前置條件。
    */
   deleteTask(id: string): void {
-    this.db.prepare('DELETE FROM task_iterations WHERE task_id = ?').run(id);
     this.db.prepare('DELETE FROM agent_sessions WHERE task_id = ?').run(id);
     this.db.prepare('DELETE FROM clarifications WHERE task_id = ?').run(id);
     this.db.prepare("DELETE FROM events WHERE scope = 'task' AND ref_id = ?").run(id);
@@ -977,36 +973,6 @@ export class Ledger {
     return res.changes;
   }
 
-  /**
-   * 刪除早於 cutoffMs 的迭代紀錄，但**每個任務至少保留最近 keepPerTask 筆**，回傳刪除筆數。
-   *
-   * 為什麼要保底：task_iterations 是無進展偵測（recentSignatures）的資料源，
-   * 也是「這個任務到底試了幾輪、每輪結果如何」的唯一軌跡。純以時間清會讓一個
-   * 長期卡住的任務把歷史整個清空，偵測邏輯反而看不出它一直沒進展。
-   * 另外，進行中（in_progress/verifying）的任務一律完全不動——它的歷史正在被讀。
-   */
-  pruneTaskIterations(cutoffMs: number, keepPerTask: number): number {
-    if (!Number.isFinite(cutoffMs)) {
-      this.log.warn({ cutoffMs }, 'pruneTaskIterations：cutoff 非有效數值，本次不清理');
-      return 0;
-    }
-    const keep = Number.isFinite(keepPerTask) ? Math.max(0, Math.floor(keepPerTask)) : 0;
-    const res = this.db
-      .prepare(
-        `DELETE FROM task_iterations
-          WHERE created_at < @cutoff
-            AND task_id NOT IN (SELECT id FROM tasks WHERE state IN ('in_progress','verifying'))
-            AND id NOT IN (
-              SELECT id FROM (
-                SELECT id, ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY round DESC, id DESC) AS rn
-                  FROM task_iterations
-              ) WHERE rn <= @keep
-            )`,
-      )
-      .run({ cutoff: cutoffMs, keep });
-    if (res.changes > 0) this.log.info({ deleted: res.changes, cutoffMs, keep }, '已清除逾期迭代紀錄');
-    return res.changes;
-  }
 
   // ── row 映射 ──
 

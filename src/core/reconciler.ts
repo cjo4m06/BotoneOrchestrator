@@ -51,7 +51,6 @@ export interface ReconcilerLedger {
   /** 可選：刪除 created_at 早於 cutoffMs 的稽核事件，回傳刪除筆數。 */
   pruneEvents?(cutoffMs: number): number;
   /** 可選：刪除 created_at 早於 cutoffMs 的迭代紀錄，但每個任務至少保留 keepPerTask 筆。 */
-  pruneTaskIterations?(cutoffMs: number, keepPerTask: number): number;
 }
 
 /** 檔案系統探針（worktree 是否還在、掃孤兒目錄、判定目錄新舊）。 */
@@ -661,18 +660,9 @@ export class Reconciler {
         report.actions.push({ scope: 'retention', ref: 'events', decision: 'pruned', detail: `清除 ${n} 筆逾 ${this.retention.eventDays} 天的稽核事件` });
       }
     }
-    if (ledger.pruneTaskIterations) {
-      const n = ledger.pruneTaskIterations(now - this.retention.iterationDays * DAY_MS, this.retention.keepIterationsPerTask);
-      if (n > 0) {
-        report.iterationsPruned = n;
-        report.actions.push({
-          scope: 'retention', ref: 'task_iterations', decision: 'pruned',
-          detail: `清除 ${n} 筆逾 ${this.retention.iterationDays} 天的迭代紀錄（每任務至少留 ${this.retention.keepIterationsPerTask} 筆）`,
-        });
-      }
-    }
-    if (!ledger.pruneEvents || !ledger.pruneTaskIterations) {
-      log.debug('ledger 未提供 prune 能力，略過 events/task_iterations 保留策略');
+    // task_iterations 的保留策略隨整張表一起退場（第 15 片）。
+    if (!ledger.pruneEvents) {
+      log.debug('ledger 未提供 prune 能力，略過 events 保留策略');
     }
   }
 

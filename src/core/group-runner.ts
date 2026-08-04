@@ -580,14 +580,13 @@ export function reviewFeedbackGate(fb: ReviewFeedback): GateReport {
   return {
     green: false,
     checks: [{ name: REVIEW_FEEDBACK_CHECK, ok: false, detail: formatFeedback(fb) }],
-    signature: `review-feedback:${fb.source}:${fb.comments.length}`,
   };
 }
 
 /** 合併兩份關卡報告的失敗項（審查意見 + 本輪 DoD 失敗，agent 要一次看到全部）。 */
 function mergeGates(a: GateReport, b: GateReport | undefined): GateReport {
   if (!b) return a;
-  return { green: false, checks: [...a.checks, ...b.checks], signature: `${a.signature}+${b.signature}` };
+  return { green: false, checks: [...a.checks, ...b.checks] };
 }
 
 /**

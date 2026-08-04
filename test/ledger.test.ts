@@ -207,27 +207,8 @@ test('setBlock 可不帶 detail；換原因會覆蓋前一次的 detail', (t) =>
   assert.equal(b?.detail, undefined, '新的 block 不應殘留舊 detail');
 });
 
-// ── iterations（無進展偵測資料源） ──
-
-test('recordIteration / recentSignatures：新到舊排序並受 n 限制', (t) => {
-  const { ledger } = setup(t);
-  ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-8' }));
-
-  ledger.recordIteration('T-8', 1, 'sig-a', false, 'diff1');
-  ledger.recordIteration('T-8', 2, 'sig-b', false);
-  ledger.recordIteration('T-8', 3, 'sig-c', true, 'diff3');
-
-  assert.deepEqual(ledger.recentSignatures('T-8', 2), ['sig-c', 'sig-b']);
-  assert.deepEqual(ledger.recentSignatures('T-8', 10), ['sig-c', 'sig-b', 'sig-a']);
-  assert.deepEqual(ledger.recentSignatures('T-8', 0), []);
-});
-
-test('recentSignatures 只看該任務，且無紀錄時回空陣列', (t) => {
-  const { ledger } = setup(t);
-  ledger.recordIteration('T-9', 1, 'x', false);
-  assert.deepEqual(ledger.recentSignatures('T-9', 3), ['x']);
-  assert.deepEqual(ledger.recentSignatures('T-other', 3), []);
-});
+// task_iterations 整張表已於第 15 片退場（見 schema.ts 的 ONE_TIME_DDL）：
+// 它存的是每輪的結果簽章，唯一用途是無進展偵測，而簽章本身已於第 14 片下線。
 
 // ── Groups ──
 
@@ -425,54 +406,7 @@ test('pruneEvents：cutoff 之後的事件不動；cutoff 非數值時保守不�
   assert.equal(ledger.listEvents({}).length, 1);
 });
 
-/** 直接寫入指定 created_at 的迭代紀錄（繞過 recordIteration 的 now()）。 */
-function seedIterations(dbPath: string, taskId: string, rounds: number[], createdAt: number): void {
-  const db = new Database(dbPath);
-  const stmt = db.prepare(
-    'INSERT INTO task_iterations (task_id, round, signature, green, diff_hash, created_at) VALUES (?, ?, ?, 0, NULL, ?)',
-  );
-  for (const r of rounds) stmt.run(taskId, r, `sig-${r}`, createdAt);
-  db.close();
-}
-
-test('pruneTaskIterations：清逾期但每個任務至少保留最近 N 筆（保住無進展偵測的軌跡）', (t) => {
-  const h = setup(t);
-  const old = Date.now() - 90 * 24 * 3600_000;
-  h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-a' }));
-  h.ledger.updateTaskState('T-a', 'done');
-  seedIterations(h.dbPath, 'T-a', [1, 2, 3, 4, 5], old);
-
-  const deleted = h.ledger.pruneTaskIterations(Date.now() - 30 * 24 * 3600_000, 2);
-  assert.equal(deleted, 3);
-  assert.deepEqual(h.ledger.recentSignatures('T-a', 10), ['sig-5', 'sig-4'], '保留的必須是最近的那幾輪');
-});
-
-test('pruneTaskIterations：進行中的任務完全不動；未逾期的也不動', (t) => {
-  const h = setup(t);
-  const old = Date.now() - 90 * 24 * 3600_000;
-  for (const id of ['T-run', 'T-verify', 'T-done']) {
-    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id }));
-    seedIterations(h.dbPath, id, [1, 2, 3], old);
-  }
-  h.ledger.updateTaskState('T-run', 'in_progress');
-  h.ledger.updateTaskState('T-verify', 'verifying');
-  h.ledger.updateTaskState('T-done', 'done');
-  h.ledger.recordIteration('T-done', 4, 'sig-new', true); // 新的，不該被清
-
-  const deleted = h.ledger.pruneTaskIterations(Date.now() - 30 * 24 * 3600_000, 0);
-  assert.equal(deleted, 3, '只有已 done 任務的 3 筆逾期紀錄會被清');
-  assert.deepEqual(h.ledger.recentSignatures('T-run', 10), ['sig-3', 'sig-2', 'sig-1']);
-  assert.deepEqual(h.ledger.recentSignatures('T-verify', 10), ['sig-3', 'sig-2', 'sig-1']);
-  assert.deepEqual(h.ledger.recentSignatures('T-done', 10), ['sig-new']);
-});
-
-test('pruneTaskIterations：cutoff 非數值時保守不清；keepPerTask 為負數視為 0', (t) => {
-  const h = setup(t);
-  seedIterations(h.dbPath, 'T-x', [1], Date.now() - 90 * 24 * 3600_000);
-  assert.equal(h.ledger.pruneTaskIterations(Number.NaN, 5), 0);
-  assert.equal(h.ledger.recentSignatures('T-x', 10).length, 1);
-  assert.equal(h.ledger.pruneTaskIterations(Date.now(), -1), 1);
-});
+// task_iterations 的保留策略測試隨整張表一起退場（第 15 片）。
 
 test('close 之後再操作會丟錯（確保連線真的關掉）', (t) => {
   const h = createTmpLedger();

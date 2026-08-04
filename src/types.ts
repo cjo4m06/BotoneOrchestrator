@@ -94,14 +94,6 @@ export interface Group {
   updatedAt: number;
 }
 
-export interface TaskIteration {
-  taskId: string;
-  round: number;
-  signature: string;            // 結果簽章（無進展偵測）
-  green: boolean;
-  diffHash?: string;
-  createdAt: number;
-}
 
 // ── MCP 契約（handler__* 的型別化包裝） ──
 export interface RepoInfo { repo: string; owner: string; name: string; branch?: string; }
@@ -151,17 +143,6 @@ export interface CheckResult { name: string; ok: boolean; detail: string; failin
 export interface GateReport {
   green: boolean;
   checks: CheckResult[];
-  /**
-   * @deprecated 結果簽章已下線（第 14 片），驗證器不再產生它。
-   *
-   * 它原本是「無進展偵測」的資料源：把失敗關卡名 + 從輸出撈到的失敗測試名雜湊起來，
-   * 簽章連續幾輪一樣就當成空轉。撈失敗測試名那一步只認得 TAP／node:test／jest 三種格式，
-   * 其餘工具鏈一律回空陣列——於是簽章退化成「只看哪幾條關卡紅」，
-   * 而 agent 每輪都在改不同的東西，卻被判定為「沒有進展」。
-   *
-   * 型別欄位留到第 15 片與 task_iterations 一起清掉。
-   */
-  signature?: string;
   screenshots?: string[];
 }
 export interface GroupOutcome { groupId: string; ok: boolean; prUrl?: string; error?: string; }

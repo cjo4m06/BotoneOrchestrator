@@ -56,11 +56,8 @@ describe('紅燈的完整輸出交給 agent，不挑行也不猜測試名', () =
     assert.match(gate.checks[0]?.detail ?? '', /not ok 1 - alpha/, '但原始輸出必須在，讀得懂的是 agent');
   });
 
-  it('簽章不再產生（無進展偵測連同它一起下線）', async () => {
-    const v = new Verifier(createSilentLogger());
-    const gate = await v.check({ cwd: dir.path, config: { test: 'true' } });
-    assert.equal(gate.signature, undefined);
-  });
+  // 「簽章不再產生」那條退場：GateReport.signature 這個欄位本身已於第 15 片刪掉，
+  // 由 typecheck 守著（誰想加回來會當場編不過），不必再用執行期斷言。
 });
 
 describe('formatGateFeedback：agent 這一輪會看到的那段文字', () => {

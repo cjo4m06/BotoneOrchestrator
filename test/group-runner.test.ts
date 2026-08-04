@@ -199,7 +199,7 @@ function fakeApprovalNotifier(over: { fail?: boolean } = {}): Notifier & {
 
 const greenVerifier = (): VerifierLike => ({
   async check() {
-    return { green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }], signature: 'g' };
+    return { green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }] };
   },
 });
 
@@ -1087,7 +1087,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
       reworkRounds: 2,
       makeVerifier: () => ({
         async check(): Promise<GateReport> {
-          return { green: false, checks: [{ name: 'test', ok: false, detail: '測試紅' }], signature: 'red' };
+          return { green: false, checks: [{ name: 'test', ok: false, detail: '測試紅' }] };
         },
       }),
     });

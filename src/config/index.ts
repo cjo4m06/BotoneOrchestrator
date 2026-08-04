@@ -26,18 +26,6 @@ const VisualBreakpointSchema = z.object({
   width: z.number(),
   height: z.number(),
 });
-
-const LayoutThresholdsSchema = z.object({
-  docOverflowSlackPx: z.number().optional(),
-  elementOverflowSlackPx: z.number().optional(),
-  textClipSlackPx: z.number().optional(),
-  maxOverlapRatio: z.number().optional(),
-  maxRowSkewPx: z.number().optional(),
-  maxGapSpreadPx: z.number().optional(),
-  gapSpreadRelative: z.number().optional(),
-  maxObscuredRatio: z.number().optional(),
-});
-
 const VisualSchema = z
   .object({
     // 空陣列 = 這個專案不做視覺驗證（完全不啟瀏覽器）
@@ -48,15 +36,13 @@ const VisualSchema = z
     // 截圖/基準都必須放 worktree 外，否則會被算進 git diff 污染 PR
     screenshotRoot: z.string().default('./data/screenshots'),
     baselineRoot: z.string().optional(),
-    maxDiffRatio: z.number().optional(),
-    pixelTolerance: z.number().optional(),
-    updateBaseline: z.boolean().optional(),
     browserChannel: z.string().optional(),
     serverReadyTimeoutMs: z.number().optional(),
     navTimeoutMs: z.number().optional(),
     settleMs: z.number().optional(),
-    maxElements: z.number().optional(),
-    thresholds: LayoutThresholdsSchema.optional(),
+    // 量測用的旋鈕（maxDiffRatio / pixelTolerance / updateBaseline / maxElements /
+    // thresholds）隨截圖比對與版面稽核堆疊一起退場（第 15 片）。它們從來沒有出現在
+    // 控制台的表單上，只有量測程式在讀——那些程式已經不存在了。
   })
   .prefault({});
 
@@ -270,9 +256,16 @@ export const OrchestratorSchema = z.object({
             coder: ModelAlias.optional(),
             reviewer: ModelAlias.optional(),
             planner: ModelAlias.optional(),
-            uiJudge: ModelAlias.optional(),
             driftJudge: ModelAlias.optional(),
             riskJudge: ModelAlias.optional(),
+            /**
+             * @deprecated 介面判斷者已於第 15 片退場（畫面改由審查者自己開瀏覽器判斷）。
+             *
+             * 欄位**保留**而不是刪掉：正式 DB 的 settings JSON 裡已經有這個鍵，
+             * zod 預設會把未知欄位剝掉，於是「使用者設過的值」在下一次存檔時被靜默丟棄。
+             * 留著讓它原樣進出，沒有人讀它——比「悄悄改掉使用者的設定」好。
+             */
+            uiJudge: ModelAlias.optional(),
           })
           .prefault({}),
     })

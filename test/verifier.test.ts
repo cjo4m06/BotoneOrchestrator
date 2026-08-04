@@ -73,9 +73,9 @@ describe('Verifier — DoD 關卡', () => {
     assert.match(gate.checks[0]?.detail ?? '', /設定問題/);
     assert.match(gate.checks[0]?.detail ?? '', /commands/);
     assert.deepEqual(gate.checks[0]?.failingIds, ['no-gates']);
-    // 簽章仍需可計算且穩定（固定字串，不可帶變動內容）
+    // 種類碼是固定字串，重跑一樣（不可帶變動內容）
     const again = await verifier.check({ cwd: dir.path, config: {} });
-    assert.equal(gate.signature, again.signature);
+    assert.deepEqual(again.checks[0]?.failingIds, ['no-gates']);
   });
 
   /**
@@ -125,11 +125,12 @@ describe('Verifier — DoD 關卡', () => {
       assert.deepEqual(gate.checks[0]?.failingIds, ['timeout']);
     });
 
-    it('逾時兩次 → 簽章相同（不含耗時等變動內容）', async () => {
+    it('逾時兩次 → 種類碼都是 timeout（不含耗時等變動內容）', async () => {
       const cfg = { test: 'sleep 30', timeoutMs: 150 };
       const a = await verifier.check({ cwd: dir.path, config: cfg });
       const b = await verifier.check({ cwd: dir.path, config: cfg });
-      assert.equal(a.signature, b.signature);
+      assert.deepEqual(a.checks[0]?.failingIds, ['timeout']);
+      assert.deepEqual(b.checks[0]?.failingIds, ['timeout']);
     });
 
     it('daemon 層可設預設逾時；專案設定優先', async () => {

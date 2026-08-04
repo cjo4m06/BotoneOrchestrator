@@ -126,12 +126,17 @@ describe('reviewGateReport / toReviewOutcome', () => {
     assert.equal(reviewGateReport({ status: 'skipped', reason: '無金鑰' }).green, true);
   });
 
-  it('同一批違規簽章穩定、不同批不同（供無進展偵測）', () => {
-    const a = reviewGateReport({ status: 'fail', violations: [{ requirement: 'A', problem: 'x' }] });
-    const b = reviewGateReport({ status: 'fail', violations: [{ requirement: 'A', problem: 'y' }] });
-    const c = reviewGateReport({ status: 'fail', violations: [{ requirement: 'B', problem: 'x' }] });
-    assert.equal(a.signature, b.signature);
-    assert.notEqual(a.signature, c.signature);
+  it('違規內容原樣進 detail：規格要求、哪裡不符、建議都在', () => {
+    const g = reviewGateReport({
+      status: 'fail',
+      violations: [{ docRef: 'spec/a.md#登入', requirement: '要有錯誤提示', problem: '沒有', suggestion: '加一個 toast' }],
+    });
+
+    const detail = g.checks[0]?.detail ?? '';
+    assert.match(detail, /spec\/a\.md#登入/);
+    assert.match(detail, /要有錯誤提示/);
+    assert.match(detail, /沒有/);
+    assert.match(detail, /加一個 toast/, '建議也要送到 agent 手上，否則它只知道錯不知道怎麼改');
   });
 
   it('ok 語意：只有 fail 會擋', () => {

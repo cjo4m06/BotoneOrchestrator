@@ -398,12 +398,12 @@ export function reviewGateReport(verdict: ReviewVerdict): GateReport {
         failingIds: verdict.violations.map((v) => v.requirement),
       },
     ];
-    return { green: false, checks, signature: reviewSignature(verdict.violations) };
+    return { green: false, checks };
   }
 
   const detail = verdict.status === 'pass' ? verdict.notes.join('；') || 'ok' : `略過：${verdict.reason}`;
   const checks: CheckResult[] = [{ name: 'reviewer', ok: true, detail }];
-  return { green: true, checks, signature: reviewSignature([]) };
+  return { green: true, checks };
 }
 
 /** 包裝成 Worker 期望的形狀（ok + asGateReport）。 */
@@ -422,11 +422,6 @@ export function truncateDiff(diff: string, maxChars: number): string {
   return `${diff.slice(0, half)}\n\n…（diff 過長，中間 ${diff.length - maxChars} 字元已省略）…\n\n${diff.slice(-half)}`;
 }
 
-/** 違規簽章：與 Verifier 一致的用途——同一批問題重複出現時簽章不變，供無進展偵測。 */
-function reviewSignature(violations: ReviewViolation[]): string {
-  const key = violations.map((v) => `${v.docRef ?? ''}:${v.requirement}`).sort().join('|');
-  return createHash('sha1').update(`reviewer|${key}`).digest('hex').slice(0, 16);
-}
 
 /** 從文字中抓出第一個完整的 JSON 物件（優先 ```json 圍欄，其次括號配對）。 */
 function extractJsonObject(text: string): string | null {

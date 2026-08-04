@@ -57,20 +57,12 @@ CREATE TABLE IF NOT EXISTS groups (
 );
 CREATE INDEX IF NOT EXISTS idx_groups_state ON groups(state);
 
-CREATE TABLE IF NOT EXISTS task_iterations (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id     TEXT NOT NULL,
-  round       INTEGER NOT NULL,
-  signature   TEXT NOT NULL,
-  green       INTEGER NOT NULL,
-  diff_hash   TEXT,
-  created_at  INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_iter_task ON task_iterations(task_id);
--- 保留策略要「每個任務留最近 N 筆」，需要 (task_id, round) 的走訪順序；
--- created_at 索引則讓「刪除逾期」不必全表掃描。
-CREATE INDEX IF NOT EXISTS idx_iter_task_round ON task_iterations(task_id, round DESC);
-CREATE INDEX IF NOT EXISTS idx_iter_created ON task_iterations(created_at);
+-- task_iterations 已於第 15 片退場（DROP 見下方 ONE_TIME_DDL）。
+-- 它存的是每輪的「結果簽章」，唯一的用途是無進展偵測——而簽章的組成裡
+-- 「失敗的測試叫什麼」只認得三種測試框架的輸出格式，其他工具鏈一律撈不到，
+-- 於是簽章退化成「哪幾條關卡是紅的」，把「每輪都在修不同東西」誤判成空轉。
+-- 這裡刻意不留 CREATE：留著的話 DROP 之後下次開機又會被建回來。
+
 
 CREATE TABLE IF NOT EXISTS clarifications (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,8 +296,81 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
 ];
 
 export interface MigratableDb {
-  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+  prepare(sql: string): { all(...params: unknown[]): unknown[]; get(...params: unknown[]): unknown; run(...params: unknown[]): unknown };
   exec(sql: string): unknown;
+}
+
+/**
+ * 一次性的 DDL（加欄位以外的結構變更）。
+ *
+ * ── 為什麼需要跟 COLUMN_MIGRATIONS 分家 ──
+ *
+ * 上面那張清單只做一件事：`PRAGMA table_info` 看欄位在不在，不在就加。它判斷「做過沒」
+ * 的依據是**結果本身**（欄位存在＝做過了），所以天生冪等、不需要記錄。
+ *
+ * DROP TABLE 沒有這種性質：表被刪掉之後，SCHEMA 裡的 `CREATE TABLE IF NOT EXISTS`
+ * 會在下一次開機時把空表**建回來**——用「表在不在」當判準的話，這條遷移會每次開機
+ * 都跑一次，而且每次都認為自己是第一次。所以要另外記一筆「已經執行過」。
+ *
+ * ── 回滾語意（刻意寫死在這裡）──
+ *
+ * 舊版程式重啟時，SCHEMA 會把 task_iterations 建成空表。那是安全的：
+ * 舊版對它只有寫入與讀取，讀到空的就是「沒有歷史」，不會擲錯。
+ * 換句話說這個 DROP 丟掉的是**資料**，不是相容性——所以執行前要備份。
+ */
+export const ONE_TIME_DDL: { id: string; sql: string; why: string; affects: string }[] = [
+  {
+    id: 'drop-task-iterations-v1',
+    sql: 'DROP TABLE IF EXISTS task_iterations',
+    why: '無進展偵測（結果簽章）已於第 14 片下線，這張表沒有任何寫入者與讀取者',
+    // 全新的 DB 根本沒有這張表 → 這條不算「動到了東西」，不該吵。
+    affects: 'task_iterations',
+  },
+];
+
+/** ONE_TIME_DDL 執行紀錄在 settings 裡的鍵。 */
+export const APPLIED_DDL_KEY = 'applied_ddl';
+
+/**
+ * 跑還沒跑過的一次性 DDL，回傳**真的動到了東西**的那幾個 id（全新的 DB 一律回空陣列）。
+ *
+ * 記帳與 DDL **在同一個交易裡**：分開的話，DDL 成功而記帳失敗會讓它下次再跑一次
+ * （對 DROP IF EXISTS 無害，但對未來任何有副作用的 DDL 就是災難）。
+ *
+ * 記帳失敗不可以靜默跳過 DDL——那會變成「每次開機都在跑遷移，而且沒有人知道」。
+ */
+export function applyOneTimeDdl(db: MigratableDb): string[] {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(APPLIED_DDL_KEY) as { value?: string } | undefined;
+  let done: string[] = [];
+  try {
+    const parsed: unknown = row?.value ? JSON.parse(row.value) : [];
+    if (Array.isArray(parsed)) done = parsed.filter((x): x is string => typeof x === 'string');
+  } catch {
+    // 記錄壞掉時**當成沒跑過**：這裡的 DDL 一律要求冪等（DROP IF EXISTS），
+    // 重跑的代價遠小於「以為跑過了其實沒跑」。
+    done = [];
+  }
+
+  const ran: string[] = [];
+  const changed: string[] = [];
+  for (const d of ONE_TIME_DDL) {
+    if (done.includes(d.id)) continue;
+    // **「跑過了」與「動到了東西」要分開。**
+    //
+    // 全新的 DB 沒有 task_iterations，DROP IF EXISTS 是 no-op——把它報成
+    // 「執行了不可逆的結構變更，請確認已有備份」是**每一次建新 DB 都會出現的假警報**
+    //（每個測試、每個新 profile）。狼來了喊多了，真正該看的那一次就沒人會看。
+    const existed = (db.prepare(`PRAGMA table_info(${d.affects})`).all() as unknown[]).length > 0;
+    db.exec(d.sql);
+    ran.push(d.id);
+    if (existed) changed.push(d.id);
+  }
+  if (ran.length > 0) {
+    const next = JSON.stringify([...done, ...ran]);
+    db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .run(APPLIED_DDL_KEY, next, Date.now());
+  }
+  return changed;
 }
 
 /** 回傳實際執行的遷移數（測試與啟動日誌用）。 */

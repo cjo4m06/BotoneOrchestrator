@@ -365,7 +365,7 @@ class ScriptedAgent implements AgentLike {
       return { sessionId: 'x', resultText: `沒有腳本可跑（${id}）`, isError: true, toolCalls: {} };
     }
     const step = steps[Math.min(n, steps.length - 1)]!;
-    log.info({ taskId: id, step: n + 1, feedback: input.feedback?.signature }, '🤖 假 agent 執行一輪');
+    log.info({ taskId: id, step: n + 1, feedback: input.feedback?.checks.filter((c) => !c.ok).map((c) => c.name).join('、') }, '🤖 假 agent 執行一輪');
     return step(input);
   }
 }

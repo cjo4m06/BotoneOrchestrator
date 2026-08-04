@@ -574,23 +574,21 @@ describe('保留策略（避免長期常駐磁碟無限成長）', () => {
     assert.deepEqual(fs.removed, [doneOld]);
   });
 
-  test('ledger 具備 prune 能力時，events / task_iterations 依保留期清理', async () => {
+  // task_iterations 的保留策略隨整張表一起退場（第 15 片）。
+  test('ledger 具備 prune 能力時，events 依保留期清理', async () => {
     const ledger = new PrunableLedger();
     const report = await new Reconciler(
-      makeDeps({ ledger, fs: new FakeFs(), git: new FakeGit(), clock: () => NOW, retention: { eventDays: 10, iterationDays: 5, keepIterationsPerTask: 7 } }),
+      makeDeps({ ledger, fs: new FakeFs(), git: new FakeGit(), clock: () => NOW, retention: { eventDays: 10 } }),
     ).reconcile();
 
     assert.equal(report.eventsPruned, 12);
-    assert.equal(report.iterationsPruned, 34);
     assert.equal(ledger.pruneArgs.events, NOW - 10 * DAY);
-    assert.deepEqual(ledger.pruneArgs.iterations, [NOW - 5 * DAY, 7]);
   });
 
   test('ledger 沒有 prune 能力時安全略過（優雅降級）', async () => {
     const ledger = new FakeLedger();
     const report = await new Reconciler(makeDeps({ ledger, fs: new FakeFs(), git: new FakeGit(), clock: () => NOW })).reconcile();
     assert.equal(report.eventsPruned, 0);
-    assert.equal(report.iterationsPruned, 0);
   });
 
   test('dryRun 不執行任何保留清理', async () => {
