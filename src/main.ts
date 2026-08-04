@@ -1,6 +1,7 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
+import { createCheckRecorder, type CheckContext } from './worker/check-recorder.js';
 import { pathToFileURL } from 'node:url';
 import { execa } from 'execa';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -101,6 +102,11 @@ export function verifierConfigOf(p: ProjectConfig): VerifierConfig {
  * 也會讓「diff 非空」的 DoD 判定被垃圾檔滿足。
  */
 export const browserOutputRootOf = (dataRoot: string): string => join(dataRoot, 'browser-tmp');
+
+/** 關卡全文太長時的落地目錄。跟截圖一樣掛在 dataRoot 底下，絕不寫進 worktree。 */
+export function checkOutputRootOf(dataRoot: string): string {
+  return join(dataRoot, 'check-outputs');
+}
 
 export function verifierDepsOf(
   orch: Pick<OrchestratorConfig, 'commandTimeoutSec' | 'agent'>,
@@ -611,7 +617,7 @@ export interface CreateMergePipelineInput {
   worktreeBase?: string;
   git?: GitRun;
   /** DoD 驗證器工廠（Merge Guard 在「合併後狀態」重跑用）。 */
-  makeVerifier?: () => VerifierLike;
+  makeVerifier?: (ctx?: CheckContext) => VerifierLike;
   /** 測試注入：預設 ensureMergeWorkspace。 */
   ensureWorkspace?: EnsureMergeWorkspace;
   guard?: MergeGuardLike;
@@ -1414,7 +1420,11 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       },
     }),
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
-    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger)),
+    makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
+      ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),
+      checkRecorder: createCheckRecorder({ ledger, log, outputRoot: checkOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT) }),
+      ...(ctx ? { checkContext: ctx } : {}),
+    }),
     progressRounds: config.orchestrator.noProgress.rounds,
     notifier: gateway,
     // 合併會動到 base 分支，安全優先：必須明確開啟
@@ -1827,7 +1837,11 @@ export async function main(): Promise<void> {
     actions,
     log,
     dataRoot: boot.dataRoot,
-    makeVerifier: () => new Verifier(log, verifierDepsOf(config.orchestrator, log, browserOutputRootOf(boot.dataRoot), ledger, ledger)),
+    makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
+      ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(boot.dataRoot), ledger, ledger),
+      checkRecorder: createCheckRecorder({ ledger, log, outputRoot: checkOutputRootOf(boot.dataRoot) }),
+      ...(ctx ? { checkContext: ctx } : {}),
+    }),
   });
 
   const { dispatcher, orchestrator } = buildPipeline({

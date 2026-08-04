@@ -19,6 +19,7 @@
  * 也不必把 `delete_repo`（能刪掉你**任何** repo）留在 token 上。
  */
 import { execa } from 'execa';
+import { createCheckRecorder, type CheckContext } from '../src/worker/check-recorder.js';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createLogger } from '../src/observability/logger.js';
@@ -490,7 +491,10 @@ async function runFlow(repo: TempRepo): Promise<number> {
     worktreeBase: join(ROOT, 'worktrees'),
     resolveProject: (r) => (r === repo.full ? runtime : undefined),
     agent,
-    makeVerifier: () => new Verifier(log),
+    makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
+      checkRecorder: createCheckRecorder({ ledger, log }),
+      ...(ctx ? { checkContext: ctx } : {}),
+    }),
     progressRounds: 3,
     notifier: Object.assign(notifier, { askMergeApproval: (ts: string | undefined, g: { groupId: string }) => gateway.askMergeApproval(ts, g) }),
     allowLocalMerge: false, // 有 PR 時一律走 PR 合併路徑（不本地合併，避免孤兒 PR）

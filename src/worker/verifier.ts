@@ -1,4 +1,5 @@
 import { execa } from 'execa';
+import type { CheckContext, CheckRecorder } from './check-recorder.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -148,6 +149,17 @@ export interface VerifierDeps {
    * 這種故障靠 agent 修不好（問題在調度器/量測程式），必須讓人知道。
    */
   onVisualError?: (info: { cwd: string; detail: string }) => void | Promise<void>;
+  /**
+   * 關卡執行的記帳出口。未注入 → 不記（測試與還沒接線的呼叫端）。
+   *
+   * 這是**旁路**：記帳失敗不改變關卡結果，也不往外冒。
+   */
+  checkRecorder?: CheckRecorder;
+  /**
+   * 記帳需要的上下文（哪個 repo、哪條分支、哪一種工作區、誰要求跑的）。
+   * 沒有它就不知道這一列屬於誰，記了也查不出東西——所以缺它時視同沒接記帳。
+   */
+  checkContext?: CheckContext;
 }
 
 // 固定關卡順序：便宜/快的先跑（早失敗早回饋）。視覺關卡最貴，永遠排最後。
@@ -517,23 +529,55 @@ export class Verifier {
    * 註：shell:true 時 execa 殺的是 shell；孫行程理論上可能殘留（子行程自己 detach 的情況），
    * 但至少監督迴圈能繼續走，不會整個調度器卡死。
    */
+  /**
+   * 跑一個專案指令，**並把這一次執行記進 check_runs**。
+   *
+   * 記帳是旁路：任何一條回傳路徑都要記到，而且記帳失敗不改變關卡結果。
+   * 這裡把「跑」與「記」分開——runCheckInner 只負責跑並回報原始事實
+   * （exit code 與全文輸出），解讀留給讀的人。
+   */
   private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<CheckResult> {
+    const startedAt = Date.now();
+    const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, signal);
+    const ctx = this.deps.checkContext;
+    if (this.deps.checkRecorder && ctx) {
+      this.deps.checkRecorder.record({
+        repo: ctx.repo,
+        ...(ctx.branch ? { branch: ctx.branch } : {}),
+        workspaceKind: ctx.workspaceKind,
+        command: cmd,
+        ...(ctx.headSha ? { headSha: ctx.headSha } : {}),
+        ...(ctx.verifiedBaseSha ? { verifiedBaseSha: ctx.verifiedBaseSha } : {}),
+        // undefined 代表**沒跑起來**（紅線擋下、spawn 失敗），與「跑了但失敗」是不同的事實
+        ...(inner.exitCode === undefined ? {} : { exitCode: inner.exitCode }),
+        output: inner.output,
+        requestedBy: ctx.requestedBy,
+        startedAt,
+        endedAt: Date.now(),
+      });
+    }
+    return inner.result;
+  }
+
+  private async runCheckInner(
+    name: string,
+    cmd: string,
+    cwd: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ result: CheckResult; exitCode?: number; output: string }> {
     // 先過部署紅線：關卡指令是以 shell 實跑的，`npm run build` 可能一路展開到 `firebase deploy`。
     // 命中就**拒絕執行**並判紅（fail-closed）——寧可讓任務卡住等人看，也不能誤觸真實部署。
     const redline = await evaluateGateCommandRedline(cmd, cwd);
     if (redline.deny) {
       this.log.error({ name, cmd, cwd, reason: redline.reason }, 'DoD 關卡指令命中部署紅線，已拒絕執行');
-      return {
-        name,
-        ok: false,
-        detail:
-          `已拒絕執行本關卡指令：${redline.reason}\n` +
-          `關卡指令：${cmd}\n` +
-          '調度器絕不代為執行部署（DESIGN §10）。請把部署動作移出這個關卡會跑到的 script' +
-          '（例如改由 CI 或人工執行），或在 projects.yaml 改用不含部署的指令。',
-        // 固定 id：設定沒改的話每輪都一樣，無進展偵測才抓得到（不會無限重試）
-        failingIds: [ID_REDLINE],
-      };
+      const detail =
+        `已拒絕執行本關卡指令：${redline.reason}\n` +
+        `關卡指令：${cmd}\n` +
+        '調度器絕不代為執行部署（DESIGN §10）。請把部署動作移出這個關卡會跑到的 script' +
+        '（例如改由 CI 或人工執行），或在 projects.yaml 改用不含部署的指令。';
+      // 固定 id：設定沒改的話每輪都一樣，無進展偵測才抓得到（不會無限重試）
+      return { result: { name, ok: false, detail, failingIds: [ID_REDLINE] }, output: detail };
     }
 
     let res: Awaited<ReturnType<typeof runShell>>;
@@ -543,26 +587,22 @@ export class Verifier {
       // reject:false 之外仍可能丟（cwd 不存在、無法 spawn shell）。跑都跑不起來 = 沒驗到東西，
       // 絕不能當成通過。
       this.log.error({ name, cmd, cwd, err: errText(e) }, 'DoD 關卡指令無法執行');
-      return {
-        name,
-        ok: false,
-        detail: `指令無法執行（沒有驗到任何東西，因此不算通過）：${errText(e)}\n關卡指令：${cmd}`,
-        failingIds: [ID_EXEC_ERROR],
-      };
+      const detail = `指令無法執行（沒有驗到任何東西，因此不算通過）：${errText(e)}\n關卡指令：${cmd}`;
+      return { result: { name, ok: false, detail, failingIds: [ID_EXEC_ERROR] }, output: detail };
     }
     const output = res.all ?? `${res.stdout}\n${res.stderr}`;
 
     if (res.timedOut) {
       this.log.error({ name, cmd, cwd, timeoutMs }, 'DoD 關卡逾時，已終止該指令');
+      const detail =
+        `逾時：指令超過 ${timeoutMs}ms 仍未結束，已被終止。` +
+        `\n可能是測試/建置卡住（等待輸入、watch 模式、等不到的服務），或這個專案本來就需要更長時間` +
+        `（可調 projects.yaml 的驗證逾時設定）。\n最後輸出：\n${lastLines(output, 20)}`;
+      // 固定 id：逾時反覆發生時簽章要一致，才會被無進展偵測抓到
       return {
-        name,
-        ok: false,
-        detail:
-          `逾時：指令超過 ${timeoutMs}ms 仍未結束，已被終止。` +
-          `\n可能是測試/建置卡住（等待輸入、watch 模式、等不到的服務），或這個專案本來就需要更長時間` +
-          `（可調 projects.yaml 的驗證逾時設定）。\n最後輸出：\n${lastLines(output, 20)}`,
-        // 固定 id：逾時反覆發生時簽章要一致，才會被無進展偵測抓到
-        failingIds: [ID_TIMEOUT],
+        result: { name, ok: false, detail, failingIds: [ID_TIMEOUT] },
+        ...(res.exitCode === undefined ? {} : { exitCode: res.exitCode }),
+        output,
       };
     }
 
@@ -571,20 +611,20 @@ export class Verifier {
       // 不會被誤判成通過，但若不特別說明，回饋就是一片空白，agent 只能亂改。
       const why = res.shortMessage || res.message || '未知原因';
       this.log.error({ name, cmd, cwd, err: why }, 'DoD 關卡指令無法執行');
-      return {
-        name,
-        ok: false,
-        detail: `指令無法執行（沒有驗到任何東西，因此不算通過）：${firstLine(why)}\n關卡指令：${cmd}`,
-        failingIds: [ID_EXEC_ERROR],
-      };
+      const detail = `指令無法執行（沒有驗到任何東西，因此不算通過）：${firstLine(why)}\n關卡指令：${cmd}`;
+      return { result: { name, ok: false, detail, failingIds: [ID_EXEC_ERROR] }, output: output || detail };
     }
 
     const ok = res.exitCode === 0;
     return {
-      name,
-      ok,
-      detail: ok ? 'ok' : lastLines(output, 30),
-      failingIds: ok ? undefined : extractFailingIds(output),
+      result: {
+        name,
+        ok,
+        detail: ok ? 'ok' : lastLines(output, 30),
+        failingIds: ok ? undefined : extractFailingIds(output),
+      },
+      exitCode: res.exitCode,
+      output,
     };
   }
 

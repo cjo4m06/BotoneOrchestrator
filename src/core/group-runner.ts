@@ -11,6 +11,7 @@ import { formatFeedback, type FeedbackSource, type ReviewFeedback } from '../pr/
 import { readDiffStat, type PolicyInput } from '../policy/policy-engine.js';
 import type { MergeRiskVerdict } from './merge-risk-judge.js';
 import { gitDiffHash } from '../git/status.js';
+import type { CheckContext } from '../worker/check-recorder.js';
 import { resolveBaseFreshness } from '../git/base-freshness.js';
 import { syncTaskCard } from './card-status.js';
 import { gitHeadRef, taskHintOf } from '../worker/verifier.js';
@@ -169,7 +170,11 @@ export interface GroupRunnerDeps {
   worktreeBase: string;
   resolveProject: (repo: string) => ProjectRuntime | undefined;
   agent: AgentLike;
-  makeVerifier: () => VerifierLike;
+  /**
+   * 建一個驗證器。`ctx` 是**記帳用的上下文**（哪個 repo、哪條分支、哪一種工作區、
+   * 誰要求跑的）——沒有它，check_runs 記了也查不出這一列屬於誰。
+   */
+  makeVerifier: (ctx?: CheckContext) => VerifierLike;
   progressRounds: number;
   notifier: Notifier;
   /**
@@ -835,7 +840,9 @@ export class GroupRunner {
     const worker = new Worker({
       mcp: proj.mcp,
       agent,
-      verifier: this.deps.makeVerifier(),
+      verifier: this.deps.makeVerifier({
+        repo: group.repo, branch: group.branch, workspaceKind: 'group_tree', requestedBy: 'coder',
+      }),
       progress: new ProgressMonitor(ledger, this.deps.progressRounds),
       ledger,
       notifier: this.deps.notifier,
@@ -937,7 +944,13 @@ export class GroupRunner {
           this.notify(details, { type: 'problem', detail: `⚠ 合併守衛有但書：${f.caveat}` });
         },
       };
-      const guard = this.deps.makeMergeGuard?.(this.deps.makeVerifier(), guardOptions) ?? new MergeGuard(this.deps.makeVerifier(), log, guardOptions);
+      // 合併驗證跑在合併工作區上，記帳要標明——它與群工作區的那幾筆是不同的世界
+      // （一個是「我這一群自己好不好」，一個是「併上最新 base 之後好不好」）。
+      const mergeCtx: CheckContext = {
+        repo: group.repo, branch: group.branch, workspaceKind: 'merge_tree', requestedBy: 'merger',
+      };
+      const guard = this.deps.makeMergeGuard?.(this.deps.makeVerifier(mergeCtx), guardOptions)
+        ?? new MergeGuard(this.deps.makeVerifier(mergeCtx), log, guardOptions);
       const verdict = await guard.attempt({
         repoPath: wtPath,
         branch: group.branch,
@@ -1178,7 +1191,9 @@ export class GroupRunner {
     const { ledger, log } = this.deps;
     const max = Math.max(1, this.deps.reworkRounds ?? DEFAULT_REWORK_ROUNDS);
     const task = reworkTaskOf(group, details);
-    const verifier = this.deps.makeVerifier();
+    const verifier = this.deps.makeVerifier({
+      repo: group.repo, branch: group.branch, workspaceKind: 'group_tree', requestedBy: 'coder',
+    });
 
     // 規格仍要在手上：修意見時同樣不能違反 docRefs。取不到就繼續（降級，不擋修正）
     let docs: Awaited<ReturnType<McpTaskClient['loadDocs']>> = [];

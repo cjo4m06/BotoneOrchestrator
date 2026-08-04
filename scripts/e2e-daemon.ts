@@ -19,6 +19,7 @@
  *   LOG_LEVEL=debug npx tsx scripts/e2e-daemon.ts
  */
 import { execa } from 'execa';
+import { createCheckRecorder, type CheckContext } from '../src/worker/check-recorder.js';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createLogger } from '../src/observability/logger.js';
@@ -542,7 +543,10 @@ async function main(): Promise<void> {
     worktreeBase: WORKTREE_BASE,
     resolveProject: (repo) => runtimes.get(repo),
     agent,
-    makeVerifier: () => new Verifier(log),
+    makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
+      checkRecorder: createCheckRecorder({ ledger, log }),
+      ...(ctx ? { checkContext: ctx } : {}),
+    }),
     progressRounds: 3,
     notifier: gateway,
     allowLocalMerge: true, // 只動 /tmp 的 fixture
@@ -1011,6 +1015,21 @@ async function evaluate(
     withSession.length === ranTasks.size,
     `跑過 agent 的任務 ${ranTasks.size} 個，有 session 紀錄 ${withSession.length} 個`
       + `（${withSession.map((x) => `${x.id}=${x.s!.sessionId}/${x.s!.rounds}輪`).join(', ')}）`,
+  );
+
+  // 27) 每一次關卡執行都要進 check_runs。
+  //
+  // 這條探針的存在理由：記帳是**旁路**，接錯了不會有任何症狀——typecheck 綠、
+  // 測試綠、daemon 照跑，只是那張表永遠是空的。而空表看起來就像「這個關卡從來沒跑過」。
+  const runs = ledger.listCheckRuns({ limit: 500 });
+  const kinds = new Set(runs.map((r) => r.workspaceKind));
+  const withOutput = runs.filter((r) => (r.output ?? '') !== '').length;
+  note(
+    '㉗ 每一次關卡執行都留下 check_runs（含全文輸出與 exit code）',
+    runs.length > 0 && runs.every((r) => r.command !== '' && r.requestedBy !== undefined),
+    runs.length === 0
+      ? '一列都沒有——記帳沒接上（症狀只有這張表是空的，其他全綠）'
+      : `${runs.length} 列，工作區種類 ${[...kinds].join('/')}，有輸出的 ${withOutput} 列`,
   );
 
   // 24) done 的任務不該還掛著 block_reason（狀態資料一致性）
