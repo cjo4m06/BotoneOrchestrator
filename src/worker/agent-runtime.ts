@@ -105,20 +105,64 @@ export interface CapturedSignals {
 }
 
 /**
- * 允許 agent 使用的瀏覽器工具。
+ * 寫程式的 agent 能用的瀏覽器工具：**預設全開，只擋列在下面的**。
  *
- * 為什麼要給：先前 agent 做 UI 是**閉著眼睛做**——改完 CSS 只能靠 build 過了就當沒事，
- * 畫面長怎樣它看不到。有瀏覽器之後它能邊做邊看、而且**點得下去**
+ * 為什麼要給瀏覽器：先前 agent 做 UI 是**閉著眼睛做**——改完 CSS 只能靠 build 過了
+ * 就當沒事，畫面長怎樣它看不到。有瀏覽器之後它能邊做邊看、而且**點得下去**
  * （做深色模式切換就真的按一下再看結果），這是靜態截圖給不了的。
  *
- * 逐一列出而不是用萬用字元，是為了能明確排除 `browser_run_code_unsafe`——
- * 那個工具會在頁面裡執行任意程式碼，等於繞過所有指令層的紅線。
+ * ── 為什麼從白名單改成黑名單 ──
+ *
+ * 白名單是錯的機制，因為這個角色**同一個 session 裡已經有 Bash + Write + Edit**。
+ * 擋掉一個關在瀏覽器分頁裡的工具，攔不到任何一條它用 Bash 走不通的路——
+ * 只攔得到它自己的 DoD 驗證。而代價是：我沒想到的能力會被默默擋下，
+ * 症狀只有一行 WARN，閘門照樣綠燈。
+ *
+ * 這已經真的發生過兩次（實跑 log）：
+ * · `browser_find` 是 Playwright 後來才加的工具，我的清單寫在那之前 → 想在畫面上
+ *   找元素就被自己的閘門擋下。
+ * · `browser_drag` 沒列 → 有一群的 DoD 是「圖片拖超出邊界要被夾住」，它先試
+ *   `run_code_unsafe` 被擋、改用 `browser_drag` 又被擋，那條 DoD **完全無路可驗**，
+ *   整群卡死。
+ *
+ * 黑名單則相反：Playwright 明天加新工具，預設可用。這對一個已經有 Bash 的角色
+ * 是正確的預設。
+ */
+const DENIED_BROWSER_TOOLS = new Set([
+  /**
+   * 唯一擋的一個，而且理由跟「危不危險」無關，跟**它繞過哪道檢查**有關。
+   *
+   * 它在 Playwright server 的 **Node 行程**裡執行任意 JavaScript（官方 README 原文：
+   * "executes arbitrary JavaScript in the Playwright server process and is
+   * RCE-equivalent"），不是在瀏覽器分頁裡。而這個檔案的部署紅線
+   * （`evaluateCommandRedline`：firebase deploy / npm run deploy / 強推 main）
+   * **只掛在 Bash 上**——瀏覽器工具這條分支從來不看參數內容。
+   *
+   * 所以放行它 ≠ 給它一個它已經有的能力，而是 = 讓
+   * `await import('node:child_process')` 成為繞過部署紅線的正門。
+   * 專案的 CLAUDE.md 把那條紅線寫成「硬邊界，不是提示詞」——這個常數就是那句話的實作。
+   *
+   * 它實際被拿來做的三件事都有替代（實跑 log 統計）：
+   * 設 viewport → `browser_resize`；帶 cookie 登入 → `browser_evaluate` 或走登入頁；
+   * 精細拖曳 → `browser_drag` / `browser_drop`。
+   */
+  'mcp__playwright__browser_run_code_unsafe',
+]);
+
+/**
+ * 交給 SDK `allowedTools` 的瀏覽器工具名單（**建議性質**）。
+ *
+ * 實測 SDK 的 allowedTools 對 MCP 工具不具強制力——agent 成功呼叫過沒列進去的
+ * `browser_run_code_unsafe`。真正生效的是下面 `evaluateToolPolicy` 裡的
+ * `DENIED_BROWSER_TOOLS` 檢查。這份存在只是為了讓 SDK 少提示一次。
+ *
+ * 這裡只能列舉（SDK 不吃萬用字元），所以列出目前已知的全部瀏覽器工具，
+ * 扣掉黑名單。漏列的新工具**不會**被擋——強制那一層是黑名單。
  */
 const BROWSER_TOOLS = [
   'mcp__playwright__browser_navigate',
   'mcp__playwright__browser_navigate_back',
   'mcp__playwright__browser_snapshot',
-  // 唯讀的頁面搜尋，跟 Grep 同性質。漏了它，agent 想在畫面上找元素會被自己的閘門擋下。
   'mcp__playwright__browser_find',
   'mcp__playwright__browser_take_screenshot',
   'mcp__playwright__browser_click',
@@ -127,22 +171,42 @@ const BROWSER_TOOLS = [
   'mcp__playwright__browser_select_option',
   'mcp__playwright__browser_hover',
   'mcp__playwright__browser_press_key',
+  'mcp__playwright__browser_drag',
+  'mcp__playwright__browser_drop',
   'mcp__playwright__browser_resize',
+  'mcp__playwright__browser_tabs',
+  // 沒有它，頁面一跳 confirm()/alert() 整個 session 就永久卡在那裡，而且沒有人看得到。
+  // 「可能自動確認破壞性對話框」不成立：它本來就能點頁面上任何一顆刪除按鈕。
+  'mcp__playwright__browser_handle_dialog',
+  'mcp__playwright__browser_file_upload',
   'mcp__playwright__browser_wait_for',
   'mcp__playwright__browser_console_messages',
   'mcp__playwright__browser_network_requests',
+  // 頁面本來就能 fetch（browser_evaluate 給得出來），擋這個只是假的安全感。
+  'mcp__playwright__browser_network_request',
   'mcp__playwright__browser_evaluate',
   'mcp__playwright__browser_close',
-];
+].filter((t) => !DENIED_BROWSER_TOOLS.has(t));
 
 /**
- * 真正生效的瀏覽器工具白名單。
+ * 唯讀角色（介面判斷者）能用的瀏覽器工具。
  *
- * 與 BROWSER_TOOLS 內容相同，但**這一份才是強制的**——它由 PreToolUse hook 執行，
- * 而 SDK 的 allowedTools 實測對 MCP 工具不具強制力（agent 成功呼叫過沒列進去的
- * browser_run_code_unsafe）。判斷者那邊也是同一個道理：工具邊界要由自己的程式碼守。
+ * 這裡**維持白名單**，而且理由跟寫程式的 agent 相反：判斷者沒有 Bash、沒有
+ * Write/Edit，這份清單是「唯讀」這兩個字唯一的實作。放行一個能碰到本機檔案的
+ * 工具，那個邊界就不存在了。
+ *
+ * 扣掉的兩個：
+ * · `run_code_unsafe` — Node 行程任意程式碼，唯讀邊界直接歸零。
+ * · `file_upload`     — 由 Playwright server 讀本機檔案送出去。這個是**真的**增量：
+ *                       判斷者沒有 Bash，`browser_evaluate` 也碰不到檔案系統。
+ *
+ * 其餘全給，包含互動類（drag/drop/handle_dialog/fill_form…）與診斷類
+ * （console_messages/network_requests）——判斷者要真的操作得動畫面才判斷得出東西，
+ * 而且它先前連 console 錯誤都看不到。
  */
-const ALLOWED_BROWSER_TOOLS = new Set(BROWSER_TOOLS);
+export const READONLY_BROWSER_TOOLS = BROWSER_TOOLS.filter(
+  (t) => t !== 'mcp__playwright__browser_file_upload',
+);
 
 // 允許 agent 使用的工具（allow-list）。ask_human / report_no_change 為自訂 in-process 工具。
 export const ALLOWED_TOOLS = [
@@ -1942,15 +2006,18 @@ export function evaluateToolPolicy(
   // 對 MCP 工具是**建議而非強制**。唯一可靠的攔截點是這個 PreToolUse hook——
   // 它在工具真正執行前被呼叫，而且是我們自己的程式碼。
   //
-  // 所以這裡改成 allow-list：沒列進來的瀏覽器工具一律擋。
+  // 這裡是 **deny-list**：只擋 DENIED_BROWSER_TOOLS 列的，其餘（含 Playwright
+  // 日後新增的）一律放行。理由見那個常數的說明——這個角色已經有 Bash，
+  // 白名單擋不到實質東西，只會默默擋掉它的 DoD 驗證。
   if (toolName.startsWith('mcp__playwright__')) {
-    if (!ALLOWED_BROWSER_TOOLS.has(toolName)) {
+    if (DENIED_BROWSER_TOOLS.has(toolName)) {
       return {
         deny: true,
         reason:
-          `紅線：這個瀏覽器工具不在允許清單內：${toolName}。` +
-          `（run_code_unsafe 會執行任意程式碼、file_upload 能把保護檔案送出去、` +
-          `handle_dialog 可能自動確認破壞性對話框。）`,
+          `紅線：${toolName} 在 Playwright server 的 Node 行程裡執行任意程式碼` +
+          `（官方標示 RCE-equivalent），會整個繞過部署紅線與指令層檢查。` +
+          `要設 viewport 用 browser_resize、要帶 cookie 用 browser_evaluate、` +
+          `要拖曳用 browser_drag / browser_drop。`,
       };
     }
     const url = typeof toolInput.url === 'string' ? toolInput.url : '';

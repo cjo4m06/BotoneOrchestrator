@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { CheckResult } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
+import { READONLY_BROWSER_TOOLS } from './agent-runtime.js';
 
 /**
  * 介面判斷：讓 agent **自己開瀏覽器看**，判斷畫面行不行。
@@ -152,18 +153,11 @@ const JUDGE_TOOLS = [
   'mcp__git__git_diff',
   'mcp__git__git_log',
   'mcp__git__git_blame',
-  'mcp__playwright__browser_navigate',
-  'mcp__playwright__browser_snapshot',
-  'mcp__playwright__browser_find',
-  'mcp__playwright__browser_take_screenshot',
-  'mcp__playwright__browser_click',
-  'mcp__playwright__browser_type',
-  'mcp__playwright__browser_hover',
-  'mcp__playwright__browser_press_key',
-  'mcp__playwright__browser_resize',
-  'mcp__playwright__browser_wait_for',
-  'mcp__playwright__browser_evaluate',
-  'mcp__playwright__browser_close',
+  // 瀏覽器工具跟寫程式的 agent 共用同一份來源，只扣掉能碰本機檔案的 file_upload
+  // （理由見 agent-runtime 的 READONLY_BROWSER_TOOLS）。先前是各自手抄一份，
+  // 於是判斷者缺了 drag/drop/handle_dialog（點到會跳對話框的按鈕就永久卡死）、
+  // 也缺了 console_messages/network_requests——它連 console 錯誤都看不到。
+  ...READONLY_BROWSER_TOOLS,
 ];
 const DEFAULT_MAX_SHOTS = 8;
 

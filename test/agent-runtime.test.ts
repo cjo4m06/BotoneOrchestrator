@@ -2,6 +2,7 @@ import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ALLOWED_TOOLS,
+  READONLY_BROWSER_TOOLS,
   ASK_HUMAN_FALLBACK,
   browserServerConfig,
   buildAgentEnv,
@@ -1131,19 +1132,49 @@ describe('瀏覽器工具的紅線', () => {
    * （工具使用紀錄裡看得到那一次呼叫）。所以「不列進清單」不是保證，
    * 真正的攔截點是 PreToolUse hook——那是我們自己的程式碼。
    */
-  it('沒列進清單的瀏覽器工具 → **由閘門擋下**（不能只靠 allowedTools）', () => {
-    for (const t of ['browser_run_code_unsafe', 'browser_file_upload', 'browser_handle_dialog']) {
-      assert.equal(ALLOWED_TOOLS.includes(`mcp__playwright__${t}`), false, `${t} 不該列進清單`);
-      const v = evaluateToolPolicy(`mcp__playwright__${t}`, {});
-      assert.equal(v.deny, true, `${t} 必須被閘門擋下，清單擋不住它`);
-      assert.match(v.reason ?? '', /不在允許清單內/);
+  it('run_code_unsafe → **由閘門擋下**（不能只靠 allowedTools）', () => {
+    const name = 'mcp__playwright__browser_run_code_unsafe';
+    assert.equal(ALLOWED_TOOLS.includes(name), false, 'run_code_unsafe 不該列進 allowedTools');
+    const v = evaluateToolPolicy(name, { code: 'async (page) => {}' });
+    assert.equal(v.deny, true, '必須被閘門擋下，allowedTools 擋不住它');
+    assert.match(v.reason ?? '', /RCE-equivalent|部署紅線/);
+  });
+
+  // 這一條是「以後勒」的保證：擋的機制是 deny-list，所以 Playwright 之後新增的工具
+  // 預設可用，不會像 browser_find / browser_drag 那樣被默默擋掉、只留一行 WARN。
+  it('黑名單以外的瀏覽器工具一律放行，包含尚未存在的新工具', () => {
+    for (const t of [
+      'browser_navigate',
+      'browser_click',
+      'browser_drag', // 曾經漏列 → 有一群的 DoD「拖超出邊界要被夾住」完全無路可驗
+      'browser_drop',
+      'browser_handle_dialog', // 沒有它，頁面一跳 confirm() 整個 session 卡死
+      'browser_file_upload',
+      'browser_tabs',
+      'browser_network_request',
+      'browser_find', // Playwright 後來才加的，白名單時代被自己的閘門擋下
+      'browser_some_tool_invented_next_month', // 未來的工具：預設可用
+    ]) {
+      assert.equal(
+        evaluateToolPolicy(`mcp__playwright__${t}`, {}).deny,
+        false,
+        `${t} 不該被擋——寫程式的 agent 已經有 Bash，白名單擋不到實質東西`,
+      );
     }
   });
 
-  it('清單內的瀏覽器工具照常放行', () => {
-    assert.ok(ALLOWED_TOOLS.includes('mcp__playwright__browser_navigate'));
-    assert.equal(evaluateToolPolicy('mcp__playwright__browser_navigate', { url: 'http://127.0.0.1:5173' }).deny, false);
-    assert.equal(evaluateToolPolicy('mcp__playwright__browser_click', {}).deny, false);
+  it('瀏覽器仍不准開本機檔案', () => {
+    const v = evaluateToolPolicy('mcp__playwright__browser_navigate', { url: 'file:///etc/passwd' });
+    assert.equal(v.deny, true);
+  });
+
+  it('唯讀角色的瀏覽器清單：能互動與診斷，但碰不到本機檔案', () => {
+    // 判斷者沒有 Bash，所以這份白名單是「唯讀」唯一的實作——file_upload 是真的增量。
+    assert.equal(READONLY_BROWSER_TOOLS.includes('mcp__playwright__browser_file_upload'), false);
+    assert.equal(READONLY_BROWSER_TOOLS.includes('mcp__playwright__browser_run_code_unsafe'), false);
+    for (const t of ['browser_drag', 'browser_drop', 'browser_handle_dialog', 'browser_console_messages', 'browser_network_requests']) {
+      assert.ok(READONLY_BROWSER_TOOLS.includes(`mcp__playwright__${t}`), `判斷者需要 ${t}`);
+    }
   });
 });
 
