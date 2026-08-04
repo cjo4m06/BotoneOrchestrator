@@ -490,6 +490,7 @@ describe('stuck_group 的 retry', () => {
           handleMergeDecision: () => {},
           reviveGroup: async () => { calls.push('reviveGroup'); return true; },
         },
+        log: createSilentLogger(),
       },
     );
     assert.deepEqual(calls, ['reviveGroup'], '絕不能走 handleControl——那對 done 的任務是空操作');
@@ -506,6 +507,7 @@ describe('stuck_group 的 retry', () => {
           handleMergeDecision: () => {},
           reviveGroup: async () => false,
         },
+        log: createSilentLogger(),
       },
     );
     assert.match(msg, /無法復活/);
@@ -522,6 +524,7 @@ describe('stuck_group 的 retry', () => {
           handleMergeDecision: () => {},
           reviveGroup: async () => { calls.push('reviveGroup'); return true; },
         },
+        log: createSilentLogger(),
       },
     );
     assert.deepEqual(calls, ['handleControl']);

@@ -150,7 +150,9 @@ describe('buildUiPrompt / uiCheck', () => {
     assert.match(skipped.detail, /沒有其他把關者/);
     const bad = uiCheck({
       status: 'issues',
-      issues: [{ shot: 'a.png', kind: 'contrast', problem: '深底配深字', suggestion: '把文字改成淺色' }],
+      issues: [
+        { origin: 'introduced', shot: 'a.png', kind: 'contrast', problem: '深底配深字', suggestion: '把文字改成淺色' },
+      ],
     });
     assert.equal(bad.ok, false);
     assert.match(bad.detail, /深底配深字/);

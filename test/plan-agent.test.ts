@@ -20,6 +20,7 @@ import { readFileSync } from 'node:fs';
 
 const task = (id: string, over: Partial<Task> = {}): Task => ({
   id,
+  payloadHash: `hash-${id}`,
   repo: 'acme/web',
   category: 'feature',
   title: `任務 ${id}`,

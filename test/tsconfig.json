@@ -1,3 +1,13 @@
+// 測試與腳本的型別檢查。
+//
+// **這份設定一直都在，但沒有被 `npm run typecheck` 跑到**——於是 test/（26k 行）
+// 與 scripts/ 的型別錯誤靜靜累積了 81 個，而測試是用 tsx 跑的（transpile-only），
+// 型別錯誤在那裡完全隱形。症狀特別惡毒：假件與真實介面對不上時測試照樣「綠」。
+// 實際踩到：把 IterateResult 的欄位改成必填，四支腳本的假件一個都沒紅。
+//
+// 這是這個專案第三次出現同一個病（能力有、接線沒接）：
+// DOCS_TOOLS 只接給寫程式的 agent、ReviewWatcher 只掃兩種狀態、這一份。
+// 所以 package.json 的 typecheck 現在**同時**跑兩份設定，不要再拆開。
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {

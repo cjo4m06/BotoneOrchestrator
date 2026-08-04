@@ -63,7 +63,6 @@ function proj(over: Partial<ProjectConfig> = {}): ProjectConfig {
     mcp: { transport: 'stdio', command: 'node' },
     commands: {},
     visual: { routes: [], when: 'auto', categories: ['design'], screenshotRoot: './data/screenshots' },
-    autoMergePolicy: { auto: [], needsHuman: [] },
     ...over,
   };
 }
@@ -690,8 +689,8 @@ test('verifierConfigOf：專案的 commandTimeoutSec 會變成 VerifierConfig.ti
 });
 
 test('verifierDepsOf：全域 commandTimeoutSec 會變成 Verifier 的 commandTimeoutMs', () => {
-  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 600 }), { commandTimeoutMs: 600_000 });
-  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 0 }), {}, '非正數 → 用 verifier 內建預設，絕不變成「無逾時」');
+  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 600, agent: { models: {} } }), { commandTimeoutMs: 600_000 });
+  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 0, agent: { models: {} } }), {}, '非正數 → 用 verifier 內建預設，絕不變成「無逾時」');
 });
 
 // ── 截圖保留策略的根目錄（沒接 = 截圖永不清理，磁碟無限成長） ──
@@ -825,7 +824,13 @@ test('createMergePipeline：兩個開關都開時接線，且工作目錄是專�
   assert.equal(proj?.baseBranch, 'main');
   assert.equal(pipeline!.resolveProject('acme/unknown'), undefined);
   assert.deepEqual(seen, ['/Users/me/code/web']);
-  assert.equal(pipeline!.policy, undefined, '不注入單一 policy，才能讓每專案的 autoMergePolicy 生效');
+  // MergePipelineDeps 現在連 policy 這個欄位都沒有了（合併風險改由 GroupRunner 的判斷者逐案決定）。
+  // 這條仍然要驗執行期真的沒塞這個鍵——型別上不存在，不等於實作不會多塞一個進去。
+  assert.equal(
+    (pipeline as MergePipelineDeps & { policy?: unknown }).policy,
+    undefined,
+    '不注入單一 policy，才能讓每專案的合併風險判斷生效',
+  );
   assert.ok(pipeline!.fetchBase, '沒有 fetchBase 就是拿過期的 base 驗證，語意飄移抓不到');
 });
 
@@ -1007,7 +1012,6 @@ function mergeSpy(): MergeSpy {
           return { ok: true, detail: 'merged' };
         },
       },
-      readDiff: async () => ({ files: ['a.css'], deleted: [], additions: 1, deletions: 0 }),
       fetchBase: async () => undefined,
     },
   };
@@ -1274,7 +1278,7 @@ describe('buildPipeline 一定會先套用 Claude 認證', () => {
       const dir = createTmpDir();
       const config = loadConfig(dir.path);
       // 認證只存在設定裡（＝控制台存進 DB 的情況），環境變數是空的
-      config.orchestrator.agent = { authToken: 'tok-from-db', baseUrl: 'https://gw.example' };
+      config.orchestrator.agent = { authToken: 'tok-from-db', baseUrl: 'https://gw.example', models: {} };
       buildPipeline({
         config,
         ledger: tmp.ledger,

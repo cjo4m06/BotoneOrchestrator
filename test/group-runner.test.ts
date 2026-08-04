@@ -234,6 +234,15 @@ function fakeMcp(detailOf: (id: string) => TaskDetail): McpTaskClient & { starte
     async loadDocs(refs) {
       return refs.map((ref) => ({ ref, content: `內容 ${ref}` }));
     },
+    // 以下兩個是 Poller／認領被拒時的查詢路徑，GroupRunner 的流程走不到。
+    // getTask 照 detailOf 回同一份任務（與這個假任務板的其餘行為一致）；
+    // listTasks 直接炸掉——真的被呼叫代表測到的不是這裡要測的東西。
+    async getTask(id) {
+      return detailOf(id);
+    },
+    async listTasks() {
+      throw new Error('測試不該走到這裡：GroupRunner 不會列任務板');
+    },
   };
 }
 
@@ -754,6 +763,14 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
         async loadDocs() {
           return [];
         },
+        // 這個假任務板只演「認領被拒」，沒有可回報的現況：
+        // 走到查詢就等於測試踩到別條路徑，直接炸掉才看得到。
+        async getTask() {
+          throw new Error('測試不該走到這裡：認領被拒的假任務板沒有現況可查');
+        },
+        async listTasks() {
+          throw new Error('測試不該走到這裡：認領被拒的假任務板不列任務');
+        },
       },
     };
   }
@@ -948,7 +965,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
   it('rework 時續接同一個 session（要記得自己上一輪做過什麼）', async () => {
     const group = seedGroup(['已完成的任務']);
     tmp.ledger.updateTaskState('T-1', 'done');
-    tmp.ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-上一輪' });
+    tmp.ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-上一輪' });
     const agent = fakeAgent();
     const h = build({ agent, feedback: fakeFeedback(reviewFeedback(group.id, ['@bob: 這個命名要改'])) });
   
@@ -1021,6 +1038,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
           sessionId: 's',
           resultText: '',
           isError: false,
+          toolCalls: {},
           reportedNoChange: { category: 'already_satisfied', reason: '我覺得已經符合了' },
         };
       },
@@ -1039,7 +1057,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     const store = fakeFeedback(reviewFeedback(group.id, ['@bob: 請修']));
     const agent: AgentLike = {
       async iterate(): Promise<IterateResult> {
-        return { sessionId: 's', resultText: 'API 掛了', isError: true };
+        return { sessionId: 's', resultText: 'API 掛了', isError: true, toolCalls: {} };
       },
     };
     const h = build({ agent, feedback: store, reworkRounds: 1 });

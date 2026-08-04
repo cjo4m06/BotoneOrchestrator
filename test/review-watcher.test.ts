@@ -71,6 +71,8 @@ function makeGroup(o: Partial<Group> = {}): Group {
     branch: 'feat/g1',
     taskIds: ['T-1'],
     footprint: ['src/a.ts'],
+    afterGroups: [],
+    rationale: '',
     state: 'pr_open',
     prNumber: 42,
     prUrl: 'https://github.com/acme/web/pull/42',
@@ -376,6 +378,7 @@ describe('ReviewWatcher — 與真實 Ledger 整合', () => {
     try {
       tmp.ledger.upsertGroup({
         id: 'g_real', repo: 'acme/web', branch: 'feat/real', taskIds: ['T-1'], footprint: [],
+        afterGroups: [], rationale: '',
         state: 'pr_open', prUrl: 'https://github.com/acme/web/pull/7', prNumber: 7,
       });
       const gh = fakeGh([

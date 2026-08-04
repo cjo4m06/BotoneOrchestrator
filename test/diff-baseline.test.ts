@@ -64,7 +64,8 @@ test('新增的未追蹤檔案也算（新增檔案是變更）', async (t) => {
   const { cwd, base } = await repo(t);
   writeFileSync(join(cwd, 'b.txt'), '全新的檔案\n');
   assert.equal(await workingTreeChanged(cwd, base), true);
-  assert.deepEqual((await changedSince(cwd, base)).ok && (await changedSince(cwd, base)).files, ['b.txt']);
+  const changes = await changedSince(cwd, base);
+  assert.deepEqual(changes.ok && changes.files, ['b.txt']);
 });
 
 test('真的什麼都沒做 → false（這個判斷不能因為修 bug 而失效）', async (t) => {
@@ -138,7 +139,7 @@ test('Stop hook 不可以叫 agent 去 reset／amend 讓變更重新出現', () 
     stopHookActive: false,
   });
   assert.equal(d.block, true);
-  const reason = d.block ? d.reason : '';
+  const reason = d.block ? d.reason ?? '' : '';
   assert.match(reason, /已經把變更 commit 了.*算數/s, '要明講已提交的成果算數');
   assert.match(reason, /不要用 reset／amend／rebase/, '要明擋改寫歷史這條路');
   assert.match(reason, /report_no_change/, '合法的零變更出口不能被這次修改弄丟');

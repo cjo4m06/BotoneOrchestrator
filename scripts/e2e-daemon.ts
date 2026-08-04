@@ -275,7 +275,7 @@ class ScriptedAgent implements AgentLike {
     'T-1': [
       (i) => {
         writeAlpha(i.cwd, false);
-        return { sessionId: 'sess-T1', resultText: '新增 alpha.js 的 alphaSum 與測試。', isError: false };
+        return { sessionId: 'sess-T1', resultText: '新增 alpha.js 的 alphaSum 與測試。', isError: false, toolCalls: {} };
       },
     ],
     'T-2': [
@@ -284,6 +284,7 @@ class ScriptedAgent implements AgentLike {
         sessionId: 'sess-T2',
         resultText: '需要澄清',
         isError: false,
+        toolCalls: {},
         askedClarification: {
           question: '空陣列要回傳 0 還是丟例外？這會改變既有呼叫端的行為。',
           rationale: '回傳值語意不可逆，錯了會影響下游',
@@ -293,7 +294,7 @@ class ScriptedAgent implements AgentLike {
       // 第二輪（人已回覆後）：實際修改
       (i) => {
         writeAlpha(i.cwd, true);
-        return { sessionId: 'sess-T2', resultText: 'alphaSum 補上空陣列回傳 0 的邊界處理。', isError: false };
+        return { sessionId: 'sess-T2', resultText: 'alphaSum 補上空陣列回傳 0 的邊界處理。', isError: false, toolCalls: {} };
       },
     ],
     'T-3': [
@@ -302,6 +303,7 @@ class ScriptedAgent implements AgentLike {
         sessionId: 'sess-T3',
         resultText: '判定無需改動',
         isError: false,
+        toolCalls: {},
         reportedNoChange: {
           category: 'already_satisfied' as const,
           reason: 'README 已有安裝說明段落',
@@ -314,7 +316,7 @@ class ScriptedAgent implements AgentLike {
           join(i.cwd, 'README.md'),
           '# e2e-daemon fixture\n\n這是端到端 harness 用的假專案。\n\n## 安裝\n\n```\nnpm install\n```\n\n## 測試\n\n```\nnpm test\n```\n',
         );
-        return { sessionId: 'sess-T3', resultText: 'README 補上安裝與測試說明。', isError: false };
+        return { sessionId: 'sess-T3', resultText: 'README 補上安裝與測試說明。', isError: false, toolCalls: {} };
       },
     ],
     // 探針：**每一輪**都宣告無需改動（模擬一張確實不用做的卡）
@@ -323,6 +325,7 @@ class ScriptedAgent implements AgentLike {
         sessionId: 'sess-T5',
         resultText: '確認過了，不需要改動',
         isError: false,
+        toolCalls: {},
         reportedNoChange: {
           category: 'already_satisfied' as const,
           reason: 'delta 設定本來就沒有啟用，沒有任何檔案需要改',
@@ -340,7 +343,7 @@ class ScriptedAgent implements AgentLike {
           join(i.cwd, 'gamma.test.js'),
           "const test = require('node:test');\nconst assert = require('node:assert');\nconst { gammaAll } = require('./gamma');\n\ntest('gammaAll sums', () => {\n  assert.equal(gammaAll([1, 2, 3]), 6);\n});\n",
         );
-        return { sessionId: 'sess-T4', resultText: '新增 gamma.js 與測試。', isError: false };
+        return { sessionId: 'sess-T4', resultText: '新增 gamma.js 與測試。', isError: false, toolCalls: {} };
       },
     ],
   };
@@ -359,7 +362,7 @@ class ScriptedAgent implements AgentLike {
 
     const steps = this.scripts[id];
     if (!steps || steps.length === 0) {
-      return { sessionId: 'x', resultText: `沒有腳本可跑（${id}）`, isError: true };
+      return { sessionId: 'x', resultText: `沒有腳本可跑（${id}）`, isError: true, toolCalls: {} };
     }
     const step = steps[Math.min(n, steps.length - 1)]!;
     log.info({ taskId: id, step: n + 1, feedback: input.feedback?.signature }, '🤖 假 agent 執行一輪');

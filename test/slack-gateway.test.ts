@@ -942,7 +942,7 @@ test('過期卡片：舊 thread 上的核准鈕不觸發裁決，並提示去看
     log,
     socket,
     // ledger 記錄的「現行卡片」是 ts-new；ts-old 是上一輪留下的殘卡
-    resolveCard: (taskId) => (taskId === 'T-1' ? { ts: 'ts-new', card: { task, status: 'awaiting_merge' } } : undefined),
+    resolveCard: (taskId) => (taskId === 'T-1' ? { ts: 'ts-new', card: task } : undefined),
   });
   await gw.start();
 
@@ -970,7 +970,7 @@ test('現行卡片上的同一顆按鈕照常生效（別把正常操作也擋�
     channel: '#dev',
     log,
     socket,
-    resolveCard: (taskId) => (taskId === 'T-1' ? { ts: 'ts-new', card: { task, status: 'awaiting_merge' } } : undefined),
+    resolveCard: (taskId) => (taskId === 'T-1' ? { ts: 'ts-new', card: task } : undefined),
   });
   await gw.start();
 

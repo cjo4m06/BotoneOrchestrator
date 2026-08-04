@@ -17,11 +17,11 @@ function setup(t: { after(fn: () => void): void }) {
 test('recordAgentSession：同一 (task, session) 多輪會累加，不會變成多列', (t) => {
   const { ledger } = setup(t);
   ledger.recordAgentSession({
-    taskId: 'T-1', sessionId: 's-1', groupId: 'G-1',
+    kind: 'worker', taskId: 'T-1', sessionId: 's-1', groupId: 'G-1',
     costUsd: 0.5, inputTokens: 100, outputTokens: 20, cacheReadTokens: 900, models: ['claude-opus-5'],
   });
   ledger.recordAgentSession({
-    taskId: 'T-1', sessionId: 's-1',
+    kind: 'worker', taskId: 'T-1', sessionId: 's-1',
     costUsd: 0.25, inputTokens: 40, outputTokens: 10, cacheReadTokens: 100, models: ['claude-opus-5'],
   });
 
@@ -37,8 +37,8 @@ test('recordAgentSession：同一 (task, session) 多輪會累加，不會變成
 
 test('同一 session 中途換模型 → models 取併集', (t) => {
   const { ledger } = setup(t);
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1', models: ['claude-opus-5'] });
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1', models: ['claude-haiku-4-5-20251001'] });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1', models: ['claude-opus-5'] });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1', models: ['claude-haiku-4-5-20251001'] });
   assert.deepEqual(ledger.latestAgentSession('T-1')?.models, ['claude-opus-5', 'claude-haiku-4-5-20251001']);
 });
 
@@ -48,8 +48,8 @@ test('同一 session 中途換模型 → models 取併集', (t) => {
  */
 test('latestAgentSession 取的是最近更新的那個 session', (t) => {
   const { ledger } = setup(t);
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-old' });
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-new' });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-old' });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-new' });
   assert.equal(ledger.latestAgentSession('T-1')?.sessionId, 's-new');
 });
 
@@ -60,7 +60,7 @@ test('沒有紀錄時 latestAgentSession 回 undefined（而不是丟例外）',
 
 test('markAgentSession 標記收尾狀態', (t) => {
   const { ledger } = setup(t);
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1' });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1' });
   ledger.markAgentSession('T-1', 's-1', 'done');
   assert.equal(ledger.latestAgentSession('T-1')?.status, 'done');
 });
@@ -69,9 +69,9 @@ test('markAgentSession 標記收尾狀態', (t) => {
 
 test('costSummary 彙總全部；costByTask 依花費排序', (t) => {
   const { ledger } = setup(t);
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1', costUsd: 1, inputTokens: 10, outputTokens: 1 });
-  ledger.recordAgentSession({ taskId: 'T-2', sessionId: 's-2', costUsd: 3, inputTokens: 30, outputTokens: 3 });
-  ledger.recordAgentSession({ taskId: 'T-2', sessionId: 's-3', costUsd: 2, inputTokens: 20, outputTokens: 2 });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1', costUsd: 1, inputTokens: 10, outputTokens: 1 });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-2', sessionId: 's-2', costUsd: 3, inputTokens: 30, outputTokens: 3 });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-2', sessionId: 's-3', costUsd: 2, inputTokens: 20, outputTokens: 2 });
 
   const sum = ledger.costSummary();
   assert.equal(sum.sessions, 3);
@@ -87,7 +87,7 @@ test('costSummary 彙總全部；costByTask 依花費排序', (t) => {
 
 test('costSummary(sinceMs) 只算該時間點之後的 session', (t) => {
   const { ledger } = setup(t);
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1', costUsd: 1 });
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1', costUsd: 1 });
   const cutoff = Date.now() + 1000; // 未來 → 應該一筆都不算
   assert.equal(ledger.costSummary(cutoff).sessions, 0);
   assert.equal(ledger.costSummary(0).sessions, 1);

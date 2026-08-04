@@ -60,10 +60,12 @@ async function main(): Promise<void> {
   }));
   ledger.upsertGroup({
     id: 'g_1', repo: 'acme/web', branch: 'orch/web/g_1', taskIds: ['T-3'], footprint: ['src/a.ts'],
+    afterGroups: [], rationale: '',
     state: 'in_review', prUrl: 'https://example.test/pr/1', prNumber: 1,
-  } as never);
+  });
   ledger.logEvent('group', 'g_1', 'policy_needs_human', '程式碼變更需人工核准');
-  ledger.recordAgentSession({ taskId: 'T-1', sessionId: 's-1', costUsd: 2.5, models: ['claude-opus-5'] });
+  // kind 必填：這筆是寫程式的 agent 燒的錢（ledger 的預設值也是 worker，行為不變）
+  ledger.recordAgentSession({ kind: 'worker', taskId: 'T-1', sessionId: 's-1', costUsd: 2.5, models: ['claude-opus-5'] });
 
   // ① 列出待辦
   const list = await ask();

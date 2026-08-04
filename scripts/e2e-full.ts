@@ -25,7 +25,7 @@ import { PrManager } from '../src/pr/pr-manager.js';
 import { MergeGuard } from '../src/pr/merge-guard.js';
 import { generatePrBody } from '../src/pr/pr-body.js';
 import type { McpTaskClient } from '../src/contracts.js';
-import type { McpOut, TaskDetail } from '../src/types.js';
+import type { McpOut, TaskBrief, TaskDetail } from '../src/types.js';
 
 const TASK_ID = process.argv[2] ?? 'tKgVw3AuaWPO';
 const log = createLogger();
@@ -35,9 +35,20 @@ const BUILD = { build: 'npm run build' };
 
 const git = (args: string[]) => execa('git', ['-C', SANDBOX, ...args], { reject: false });
 
-/** 真實 loadDocs，但 start/complete 樁化以保護任務板。 */
+/**
+ * 真實 loadDocs，但 start/complete 樁化以保護任務板。
+ *
+ * 唯讀的 listTasks/getTask 直接轉給真的 client：它們不會改動任務板，
+ * 而 Worker 在認領被拒時要靠 getTask 分辨「這張卡本來就是我們的」還是「已經是別人的」。
+ */
 class BoardSafeMcp implements McpTaskClient {
   constructor(private real: PmmMcpClient, private task: TaskDetail) {}
+  listTasks(q: Parameters<McpTaskClient['listTasks']>[0]): Promise<TaskBrief[]> {
+    return this.real.listTasks(q);
+  }
+  getTask(id: string): Promise<TaskDetail> {
+    return this.real.getTask(id);
+  }
   async startTask(): Promise<McpOut<TaskDetail>> {
     log.info({ id: this.task.id }, '（demo 樁）start_task：跳過以保護任務板');
     return { ok: true, value: this.task };

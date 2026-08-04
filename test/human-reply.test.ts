@@ -6,6 +6,7 @@ import {
   markHumanReplyConsumed,
   pendingHumanReply,
 } from '../src/worker/human-reply.js';
+import type { TaskBrief, TaskDetail } from '../src/types.js';
 import { createTmpLedger, createSilentLogger, type TmpLedger } from './helpers/index.js';
 
 describe('人類回覆 — 讀出、注入、只用一次', () => {
@@ -143,7 +144,7 @@ describe('Worker — 人回覆後接回原 session', () => {
       title: task.title, description: task.description, dependencies: [], docRefs: [],
     });
     // 先前那一輪留下的 session（人回覆後要接回這個）
-    tmp.ledger.recordAgentSession({ taskId: task.id, sessionId: 's-old' });
+    tmp.ledger.recordAgentSession({ kind: 'worker', taskId: task.id, sessionId: 's-old' });
     tmp.ledger.logEvent('task', task.id, 'clarification_asked', '要用哪個 API？');
     tmp.ledger.logEvent('task', task.id, 'clarification_answer', JSON.stringify({ threadTs: 't', answer: '用 REST' }));
 
@@ -153,11 +154,14 @@ describe('Worker — 人回覆後接回原 session', () => {
         async startTask() { return { ok: true as const, value: task }; },
         async completeTask() { return { ok: true as const, value: undefined }; },
         async loadDocs() { return []; },
+        // 認領一定成功，Worker 走不到「查任務板現況」那條路；真的被呼叫代表測錯了路徑
+        async getTask(): Promise<TaskDetail> { throw new Error('測試不該走到這裡：認領成功時不會查任務板現況'); },
+        async listTasks(): Promise<TaskBrief[]> { throw new Error('測試不該走到這裡：Worker 不列任務板'); },
       },
       agent: {
         async iterate(i) {
           inputs.push({ resume: i.resumeSessionId, answer: i.answer });
-          return { sessionId: 's-old', resultText: '好', isError: false };
+          return { sessionId: 's-old', resultText: '好', toolCalls: {}, isError: false };
         },
       },
       verifier: { async check() { return { green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }], signature: 'g' }; } },
@@ -201,7 +205,7 @@ describe('Worker — 人回覆後接回原 session', () => {
       id: task.id, payloadHash: 'h', repo: task.repo, category: task.category,
       title: task.title, description: task.description, dependencies: [], docRefs: [],
     });
-    tmp.ledger.recordAgentSession({ taskId: task.id, sessionId: 's-old' });
+    tmp.ledger.recordAgentSession({ kind: 'worker', taskId: task.id, sessionId: 's-old' });
 
     const inputs: { resume?: string; answer?: unknown }[] = [];
     const worker = new Worker({
@@ -209,11 +213,14 @@ describe('Worker — 人回覆後接回原 session', () => {
         async startTask() { return { ok: true as const, value: task }; },
         async completeTask() { return { ok: true as const, value: undefined }; },
         async loadDocs() { return []; },
+        // 認領一定成功，Worker 走不到「查任務板現況」那條路；真的被呼叫代表測錯了路徑
+        async getTask(): Promise<TaskDetail> { throw new Error('測試不該走到這裡：認領成功時不會查任務板現況'); },
+        async listTasks(): Promise<TaskBrief[]> { throw new Error('測試不該走到這裡：Worker 不列任務板'); },
       },
       agent: {
         async iterate(i) {
           inputs.push({ resume: i.resumeSessionId, answer: i.answer });
-          return { sessionId: 's-new', resultText: '好', isError: false };
+          return { sessionId: 's-new', resultText: '好', toolCalls: {}, isError: false };
         },
       },
       verifier: { async check() { return { green: true, checks: [{ name: 'test', ok: true, detail: 'ok' }], signature: 'g' }; } },

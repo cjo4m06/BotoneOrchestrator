@@ -20,7 +20,7 @@ import { ConsoleNotifier } from '../src/notify/notifier.js';
 import { gitDiffHash } from '../src/git/status.js';
 import { Worker } from '../src/worker/worker.js';
 import type { AgentLike, McpTaskClient } from '../src/contracts.js';
-import type { McpOut, TaskDetail } from '../src/types.js';
+import type { McpOut, TaskBrief, TaskDetail } from '../src/types.js';
 
 const DRY = process.argv.includes('--dry');
 const log = createLogger();
@@ -43,6 +43,16 @@ const mockTask: TaskDetail = {
 
 class MockMcp implements McpTaskClient {
   completed: { id: string; summary?: string }[] = [];
+  /** 這塊假任務板上就只有 mockTask 一張卡（尚未完成 ⇒ 一律列出來）。 */
+  async listTasks(q: { repo?: string }): Promise<TaskBrief[]> {
+    if (q.repo && q.repo !== mockTask.repo) return [];
+    return this.completed.length > 0 ? [] : [mockTask];
+  }
+  /** Worker 在認領被拒時會用它查任務板現況；這裡只有一張卡，其餘視為未知任務。 */
+  async getTask(id: string): Promise<TaskDetail> {
+    if (id !== mockTask.id) throw new Error(`mock MCP：未知任務 ${id}`);
+    return mockTask;
+  }
   async startTask(id: string): Promise<McpOut<TaskDetail>> {
     log.info({ id }, 'mock MCP：start_task');
     return { ok: true, value: mockTask };
@@ -68,7 +78,9 @@ const dryAgent: AgentLike = {
       join(input.cwd, 'subtract.test.js'),
       "const test = require('node:test');\nconst assert = require('node:assert');\nconst { subtract } = require('./subtract');\n\ntest('subtract subtracts', () => {\n  assert.equal(subtract(5, 3), 2);\n});\n",
     );
-    return { sessionId: 'dry', resultText: '已新增 subtract 與測試', isError: false };
+    // toolCalls 必填：假 agent 沒有真的工具呼叫，但「跑了一輪什麼都沒用」與
+    // 「從來沒跑過」是不同的事實，所以給空物件而不是不給。
+    return { sessionId: 'dry', resultText: '已新增 subtract 與測試', isError: false, toolCalls: {} };
   },
 };
 

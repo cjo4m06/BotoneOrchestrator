@@ -288,8 +288,8 @@ test('getGroup 找不到回 undefined；新群沒有 PR 欄位', (t) => {
 
 test('upsertGroup 對同 id 為更新而非重複插入', (t) => {
   const { ledger } = setup(t);
-  ledger.upsertGroup({ id: 'g_fixed', repo: 'acme/web', branch: 'b1', taskIds: ['T-1'], footprint: [], state: 'forming' });
-  ledger.upsertGroup({ id: 'g_fixed', repo: 'acme/web', branch: 'b2', taskIds: ['T-1', 'T-2'], footprint: ['x'], state: 'ready' });
+  ledger.upsertGroup({ id: 'g_fixed', repo: 'acme/web', branch: 'b1', taskIds: ['T-1'], footprint: [], afterGroups: [], rationale: '', state: 'forming' });
+  ledger.upsertGroup({ id: 'g_fixed', repo: 'acme/web', branch: 'b2', taskIds: ['T-1', 'T-2'], footprint: ['x'], afterGroups: [], rationale: '', state: 'ready' });
 
   assert.equal(ledger.listGroupsByState('forming').length, 0);
   const g = ledger.getGroup('g_fixed');
@@ -570,7 +570,7 @@ test('check_runs：同一條分支的綠與紅都留著，查得出「什麼時�
 
   assert.equal(rows.length, 2);
   assert.deepEqual(rows.map((r) => r.exitCode), [1, 0], '由新到舊');
-  assert.match(rows[0]!.output, /schedule-engine/, '全文要留著，不截斷不挑行');
+  assert.match(rows[0]!.output ?? '', /schedule-engine/, '全文要留著，不截斷不挑行');
 });
 
 test('check_runs：exitCode 未給 = 沒跑起來，與「跑了但失敗」是不同的事實', (t) => {

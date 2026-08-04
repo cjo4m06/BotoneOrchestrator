@@ -36,7 +36,6 @@ import { PrManager } from '../src/pr/pr-manager.js';
 import { MergeGuard } from '../src/pr/merge-guard.js';
 import { ReviewFeedbackStore, ReviewWatcher } from '../src/pr/review-watcher.js';
 import { InboundRouter, ConsoleNotifier } from '../src/notify/notifier.js';
-import { PolicyEngine, readDiffStat } from '../src/policy/policy-engine.js';
 import type { AgentLike, McpReadClient, McpTaskClient } from '../src/contracts.js';
 import type { IterateInput, IterateResult, LoadedDoc } from '../src/worker/agent-runtime.js';
 import type { ClarificationAnswer, McpOut, TaskBrief, TaskDetail } from '../src/types.js';
@@ -401,21 +400,21 @@ function scriptedAgent(): AgentLike & { calls: string[] } {
         join(i.cwd, 'multiply.test.js'),
         "const test = require('node:test');\nconst assert = require('node:assert');\nconst { multiply } = require('./multiply');\n\ntest('multiply', () => {\n  assert.equal(multiply(3, 4), 12);\n});\n",
       );
-      return { sessionId: 's-E1', resultText: '## 做了什麼\n新增 multiply 與測試。\n## 怎麼做\n以 module.exports 匯出。', isError: false };
+      return { sessionId: 's-E1', resultText: '## 做了什麼\n新增 multiply 與測試。\n## 怎麼做\n以 module.exports 匯出。', isError: false, toolCalls: {} };
     },
     'E-2': (i) => {
       writeFileSync(
         join(i.cwd, 'multiply.test.js'),
         "const test = require('node:test');\nconst assert = require('node:assert');\nconst { multiply } = require('./multiply');\n\ntest('multiply', () => {\n  assert.equal(multiply(3, 4), 12);\n});\n\ntest('multiply by zero', () => {\n  assert.equal(multiply(5, 0), 0);\n});\n\ntest('negative', () => {\n  assert.equal(multiply(-2, 3), -6);\n});\n",
       );
-      return { sessionId: 's-E2', resultText: '## 做了什麼\n補上零與負數測試。', isError: false };
+      return { sessionId: 's-E2', resultText: '## 做了什麼\n補上零與負數測試。', isError: false, toolCalls: {} };
     },
     'E-3': (i) => {
       writeFileSync(
         join(i.cwd, 'README.md'),
         '# orch e2e fixture\n\n臨時測試專案，測完會被刪除。\n\n## 可用函式\n\n- `sum(a, b)`：兩數相加\n- `multiply(a, b)`：兩數相乘\n',
       );
-      return { sessionId: 's-E3', resultText: '## 做了什麼\nREADME 補上可用函式清單。', isError: false };
+      return { sessionId: 's-E3', resultText: '## 做了什麼\nREADME 補上可用函式清單。', isError: false, toolCalls: {} };
     },
   };
   return {
@@ -423,7 +422,9 @@ function scriptedAgent(): AgentLike & { calls: string[] } {
     async iterate(i) {
       calls.push(i.task.id);
       const fn = scripts[i.task.id];
-      if (!fn) return { sessionId: 'x', resultText: '（無腳本）', isError: false };
+      // toolCalls 必填：腳本假 agent 不會有真的工具呼叫，但「跑了一輪什麼都沒用」
+      // 與「從來沒跑過」是不同的事實，所以一律帶空物件。
+      if (!fn) return { sessionId: 'x', resultText: '（無腳本）', isError: false, toolCalls: {} };
       return fn(i);
     },
   };
@@ -434,7 +435,7 @@ const NON_TERMINAL = ['forming', 'ready', 'pr_open', 'in_review', 'changes_reque
 
 function settled(ledger: Ledger): boolean {
   const busy = NON_TERMINAL.flatMap((s) => ledger.listGroupsByState(s));
-  const pending = ['discovered', 'queued'].flatMap((s) => ledger.listTasksByState(s as never));
+  const pending = (['discovered', 'queued'] as const).flatMap((s) => ledger.listTasksByState(s));
   return busy.length === 0 && pending.length === 0;
 }
 
@@ -540,7 +541,6 @@ async function runFlow(repo: TempRepo): Promise<number> {
         resolveProject: (r) => (r === repo.full ? { repoPath: repo.localPath, baseBranch: BASE_BRANCH, verifierConfig } : undefined),
         guard: new MergeGuard(new Verifier(log), log),
         pr: prManager,
-        readDiff: readDiffStat,
         fetchBase: async (repoPath, base) => void (await git(repoPath, ['fetch', 'origin', base])),
       },
     },
@@ -619,8 +619,8 @@ async function evaluate(repo: TempRepo, ledger: Ledger, mcp: FakeMcp): Promise<v
   note('① 拉任務：全部落地 ledger', tasks.every((t) => ledger.getTask(t.id) !== undefined),
     `ledger 任務數=${tasks.filter((t) => ledger.getTask(t.id)).length}/${tasks.length}`);
 
-  const groups = ['merged', 'failed', 'pr_open', 'in_review', 'changes_requested', 'ready', 'forming', 'merge_guard']
-    .flatMap((s) => ledger.listGroupsByState(s as never));
+  const groups = (['merged', 'failed', 'pr_open', 'in_review', 'changes_requested', 'ready', 'forming', 'merge_guard'] as const)
+    .flatMap((s) => ledger.listGroupsByState(s));
   note('② 分群：有建立群組', groups.length > 0, `共 ${groups.length} 群：${groups.map((g) => `${g.id}[${g.taskIds.join(',')}]=${g.state}`).join(' ')}`);
 
   note('③ 派發 + 完成：所有任務 complete_task', mcp.completeCalls.length === tasks.length,
@@ -651,8 +651,8 @@ async function evaluate(repo: TempRepo, ledger: Ledger, mcp: FakeMcp): Promise<v
     prs.every((p) => p.state !== 'OPEN'),
     prs.filter((p) => p.state === 'OPEN').map((p) => `#${p.number}`).join(', ') || '無');
 
-  const stuck = ['ready', 'forming', 'changes_requested', 'merge_guard', 'pr_open', 'in_review']
-    .flatMap((s) => ledger.listGroupsByState(s as never));
+  const stuck = (['ready', 'forming', 'changes_requested', 'merge_guard', 'pr_open', 'in_review'] as const)
+    .flatMap((s) => ledger.listGroupsByState(s));
   note('⑨ 沒有群組卡在非終態', stuck.length === 0, stuck.map((g) => `${g.id}=${g.state}`).join(', ') || '無');
 }
 

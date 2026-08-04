@@ -13,7 +13,6 @@ import {
 import { Dispatcher } from '../src/core/dispatcher.js';
 import { Planner } from '../src/core/planner.js';
 import { ReviewFeedbackStore } from '../src/pr/review-watcher.js';
-import type { PolicyInput } from '../src/policy/policy-engine.js';
 import type { Group, GroupState, LifecycleEvent, MergeVerdict, PlanResult, Task, TaskDetail } from '../src/types.js';
 import { Poller } from '../src/core/poller.js';
 import type { BudgetVerdict } from '../src/core/budget.js';
@@ -502,7 +501,6 @@ interface FakeMerge {
   /** 可在測試中途改 */
   verdict: MergeVerdict;
   mergeResult: { ok: boolean; detail: string };
-  diff: PolicyInput;
 }
 
 const PROJECT: MergeProject = {
@@ -511,7 +509,13 @@ const PROJECT: MergeProject = {
   verifierConfig: { build: 'npm run build', test: 'npm test' },
 };
 
-function fakeMerge(over: Partial<Pick<FakeMerge, 'verdict' | 'mergeResult' | 'diff'>> = {}): FakeMerge {
+/**
+ * 這個假件**沒有 diff／政策**：合併管線不再讀 diff，「這個改動危不危險」的判斷
+ * 早就移到 GroupRunner 的風險判斷者了（見下方「政策判定」那段註解）。
+ * 先前這裡還留著 readDiff 與 diff 欄位，是假件沒跟著介面收乾淨——
+ * 餵什麼 diff 進來都不會改變任何結果，卻讓人以為測到了政策。
+ */
+function fakeMerge(over: Partial<Pick<FakeMerge, 'verdict' | 'mergeResult'>> = {}): FakeMerge {
   const f: FakeMerge = {
     guardCalls: [],
     fetched: [],
@@ -519,8 +523,6 @@ function fakeMerge(over: Partial<Pick<FakeMerge, 'verdict' | 'mergeResult' | 'di
     released: [],
     verdict: over.verdict ?? { ok: true },
     mergeResult: over.mergeResult ?? { ok: true, detail: 'merged' },
-    // 預設是「純文件」變更 → PolicyEngine 判定可自動合併
-    diff: over.diff ?? { files: ['docs/readme.md'], deleted: [], additions: 3, deletions: 1 },
     deps: undefined as unknown as MergePipelineDeps,
   };
   f.deps = {
@@ -536,9 +538,6 @@ function fakeMerge(over: Partial<Pick<FakeMerge, 'verdict' | 'mergeResult' | 'di
         f.merges.push({ repo: input.repo, prNumber: input.prNumber, approvedBy: input.approvedBy });
         return f.mergeResult;
       },
-    },
-    async readDiff() {
-      return f.diff;
     },
     async fetchBase(repoPath, base) {
       f.fetched.push({ repoPath, base });
@@ -604,6 +603,8 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       branch: `orch/web/${id}`,
       taskIds: [`T-${id}`],
       footprint: ['src/a.ts'],
+      afterGroups: [],
+      rationale: '',
       state: o.state ?? 'in_review',
       prUrl: 'https://github.com/acme/web/pull/42',
       ...('prNumber' in o ? { prNumber: o.prNumber } : { prNumber: 42 }),
@@ -716,7 +717,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
    */
   it('GitHub 上審查通過 → 系統合併（需求 7 的閉環）', async () => {
     const g = seedReviewedGroup();
-    const m = fakeMerge({ diff: { files: ['db/migrations/001_init.sql'], deleted: [], additions: 20, deletions: 0 } });
+    const m = fakeMerge();
     const gw = fakeGateway();
     const { orch } = build({
       reviewWatcher: fakeWatcher([[{ type: 'approved', group: g.id, approvedBy: 'bob' }]]),
@@ -733,7 +734,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
 
   it('人在 Slack 核准 → 同樣合併，憑證記的是那個人', async () => {
     const g = seedReviewedGroup();
-    const m = fakeMerge({ diff: { files: ['src/a.ts'], deleted: [], additions: 20, deletions: 0 } });
+    const m = fakeMerge();
     const gw = fakeGateway();
     const { orch } = build({ merge: m.deps, gateway: gw.gateway });
 
@@ -858,7 +859,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
   it('找不到專案 runtime → 標 failed，不合併', async () => {
     tmp.ledger.upsertGroup({
       id: 'g_unknown', repo: 'other/repo', branch: 'orch/repo/g', taskIds: [], footprint: [],
-      state: 'in_review', prNumber: 7,
+      afterGroups: [], rationale: '', state: 'in_review', prNumber: 7,
     });
     const m = fakeMerge();
     const { orch } = build({
@@ -962,7 +963,8 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
    */
   function seedGroup(id: string, state: GroupState, taskIds: string[], prNumber?: number): Group {
     tmp.ledger.upsertGroup({
-      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds, footprint: ['src/a.ts'], state,
+      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds, footprint: ['src/a.ts'],
+      afterGroups: [], rationale: '', state,
       ...(prNumber !== undefined ? { prNumber, prUrl: `https://example.test/pr/${prNumber}` } : {}),
     });
     return tmp.ledger.getGroup(id)!;
@@ -1269,7 +1271,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
     tmp.ledger.setBlock(`T-${id}`, 'deps', '依賴未完成：T-up');
     tmp.ledger.upsertGroup({
       id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [`T-${id}`], footprint: ['src/a.ts'],
-      state: 'changes_requested',
+      afterGroups: [], rationale: '', state: 'changes_requested',
     });
     tmp.ledger.logEvent('group', id, 'group_deps_blocked', `T-${id}: 依賴未完成`);
     return tmp.ledger.getGroup(id)!;
@@ -1418,7 +1420,7 @@ describe('Orchestrator — 群組狀態黑洞防護', () => {
     tmp.ledger.updateTaskState(`T-${id}`, 'done', { groupId: id });
     tmp.ledger.upsertGroup({
       id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [`T-${id}`], footprint: ['src/a.ts'],
-      state, prUrl: 'https://github.com/acme/web/pull/9', prNumber: 9,
+      afterGroups: [], rationale: '', state, prUrl: 'https://github.com/acme/web/pull/9', prNumber: 9,
     });
     return tmp.ledger.getGroup(id)!;
   }
@@ -1637,8 +1639,9 @@ describe('Orchestrator — 花費上限', () => {
 
   function seedReady(id: string): void {
     tmp.ledger.upsertGroup({
-      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [], footprint: ['src/a.ts'], state: 'ready',
-    } as unknown as Group);
+      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [], footprint: ['src/a.ts'],
+      afterGroups: [], rationale: '', state: 'ready',
+    });
   }
 
   it('未超限 → 照常派工', async () => {
@@ -1757,9 +1760,10 @@ describe('Orchestrator — 核准憑證要跨行程與跨重啟', () => {
 
   function seedForMerge(id: string): void {
     tmp.ledger.upsertGroup({
-      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [], footprint: [], state: 'merge_guard',
+      id, repo: 'acme/web', branch: `orch/web/${id}`, taskIds: [], footprint: [],
+      afterGroups: [], rationale: '', state: 'merge_guard',
       prUrl: 'https://github.com/acme/web/pull/1', prNumber: 1,
-    } as unknown as Group);
+    });
   }
 
   /** 沿用檔案上方既有的 fakeMerge／fakeGateway，避免另造一套語意不同的假件。 */
@@ -2014,13 +2018,13 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     }
     tmp.ledger.upsertGroup({
       id: 'g-up', repo: 'acme/web', branch: 'orch/web/g-up', taskIds: ['T-up'],
-      footprint: ['src/up.ts'], state: upGroupState,
-    } as unknown as Group);
+      footprint: ['src/up.ts'], afterGroups: [], rationale: '', state: upGroupState,
+    });
     tmp.ledger.updateTaskState('T-up', 'done', { groupId: 'g-up' });
     tmp.ledger.upsertGroup({
       id: 'g-down', repo: 'acme/web', branch: 'orch/web/g-down', taskIds: ['T-down'],
-      footprint: ['src/down.ts'], state: 'ready',
-    } as unknown as Group);
+      footprint: ['src/down.ts'], afterGroups: [], rationale: '', state: 'ready',
+    });
     tmp.ledger.updateTaskState('T-down', 'queued', { groupId: 'g-down' });
   }
 
@@ -2049,8 +2053,8 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     });
     tmp.ledger.upsertGroup({
       id: 'g1', repo: 'acme/web', branch: 'orch/web/g1', taskIds: ['A', 'B'],
-      footprint: ['src/a.ts'], state: 'ready',
-    } as unknown as Group);
+      footprint: ['src/a.ts'], afterGroups: [], rationale: '', state: 'ready',
+    });
     tmp.ledger.updateTaskState('A', 'queued', { groupId: 'g1' });
     tmp.ledger.updateTaskState('B', 'queued', { groupId: 'g1' });
 
@@ -2066,8 +2070,8 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     });
     tmp.ledger.upsertGroup({
       id: 'gx', repo: 'acme/web', branch: 'orch/web/gx', taskIds: ['T-x'],
-      footprint: ['src/x.ts'], state: 'ready',
-    } as unknown as Group);
+      footprint: ['src/x.ts'], afterGroups: [], rationale: '', state: 'ready',
+    });
     tmp.ledger.updateTaskState('T-x', 'queued', { groupId: 'gx' });
 
     const { orch, dispatched } = build();
@@ -2164,8 +2168,8 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
   function seedApproved(): Group {
     tmp.ledger.upsertGroup({
       id: 'g1', repo: 'acme/web', branch: 'orch/web/g1', taskIds: [],
-      footprint: [], state: 'merge_guard', prNumber: 42,
-    } as unknown as Group);
+      footprint: [], afterGroups: [], rationale: '', state: 'merge_guard', prNumber: 42,
+    });
     return tmp.ledger.getGroup('g1')!;
   }
 
@@ -2251,8 +2255,8 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
     );
     tmp.ledger.upsertGroup({
       id: 'g1', repo: 'acme/web', branch: 'orch/web/g1', taskIds: [],
-      footprint: ['src/a.ts'], state: 'ready',
-    } as unknown as Group);
+      footprint: ['src/a.ts'], afterGroups: [], rationale: '', state: 'ready',
+    });
     return { orch, dispatched, rec };
   }
 
@@ -2292,8 +2296,8 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
     );
     tmp.ledger.upsertGroup({
       id: 'g2', repo: 'acme/web', branch: 'orch/web/g2', taskIds: [],
-      footprint: [], state: 'ready',
-    } as unknown as Group);
+      footprint: [], afterGroups: [], rationale: '', state: 'ready',
+    });
     await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g2']);
   });

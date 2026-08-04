@@ -36,6 +36,7 @@ function task(id: string, state: TaskState, extra: Partial<Task> = {}): Task {
 function group(id: string, state: GroupState, taskIds: string[]): Group {
   return {
     id, repo: REPO, branch: `orch/app/${id}`, taskIds, footprint: [],
+    afterGroups: [], rationale: '',
     state, createdAt: 1, updatedAt: 1,
   };
 }

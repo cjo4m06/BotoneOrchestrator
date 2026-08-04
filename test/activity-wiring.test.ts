@@ -90,7 +90,7 @@ test('tick 的每一段都會登記進 ledger', async (t) => {
     reviewWatcher: { async poll() { snap('review'); return []; } } as never,
     ledger: h.ledger,
     log: createSilentLogger(),
-  } as never);
+  } as never, 60);
 
   await orch.tick();
 

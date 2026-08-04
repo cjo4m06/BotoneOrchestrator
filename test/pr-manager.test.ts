@@ -201,7 +201,7 @@ describe('PrManager — openPr 冪等', () => {
           return pushes === 1 ? { exitCode: 1, stderr: REJECT_STDERR } : {};
         }
         if (c.args[2] === 'rev-parse') {
-          return { stdout: c.args[3].endsWith('/main') ? 'b'.repeat(40) : 'a'.repeat(40) };
+          return { stdout: c.args[3]?.endsWith('/main') ? 'b'.repeat(40) : 'a'.repeat(40) };
         }
         if (c.args[2] === 'merge-base') return { exitCode: merged ? 0 : 1 };
         return {};

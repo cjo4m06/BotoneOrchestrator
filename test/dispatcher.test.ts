@@ -12,6 +12,7 @@ function makeGroup(id: string, footprint: string[], repo = 'acme/web', afterGrou
     taskIds: [`${id}-t1`],
     footprint,
     afterGroups,
+    rationale: '',
     state: 'ready',
     createdAt: 1,
     updatedAt: 1,

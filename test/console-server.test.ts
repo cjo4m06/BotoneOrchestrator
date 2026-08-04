@@ -55,19 +55,23 @@ const project = (over: Record<string, unknown> = {}) => ({
 });
 
 describe('控制台 — 綁定位址', () => {
+  /** 位址檢查只碰建構子，走不到專案清理——真的被呼叫代表測試寫錯了。 */
+  const purgeProject: ConsoleDeps['purgeProject'] = () =>
+    Promise.reject(new Error('測試不該走到這裡：綁定位址測試不該觸發專案清理'));
+
   /**
    * 這個介面可以改 MCP token、停用專案、核准合併。綁到外部位址是安全事故，
    * 不是設定選項——所以在建構時就擋，而不是「預設值剛好是 loopback」。
    */
   it('非 loopback 位址一律拒絕', () => {
-    const deps = { store: {} as ConfigStore, ledger: {} as Ledger, log: createSilentLogger() };
+    const deps = { store: {} as ConfigStore, ledger: {} as Ledger, log: createSilentLogger(), purgeProject };
     for (const host of ['0.0.0.0', '192.168.1.5', '::']) {
       assert.throws(() => new ConsoleServer({ ...deps, host }), /loopback/);
     }
   });
 
   it('loopback 的三種寫法都接受', () => {
-    const deps = { store: {} as ConfigStore, ledger: {} as Ledger, log: createSilentLogger() };
+    const deps = { store: {} as ConfigStore, ledger: {} as Ledger, log: createSilentLogger(), purgeProject };
     for (const host of ['127.0.0.1', 'localhost', '::1']) {
       assert.doesNotThrow(() => new ConsoleServer({ ...deps, host }));
     }
@@ -256,7 +260,11 @@ describe('控制台 — 人的裁決走 InboundRouter（不是第二套邏輯）
     ledger.setBlock('T-1', 'needs_clarification', '要用哪個 API？');
 
     const router = new InboundRouter({ ledger, log: createSilentLogger() });
-    const server = new ConsoleServer({ store, ledger, log: createSilentLogger(), port: 0, router, inProcess: true });
+    const server = new ConsoleServer({
+      store, ledger, log: createSilentLogger(), port: 0, router, inProcess: true,
+      // 接真的（與 start() 一致）：這批測試不走停用，但假件會讓「停用只改旗標」的漏接躲過型別檢查
+      purgeProject: projectPurgerOf({ store, ledger, worktreeBase: join(dir.path, 'wt'), log: createSilentLogger() }),
+    });
     await server.start();
     h = {
       base: `http://127.0.0.1:${server.address().port}`, store, ledger, server, dir,
@@ -324,7 +332,7 @@ describe('控制台 — 跨站請求', () => {
       { 'content-type': 'application/json', origin: 'https://evil.example' },
       JSON.stringify(project()));
     assert.equal(res.status, 403);
-    assert.equal((await get(h, '/api/projects')).body.projects.length, 0, '不可以寫進去');
+    assert.equal(((await get(h, '/api/projects')).body.projects as unknown[]).length, 0, '不可以寫進去');
   });
 
   /** 這是最關鍵的一條：text/plain 不觸發預檢，是真正可用的攻擊路徑。 */
@@ -332,7 +340,7 @@ describe('控制台 — 跨站請求', () => {
     const res = await raw('PUT', '/api/projects', { 'content-type': 'text/plain' }, JSON.stringify(project()));
     assert.equal(res.status, 403);
     assert.match((await res.json() as { error: string }).error, /application\/json/);
-    assert.equal((await get(h, '/api/projects')).body.projects.length, 0);
+    assert.equal(((await get(h, '/api/projects')).body.projects as unknown[]).length, 0);
   });
 
   it('沒有 content-type 的寫入請求 → 403', async () => {

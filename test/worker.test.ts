@@ -31,13 +31,15 @@ const red = (sig = 'red', ids: string[] = ['alpha']): GateReport => ({
 
 interface FakeMcp extends McpTaskClient {
   startCalls: string[];
+  /** 認領被拒時 Worker 去查任務板的紀錄（見下方 getTask）。 */
+  getCalls: string[];
   completeCalls: { id: string; opts?: { summary?: string } }[];
   docCalls: string[][];
 }
 
 function fakeMcp(
   over: Partial<{ start: McpOut<TaskDetail>; complete: McpOut<void>; docs: LoadedDoc[]; board: TaskDetail | Error }> = {},
-) {
+): FakeMcp {
   const startCalls: string[] = [];
   const getCalls: string[] = [];
   const completeCalls: { id: string; opts?: { summary?: string } }[] = [];
@@ -85,7 +87,8 @@ function fakeAgent(results: Partial<IterateResult>[]): FakeAgent {
       inputs.push(input);
       const r = results[Math.min(i, results.length - 1)] ?? {};
       i += 1;
-      return { sessionId: 's1', resultText: '完成了', isError: false, ...r };
+      const base: IterateResult = { sessionId: 's1', resultText: '完成了', isError: false, toolCalls: {} };
+      return { ...base, ...r };
     },
   };
 }
@@ -767,7 +770,7 @@ describe('Worker — 單任務監督迴圈', () => {
           async iterate() {
             round += 1;
             if (round === 1) repo.commit({ 'a.txt': 'v2\n' }, 'agent 自己提交的成果');
-            return { sessionId: 's1', resultText: '完成了', isError: false };
+            return { sessionId: 's1', resultText: '完成了', isError: false, toolCalls: {} };
           },
         };
         const { worker } = build({ mcp, agent, verifier: new Verifier(createSilentLogger()), headRef: gitHeadRef });
@@ -796,7 +799,7 @@ describe('Worker — 單任務監督迴圈', () => {
             inputs.push(input);
             round += 1;
             if (round >= 2) repo.dir.write('a.txt', 'v2\n');
-            return { sessionId: 's1', resultText: '完成了', isError: false };
+            return { sessionId: 's1', resultText: '完成了', isError: false, toolCalls: {} };
           },
         };
         const { worker } = build({
