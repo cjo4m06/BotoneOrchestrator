@@ -238,12 +238,25 @@ export function decideVisualGate(config: VisualGateConfig | undefined, task?: Vi
   if (config.when === 'never') return { run: false, reason: '設定為 when=never' };
   if (config.when === 'always') return { run: true };
 
+  // ── `auto` 的語意：專案設了 devServer ＋ routes 就跑 ──
+  //
+  // 先前是「卡片類別要字面等於 'design'」。那個判準有兩個問題：
+  // 1. **類別是任務板上一個人隨手填的字串**，跟這次改了什麼毫無關係。'dev' 是本系統
+  //    自己文件裡的一級類別——一張把 Vue 元件改到破版的 'dev' 卡，
+  //    typecheck/lint/build/test 全綠 → 綠燈 → 開 PR，而報告上完全看不出
+  //    「視覺從來沒驗過」。
+  // 2. 專案已經**明確 opt-in**（設了 commands.devServer 又列了 visual.routes）
+  //    卻還是不跑，那個設定等於白設。
+  //
+  // 要縮小範圍的話由使用者在 `visual.categories` 明列自己的詞彙——
+  // 那是「放寬預設、允許收緊」，而不是「預設就收緊、而且用我猜的詞」。
+  const categories = config.categories;
+  if (!categories?.length) return { run: true };
   const category = task?.category;
   if (category === undefined) return { run: true };
-  const categories = config.categories?.length ? config.categories : DEFAULT_VISUAL_CATEGORIES;
   return categories.includes(category)
     ? { run: true }
-    : { run: false, reason: `任務類別 ${category} 不在視覺類別 ${categories.join('/')} 內` };
+    : { run: false, reason: `任務類別 ${category} 不在專案自訂的視覺類別 ${categories.join('/')} 內` };
 }
 
 /**
@@ -381,8 +394,24 @@ export class Verifier {
     const config = input.config.visual;
     const decision = decideVisualGate(config, input.task);
     if (!decision.run) {
+      // **跳過一定要留下可見的痕跡。**
+      //
+      // 先前這裡只寫 debug log，於是「視覺從來沒驗過」在 GateReport 上完全看不出來
+      // ——一張把畫面改破版的卡，其他關卡全綠就一路走到 complete_task 與開 PR，
+      // 而報告上沒有任何一個字提到這件事。
+      //
+      // `ok: true` 是刻意的（跳過不等於失敗，不該擋住 DoD），但它會出現在報告裡，
+      // 人與下游 agent 都看得到「這次沒驗畫面，理由是 X」。
+      // 專案根本沒設視覺（最常見的情況）就不必吵——那不是缺口，是沒有這個需求。
+      const configured = Boolean(config?.devServer && config.routes?.length);
       this.log.debug({ reason: decision.reason }, '視覺關卡：不需執行');
-      return undefined;
+      return configured
+        ? {
+            checks: [{ name: 'visual', ok: true, detail: `未驗畫面：${decision.reason ?? '未指定原因'}` }],
+            screenshots: [],
+            status: 'skipped',
+          }
+        : undefined;
     }
     if (!commandsGreen) {
       // 指令關卡就紅了：dev server 多半也起不來，白花一次逾時；先把回饋集中在該修的東西上

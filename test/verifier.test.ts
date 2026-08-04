@@ -558,14 +558,35 @@ describe('Verifier — 視覺關卡整合', () => {
       assert.equal(always.visual.calls.length, 1);
     });
 
-    it('when=auto：design 任務才跑，其他類別略過', async () => {
+    // **`auto` 的語意是「專案有沒有 opt-in」，不是「卡片類別叫什麼」。**
+    //
+    // 卡片類別是任務板上一個人隨手填的字串，跟這次改了什麼毫無關係。先前 'dev' 類別
+    // 的卡就算把 Vue 元件改到破版，也不會跑視覺——build/test 全綠就一路開 PR，
+    // 而報告上完全看不出「視覺從來沒驗過」。
+    it('when=auto：專案設了 devServer + routes 就跑，不看卡片類別', async () => {
+      for (const category of ['design', 'bug', 'dev', 'improvement'] as const) {
+        const h = build();
+        await h.verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL }, task: { id: 'T', category } });
+        assert.equal(h.visual.calls.length, 1, `${category} 類別的卡也會動到畫面`);
+      }
+    });
+
+    it('要縮小範圍由專案自己明列（放寬預設、允許收緊）', async () => {
+      const narrowed = { ...VISUAL, categories: ['design'] };
+
       const design = build();
-      await design.verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL }, task: { id: 'T-1', category: 'design' } });
+      await design.verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: narrowed }, task: { id: 'T-1', category: 'design' } });
       assert.equal(design.visual.calls.length, 1);
 
       const bug = build();
-      await bug.verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: VISUAL }, task: { id: 'T-2', category: 'bug' } });
+      const r = await bug.verifier.check({ cwd: dir.path, config: { ...OK_CMDS, visual: narrowed }, task: { id: 'T-2', category: 'bug' } });
       assert.equal(bug.visual.calls.length, 0);
+      // **跳過一定要留下可見的痕跡**——先前只寫 debug log，於是「沒驗畫面」
+      // 在報告上完全看不出來
+      const visualCheck = r.checks.find((c) => c.name === 'visual');
+      assert.ok(visualCheck, '跳過也要出現在 GateReport 裡');
+      assert.equal(visualCheck?.ok, true, '跳過不等於失敗，不該擋住 DoD');
+      assert.match(visualCheck?.detail ?? '', /未驗畫面/);
     });
 
     it('誤殺豁免設定（ignoreSelectors/thresholds/animationSettleMs）會原封不動送到 VisualVerifier', async () => {
@@ -616,8 +637,13 @@ describe('Verifier — 視覺關卡整合', () => {
       assert.equal(decideVisualGate({ routes: ['/'] }).run, false, '沒 devServer 不跑');
       assert.equal(decideVisualGate({ devServer: 'x', routes: [] }).run, false, '沒 routes 不跑');
       assert.equal(decideVisualGate(VISUAL).run, true);
+      // 預設不看類別：專案 opt-in 了就跑（類別是任務板上隨手填的字串，
+      // 跟這次改了什麼毫無關係）
       assert.equal(decideVisualGate(VISUAL, { category: 'design' }).run, true);
-      assert.equal(decideVisualGate(VISUAL, { category: 'dev' }).run, false);
+      assert.equal(decideVisualGate(VISUAL, { category: 'dev' }).run, true, 'dev 卡也會動到畫面');
+      assert.equal(decideVisualGate(VISUAL, { category: 'bug' }).run, true);
+      // 要收緊由專案自己明列
+      assert.equal(decideVisualGate({ ...VISUAL, categories: ['design'] }, { category: 'dev' }).run, false);
       assert.equal(decideVisualGate({ ...VISUAL, categories: ['dev', 'design'] }, { category: 'dev' }).run, true);
     });
   });
