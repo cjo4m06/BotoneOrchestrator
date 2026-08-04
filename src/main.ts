@@ -2,6 +2,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync,
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { createCheckRecorder, type CheckContext } from './worker/check-recorder.js';
+import type { DocsSource } from './worker/docs-server.js';
 import { pathToFileURL } from 'node:url';
 import { execa } from 'execa';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -1382,6 +1383,28 @@ export function buildPipeline(input: PipelineInput): Pipeline {
   //   退回時附的意見要寫進**同一個** store 才有人讀得到。
   const feedback = input.feedback ?? new ReviewFeedbackStore(ledger);
 
+  /**
+   * 規格文件的來源——**每一個角色都用同一份**。
+   *
+   * 程式不預抓內容：docRef 字串對不上（實跑：issues/ vs issue）就整份讀不到，
+   * 而預抓的那份是「開工那一刻的快照」，規格在任務進行中被更新時拿著它的人不會知道。
+   *
+   * 抽成具名函式而不是每個角色各寫一份：commit e2820a9 就是只接給寫程式的 agent，
+   * 審查者的工作是「規格逐條 vs diff」卻不能搜規格。一份來源、所有角色一起接。
+   */
+  const docsSourceOf = (repo: string): DocsSource | undefined => {
+    const mcp = registry.runtimeOf(repo)?.mcp;
+    // 任務板沒有這些能力就不掛（角色只會拿到提示詞裡的那份，行為與先前一致）
+    if (!mcp?.listDocs || !mcp.searchDocs || !mcp.readDoc) return undefined;
+    const { listDocs, searchDocs, readDoc } = mcp;
+    return {
+      listDocs: () => listDocs.call(mcp),
+      searchDocs: (q: string) => searchDocs.call(mcp, q),
+      // agent 若照任務裡的 issues/ 寫成複數，這裡一併正規化（同 parseDocRef）
+      readDoc: (t: string, f: string, sec?: string) => readDoc.call(mcp, normalizeDocType(t), f, sec),
+    };
+  };
+
   const reviewWatcher = new ReviewWatcher({
     ledger,
     log,
@@ -1406,19 +1429,18 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       // 規格文件讓 agent 自己找：程式只能照 docRef 字串比對，檔案改名／章節改名／
       // docType 對不上就整份讀不到（實跑：issues/ vs issue，每個帶 issue 規格的任務
       // 都是沒看過規格就做的）。搜尋是語意的、會回不相干的東西，所以要它自己判斷。
-      docs: (repo) => {
-        const mcp = registry.runtimeOf(repo)?.mcp;
-        // 任務板沒有這些能力就不掛（agent 只會拿到程式先讀好的那份，行為與先前一致）
-        if (!mcp?.listDocs || !mcp.searchDocs || !mcp.readDoc) return undefined;
-        const { listDocs, searchDocs, readDoc } = mcp;
-        return {
-          listDocs: () => listDocs.call(mcp),
-          searchDocs: (q: string) => searchDocs.call(mcp, q),
-          // agent 若照任務裡的 issues/ 寫成複數，這裡一併正規化（同 parseDocRef）
-          readDoc: (t: string, f: string, sec?: string) => readDoc.call(mcp, normalizeDocType(t), f, sec),
-        };
-      },
+      docs: docsSourceOf,
     }),
+    // 規格文件讓 **每一個角色**自己去找。
+    //
+    // 程式只能照 docRef 字串比對，檔案改名／章節改名／docType 對不上就整份讀不到
+    // （實跑：issues/ vs issue，每個帶 issue 規格的任務都是沒看過規格就做的）；
+    // 而且預抓的那份是**開工那一刻的快照**——規格在任務進行中被更新時，
+    // 拿著它的人不會知道自己看的是舊的。
+    //
+    // **抽成具名工廠而不是每個角色各寫一份**：commit e2820a9 就是只接給寫程式的 agent，
+    // 審查者的工作是「規格逐條 vs diff」卻不能搜規格。一份來源、四個角色一起接，
+    // 下次加角色時漏掉會很明顯。
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
     makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
       ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),
@@ -1431,16 +1453,16 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     allowLocalMerge: input.allowLocalMerge,
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, docs: docsSourceOf, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
-    reviewer: new Reviewer({ log, usage: ledger, ...(models.reviewer ? { model: models.reviewer } : {}) }),
+    reviewer: new Reviewer({ log, usage: ledger, docs: docsSourceOf, ...(models.reviewer ? { model: models.reviewer } : {}) }),
     // agent 宣告「無需改動」時的處置（預設全 ask：交人確認，不自動結案）
     noChangePolicy: config.orchestrator.noChange,
     // 審查意見回灌：與 Orchestrator／ReviewWatcher 共用同一個實例
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log, usage: ledger, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
+    driftJudge: new DriftJudge({ log, usage: ledger, docs: docsSourceOf, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1477,7 +1499,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 分群與排序交給 agent：判準是「這幾個任務會不會動到同一批程式碼」，
         // 那要看懂任務在講什麼再對應到 repo。沒有 Claude 認證時才退回啟發式，
         // 並且明講——不然它會安靜地用一套已知會出錯的規則在跑。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, docs: docsSourceOf, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。

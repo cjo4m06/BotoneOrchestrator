@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
@@ -46,6 +47,8 @@ export interface DriftJudgeInput {
   groupChanges: string;
   /** 本群在做什麼（任務標題，給判斷者背景）。 */
   taskTitles: string[];
+  /** 所屬 repo——判斷者要靠它去任務板查規格（程式不預抓）。 */
+  repo?: string;
 }
 
 const FindingSchema = z.object({
@@ -63,6 +66,18 @@ export type DriftQueryFn = (args: { prompt: string; cwd: string }) => AsyncItera
 
 export interface DriftJudgeDeps {
   /**
+   * 任務板的文件來源。**未注入 → 這個角色查不到規格**（只能用提示詞裡程式先讀好的那份）。
+   *
+   * 為什麼每個角色都要有：程式預抓規格有兩個無聲的失效模式，兩個都實際發生過——
+   * (1) docRef 字串對不上（實跑：docType 單複數不一致）→ 整份讀不到，只留一行 warn，
+   *     而 build/test 全綠看起來完全正常；
+   * (2) **規格在任務進行中被更新** → 手上是開工那一刻的快照，而且不知道自己拿的是舊的。
+   *
+   * commit e2820a9 已經做過一次，但**只接給寫程式的 agent**——審查者的工作就是
+   * 「規格逐條 vs diff」，卻不能搜規格。
+   */
+  docs?: (repo: string) => DocsSource | undefined;
+  /**
    * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
@@ -77,7 +92,7 @@ export interface DriftJudgeDeps {
 /** 判斷者只讀不寫：它的職責是判斷，不是順手把問題改掉。 */
 // Bash 一定要留：語意飄移判斷要跑 git 查詢與 grep 才看得出「改的東西有沒有超出任務範圍」。
 // 它跑在 readonly policy 底下，只能執行查詢類指令（見 reviewer.ts 同一段說明）。
-const JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
+const JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS];
 
 const SYSTEM_PROMPT =
   '你在判斷兩份各自正確的變更合併之後，產品行為會不會自相矛盾。' +
@@ -101,7 +116,7 @@ export class DriftJudge {
 
     let text: string;
     try {
-      text = await this.runQuery(buildDriftPrompt(input), input.cwd);
+      text = await this.runQuery(buildDriftPrompt(input), input.cwd, input.repo);
     } catch (e) {
       // 判斷層失敗不該擋住一組已經全綠的證據
       this.deps.log.warn({ err: msg(e) }, '語意飄移判斷呼叫失敗，略過（不阻斷合併）');
@@ -120,7 +135,12 @@ export class DriftJudge {
     return verdict;
   }
 
-  private async runQuery(prompt: string, cwd: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, repo?: string): Promise<string> {
+    // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
+    // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
+    const docsSource = repo ? this.deps.docs?.(repo) : undefined;
+    const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
+
     const q: DriftQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -130,6 +150,7 @@ export class DriftJudge {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 工具已限制唯讀
+            ...(docsServer ? { mcpServers: { docs: docsServer } as never } : {}),
             allowedTools: JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力

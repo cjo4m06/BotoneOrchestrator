@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { execa } from 'execa';
 import { createHash } from 'node:crypto';
 import type { Logger } from '../observability/logger.js';
@@ -88,6 +89,18 @@ export type ReviewQueryFn = (args: { prompt: string; cwd: string; resume?: strin
 
 export interface ReviewerDeps {
   /**
+   * 任務板的文件來源。**未注入 → 這個角色查不到規格**（只能用提示詞裡程式先讀好的那份）。
+   *
+   * 為什麼每個角色都要有：程式預抓規格有兩個無聲的失效模式，兩個都實際發生過——
+   * (1) docRef 字串對不上（實跑：docType 單複數不一致）→ 整份讀不到，只留一行 warn，
+   *     而 build/test 全綠看起來完全正常；
+   * (2) **規格在任務進行中被更新** → 手上是開工那一刻的快照，而且不知道自己拿的是舊的。
+   *
+   * commit e2820a9 已經做過一次，但**只接給寫程式的 agent**——審查者的工作就是
+   * 「規格逐條 vs diff」，卻不能搜規格。
+   */
+  docs?: (repo: string) => DocsSource | undefined;
+  /**
    * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
@@ -109,7 +122,7 @@ const DEFAULT_MAX_DIFF_CHARS = 60_000;
 //
 // 先前這份清單只交給 SDK 的 allowedTools，而那個對工具不具強制力，所以少列 Bash 沒有後果；
 // 改成由 PreToolUse hook 強制之後，少列就等於**默默拿掉它一直在用的能力**（實跑撞到）。
-const REVIEWER_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
+const REVIEWER_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS];
 
 export class Reviewer {
   constructor(private deps: ReviewerDeps) {}
@@ -184,6 +197,10 @@ export class Reviewer {
     cwd: string,
     ctx?: { taskId?: string; repo?: string; groupId?: string; resume?: string },
   ): Promise<string> {
+    // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
+    // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
+    const docsSource = ctx?.repo ? this.deps.docs?.(ctx?.repo) : undefined;
+    const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
     const q: ReviewQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -194,6 +211,7 @@ export class Reviewer {
             cwd: args.cwd,
             ...(args.resume ? { resume: args.resume } : {}),
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
+            ...(docsServer ? { mcpServers: { docs: docsServer } as never } : {}),
             allowedTools: REVIEWER_TOOLS,
             systemPrompt: REVIEWER_SYSTEM_PROMPT,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力

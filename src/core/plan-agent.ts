@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
 import { z } from 'zod';
 import type { Task } from '../types.js';
 import type { Logger } from '../observability/logger.js';
@@ -72,6 +73,18 @@ export type PlanQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterab
 
 export interface PlanAgentDeps {
   /**
+   * 任務板的文件來源。**未注入 → 這個角色查不到規格**（只能用提示詞裡程式先讀好的那份）。
+   *
+   * 為什麼每個角色都要有：程式預抓規格有兩個無聲的失效模式，兩個都實際發生過——
+   * (1) docRef 字串對不上（實跑：docType 單複數不一致）→ 整份讀不到，只留一行 warn，
+   *     而 build/test 全綠看起來完全正常；
+   * (2) **規格在任務進行中被更新** → 手上是開工那一刻的快照，而且不知道自己拿的是舊的。
+   *
+   * commit e2820a9 已經做過一次，但**只接給寫程式的 agent**——審查者的工作就是
+   * 「規格逐條 vs diff」，卻不能搜規格。
+   */
+  docs?: (repo: string) => DocsSource | undefined;
+  /**
    * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
@@ -85,7 +98,7 @@ export interface PlanAgentDeps {
 }
 
 /** 規劃 agent 只讀不寫：它的職責是判斷，不是動手改東西。 */
-const PLAN_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
+const PLAN_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', ...DOCS_TOOLS];
 
 
 /**
@@ -164,6 +177,11 @@ export class PlanAgent {
   }
 
   private async runQuery(prompt: string, cwd: string, repo?: string, signal?: AbortSignal): Promise<string> {
+    // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
+    // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
+    const docsSource = repo ? this.deps.docs?.(repo) : undefined;
+    const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
+
     const q: PlanQueryFn =
       this.deps.queryFn ??
       ((args) =>
@@ -173,6 +191,7 @@ export class PlanAgent {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
             permissionMode: 'acceptEdits', // 邊界由下面的 hook 守，這裡只為避免非互動環境卡在權限詢問
+            ...(docsServer ? { mcpServers: { docs: docsServer } as never } : {}),
             allowedTools: PLAN_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             // **真正的邊界在這裡。** allowedTools 對工具不具強制力（見 PLAN_TOOLS 的說明）

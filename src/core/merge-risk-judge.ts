@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Logger } from '../observability/logger.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
@@ -41,6 +42,8 @@ export interface MergeRiskInput {
   /** 這一群在做什麼——判斷「改動有沒有超出任務範圍」需要知道意圖。 */
   taskTitles: string[];
   taskDescriptions?: string[];
+  /** 所屬 repo——判斷者要靠它去任務板查規格（程式不預抓）。 */
+  repo?: string;
 }
 
 export interface MergeRisk {
@@ -66,7 +69,7 @@ const VerdictSchema = z.union([
 ]);
 
 /** 判斷者只能看，不能動。跟其他判斷者同一個原則：判斷交給 agent，邊界由程式守住。 */
-export const RISK_JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', 'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame'];
+export const RISK_JUDGE_TOOLS = ['Read', 'Glob', 'Grep', 'Bash', 'mcp__git__git_changed_files', 'mcp__git__git_diff', 'mcp__git__git_log', 'mcp__git__git_blame', ...DOCS_TOOLS];
 
 const SYSTEM_PROMPT =
   '你是合併前的最後一道人工判斷。你的唯一問題是：**這個改動要是做錯了，救得回來嗎？**'
@@ -76,6 +79,18 @@ const SYSTEM_PROMPT =
 export type RiskQueryFn = (args: { prompt: string; cwd: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface MergeRiskJudgeDeps {
+  /**
+   * 任務板的文件來源。**未注入 → 這個角色查不到規格**（只能用提示詞裡程式先讀好的那份）。
+   *
+   * 為什麼每個角色都要有：程式預抓規格有兩個無聲的失效模式，兩個都實際發生過——
+   * (1) docRef 字串對不上（實跑：docType 單複數不一致）→ 整份讀不到，只留一行 warn，
+   *     而 build/test 全綠看起來完全正常；
+   * (2) **規格在任務進行中被更新** → 手上是開工那一刻的快照，而且不知道自己拿的是舊的。
+   *
+   * commit e2820a9 已經做過一次，但**只接給寫程式的 agent**——審查者的工作就是
+   * 「規格逐條 vs diff」，卻不能搜規格。
+   */
+  docs?: (repo: string) => DocsSource | undefined;
   /**
    * 記帳出口。未注入 → 不記（測試與無 ledger 的情境）。
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
@@ -99,7 +114,7 @@ export class MergeRiskJudge {
 
     let text: string;
     try {
-      text = await this.runQuery(buildRiskPrompt(input), input.cwd, input.baseRef);
+      text = await this.runQuery(buildRiskPrompt(input), input.cwd, input.baseRef, input.repo);
     } catch (e) {
       const why = `判斷呼叫失敗：${e instanceof Error ? e.message : String(e)}`;
       this.deps.log.warn({ err: why }, '合併風險判斷失敗，保守轉人工');
@@ -118,7 +133,12 @@ export class MergeRiskJudge {
     return verdict;
   }
 
-  private async runQuery(prompt: string, cwd: string, baseRef: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, baseRef: string, repo?: string): Promise<string> {
+    // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
+    // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
+    const docsSource = repo ? this.deps.docs?.(repo) : undefined;
+    const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
+
     const gitServer = createGitInspectServer({ cwd, baseRef, log: this.deps.log });
     const q: RiskQueryFn =
       this.deps.queryFn ??
@@ -131,7 +151,7 @@ export class MergeRiskJudge {
             permissionMode: 'acceptEdits', // 工具已限制唯讀
             allowedTools: RISK_JUDGE_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
-            mcpServers: { git: gitServer } as never,
+            mcpServers: { git: gitServer, ...(docsServer ? { docs: docsServer } : {}) } as never,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
             // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。判斷者只看不動。
             hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: RISK_JUDGE_TOOLS })] }] },
