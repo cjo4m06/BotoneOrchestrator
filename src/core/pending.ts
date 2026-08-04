@@ -1,6 +1,8 @@
 import { NO_CHANGE_BLOCK_PREFIX, RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Group, Task } from '../types.js';
+import type { HandoffRow } from '../store/ledger.js';
+import { HANDOFF_ACTIONS } from './handoff.js';
 
 /**
  * 「有哪些事在等人」的唯一定義。
@@ -62,140 +64,118 @@ export interface PendingItem {
 }
 
 export interface AskLedger {
-  listTasksByState(state: 'blocked'): Task[];
+  /** 「等人」的唯一來源：`to_role='human' AND consumed_at IS NULL`。 */
+  listHandoffs(q: { toRole?: string; kind?: string; groupId?: string; taskId?: string; unconsumedOnly?: boolean; limit?: number }): HandoffRow[];
   listGroupsByState(state: Group['state']): Group[];
+  getTask?(id: string): Task | undefined;
+  getGroup?(id: string): Group | undefined;
   latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
 }
 
 /**
- * 掃出所有「等人處理」的事項。
- * 純函式（只讀 ledger），因此可以完整單元測試，也能被 dashboard 之類的其他前端重用。
+ * 誰在等人——**一條查詢，不是一串推論**。
+ *
+ * ── 為什麼換掉推論 ──
+ *
+ * 先前這個函式從「任務 block 狀態 ＋ 群組狀態 ＋ 事件」反推出待處理清單。
+ * 推論綁在寫死的狀態清單上，漏一項就是一次靜默：實跑撞到兩個群耗盡重試停在
+ * `changes_requested`（不是 `failed`），16 個任務堵著，而控制台顯示
+ * 「沒有需要你處理的事項」。修過一次（把 changes_requested 加進清單），
+ * 但那只是把同一個錯往後推——下一個新狀態還是會漏。
+ *
+ * 現在「等人」是資料：`to_role='human' AND consumed_at IS NULL`。
+ * 開單與停手是同一個寫入動作（見 ledger.setBlock），收單與解除受阻也是（clearBlock）。
+ *
+ * ── 正向自檢 ──
+ *
+ * 光有查詢還不夠：萬一某條路徑忘了開單，症狀一樣是「清單上沒有」。
+ * 所以再加一道**反向**檢查——群組停在非終態、卻沒有任何未結案交接單，就代寫一張。
+ * 這一道刻意不精準（它說的是「我說不出這一群在等什麼」），但它保證
+ * **不會有東西悄悄消失**。
  */
 export function collectPending(ledger: AskLedger): PendingItem[] {
   const items: PendingItem[] = [];
 
-  for (const t of ledger.listTasksByState('blocked')) {
-    const reason = t.block?.reason;
-    const detail = t.block?.detail ?? '';
+  for (const h of ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true })) {
+    const meta = h.taskId ? ledger.getTask?.(h.taskId) : undefined;
+    const group = h.groupId ? ledger.getGroup?.(h.groupId) : undefined;
+    items.push({
+      kind: h.kind as PendingKind,
+      // 任務單掛任務、群組單掛群組——UI 的動作要打到對的東西上
+      id: h.taskId ?? h.groupId ?? h.id,
+      title: h.title,
+      repo: meta?.repo ?? group?.repo ?? '',
+      // body 是 agent／程式自己寫的文字，**程式不解析它**
+      detail: h.ifIgnored ? `${h.body}\n    ⛓ ${h.ifIgnored}` : h.body,
+      ...(h.options?.length ? { actions: h.options } : { actions: HANDOFF_ACTIONS[h.kind] ?? [] }),
+      ...(h.evidence?.length ? { evidence: h.evidence.join(' ') } : {}),
+      // ── 細節補強 ──
+      //
+      // 這與被換掉的「推論」是不同的事：那邊推的是**誰在等人**（會漏），
+      // 這邊只是替一個**已經確定在清單上**的項目補齊 UI 要用的欄位。
+      // 補不到就沒有，不影響它出不出現。
+      ...(h.kind === 'clarification' && parseSuggestion(h.body) ? { suggestion: parseSuggestion(h.body)! } : {}),
+      ...(h.kind === 'no_change' ? noChangeExtras(ledger, h.taskId) : {}),
+    });
+  }
 
-    if (reason === 'needs_clarification') {
+  // 正向自檢：停在非終態、又沒有任何未結案交接單的群組。
+  // 這一道抓的是「某條路徑忘了開單」——症狀與「真的沒事」完全一樣，
+  // 所以必須由程式主動找出來，而不是等人發現。
+  const seen = new Set(items.map((i) => i.id));
+  for (const st of SELF_CHECK_STATES) {
+    for (const g of ledger.listGroupsByState(st)) {
+      if (seen.has(g.id)) continue;
+      if (ledger.listHandoffs({ groupId: g.id, unconsumedOnly: true, limit: 1 }).length > 0) continue;
+      if (!hasStopSignal(ledger, g.id)) continue;
       items.push({
-        kind: 'clarification',
-        id: t.id,
-        title: t.title,
-        repo: t.repo,
-        detail,
-        ...(parseSuggestion(detail) ? { suggestion: parseSuggestion(detail)! } : {}),
-        actions: ['<你的答案>', '--default', 'abort'],
+        kind: 'stuck_group',
+        id: g.id,
+        title: `群組 ${g.id}`,
+        repo: g.repo,
+        detail:
+          `這一群停在 ${g.state} 而且沒有在跑，但系統說不出它在等什麼——` +
+          '這代表某條停手路徑忘了開交接單。成果保留著，請看 log 或按重試。',
+        actions: ['retry'],
       });
-      continue;
     }
-
-    if (reason === 'needs_human') {
-      // 「無需改動」的宣告會以固定前綴寫進 block detail（見 notifier.NO_CHANGE_BLOCK_PREFIX），
-      // 額外從 events 取回結構化的分類與依據，人才有足夠資訊判斷 agent 有沒有誤判。
-      if (detail.startsWith(NO_CHANGE_BLOCK_PREFIX)) {
-        const report = parseNoChangeEvent(ledger, t.id);
-        items.push({
-          kind: 'no_change',
-          id: t.id,
-          title: t.title,
-          repo: t.repo,
-          detail: report?.reason ?? detail,
-          ...(report?.category ? { category: report.category } : {}),
-          ...(report?.evidence ? { evidence: report.evidence } : {}),
-          actions: ['confirm', 'reject'],
-        });
-      } else {
-        items.push({ kind: 'needs_human', id: t.id, title: t.title, repo: t.repo, detail, actions: ['retry', 'abort'] });
-      }
-    }
-  }
-
-  // 等待合併核准：政策判定需人工的群組會停在 in_review（見 group-runner 的政策閘門）
-  for (const g of ledger.listGroupsByState('in_review')) {
-    const why = ledger.latestEvent?.('group', g.id, 'policy_needs_human')?.detail;
-    items.push({
-      kind: 'merge_approval',
-      id: g.id,
-      title: `群組 ${g.id}（${g.taskIds.length} 個任務）`,
-      repo: g.repo,
-      detail: why ?? '等待人工核准合併',
-      actions: ['approve', 'deny'],
-    });
-  }
-
-  // **任何 failed 的群組都要出現在這裡。**
-  //
-  // 先前只列「重新派工已達上限」那一種，其餘全部靜默：執行中擲出例外、前置條件不成立、
-  // 合併工作區不見、建 worktree 失敗……群組停在 failed，控制台卻回報「沒有需要你處理的事項」。
-  // 實跑撞到：一個群組 failed 了半小時，待處理清單是空的——那等於這個系統
-  // 悄悄放棄了一批工作而沒有人知道。**沒人看得到的失敗，比失敗本身更糟。**
-  // 「有幾群在等它」——afterGroups 只有真的有依賴才會有值，所以這個數字直接代表
-  // 修好這一群能解開多少後續工作。沒有它的話，人看到的只是一則孤立的失敗，
-  // 不知道背後還有一整條鏈停在那裡。
-  const blockedBy = new Map<string, string[]>();
-  for (const st of ['ready', 'forming'] as const) {
-    for (const g of ledger.listGroupsByState(st)) {
-      for (const dep of g.afterGroups) {
-        const cur = blockedBy.get(dep);
-        if (cur) cur.push(g.id);
-        else blockedBy.set(dep, [g.id]);
-      }
-    }
-  }
-
-  // **不能只掃 failed。** 群組「停手交人」有兩種收尾：進 failed，或**留在原本的狀態**。
-  //
-  // 實跑撞到：g_1fb6a29e1a0c 重新派工用完 3 次，事件寫著「停手交人處理｜停在
-  // changes_requested」——它不在 failed，所以整段掃描看不到它。同一時間 g_5dc7cbe807d4
-  // 有 reconcile_needs_human 也停在 changes_requested。兩群在等人、16 個任務堵在它們後面，
-  // 控制台的「等你處理」是空的，什麼都沒發生也沒有人知道。
-  //
-  // 所以判準改成「有沒有留下**停手交人**的事件」，而不是「狀態是不是 failed」。
-  // 狀態是系統的內部分類，會因為停在哪一步而不同；事件才是「這件事需要人」的事實。
-  const stopped = new Map<string, Group>();
-  for (const g of ledger.listGroupsByState('failed')) stopped.set(g.id, g);
-  for (const st of HANDOFF_STATES) {
-    for (const g of ledger.listGroupsByState(st)) {
-      if (stopped.has(g.id)) continue;
-      const handoff = HANDOFF_EVENTS.some((k) => ledger.latestEvent?.('group', g.id, k));
-      if (handoff) stopped.set(g.id, g);
-    }
-  }
-
-  for (const g of stopped.values()) {
-    // 兩種停手講的是不同的事，標題不能混用：
-    // requeue_exhausted     = 試過 N 次都不成，你要決定還要不要再試
-    // reconcile_needs_human = 系統根本沒有自動路徑，再按重試也不會有事發生
-    const exhausted = ledger.latestEvent?.('group', g.id, 'requeue_exhausted')?.detail;
-    const noAutoPath = ledger.latestEvent?.('group', g.id, 'reconcile_needs_human')?.detail;
-    // 最後一則失敗原因：優先用停手的說明，否則找最近一次 blocked／失敗事件
-    const lastReason =
-      exhausted ??
-      noAutoPath ??
-      ledger.latestEvent?.('group', g.id, 'merge_guard_blocked')?.detail ??
-      // 「已核准卻無路可走」也走這裡：它的原因寫在 merge_blocked
-      ledger.latestEvent?.('group', g.id, 'merge_blocked')?.detail ??
-      ledger.latestEvent?.('group', g.id, 'worktree_create_failed')?.detail ??
-      ledger.latestEvent?.('group', g.id, 'group_failed')?.detail;
-    items.push({
-      kind: 'stuck_group',
-      id: g.id,
-      title: `群組 ${g.id}`,
-      repo: g.repo,
-      detail:
-        (exhausted
-          ? `重新派工已達上限：${firstLine(exhausted)}`
-          : noAutoPath
-            ? `沒有自動處理的路徑，要你親自處理：${firstLine(noAutoPath)}`
-            : `群組失敗，需要你決定要不要重試：${firstLine(lastReason) || '（沒有留下原因，請看 log）'}`)
-        + waitingSuffix(blockedBy.get(g.id)),
-      actions: ['retry'],
-    });
   }
 
   return items;
+}
+
+/**
+ * 「無需改動」的分類與查證依據。
+ *
+ * agent 用 `report_no_change` 交件時是結構化的（category／reason／evidence），
+ * 但 block detail 只塞得下一句話。人要判斷「agent 有沒有誤判」需要看它查證了什麼，
+ * 所以從事件把結構化那份取回來。
+ */
+function noChangeExtras(ledger: AskLedger, taskId: string | undefined): Partial<PendingItem> {
+  if (!taskId) return {};
+  const raw = ledger.latestEvent?.('task', taskId, 'no_change_reported')?.detail;
+  if (!raw) return {};
+  try {
+    const r = JSON.parse(raw) as { category?: NoChangeCategory; reason?: string; evidence?: string };
+    return {
+      ...(r.category ? { category: r.category } : {}),
+      ...(r.reason ? { detail: r.reason } : {}),
+      ...(r.evidence ? { evidence: r.evidence } : {}),
+    };
+  } catch {
+    // 格式壞掉不該讓這一項從清單上消失——它還是要出現，只是少了分類
+    return {};
+  }
+}
+
+/** 自檢要看的狀態：跑到一半停住、而且系統不會自己再動它的那些。 */
+const SELF_CHECK_STATES: Group['state'][] = ['changes_requested', 'failed', 'merge_guard'];
+
+/** 這一群留下過「停手交人」的痕跡嗎（事件層，與交接單獨立）。 */
+function hasStopSignal(ledger: AskLedger, groupId: string): boolean {
+  return ['requeue_exhausted', 'reconcile_needs_human', 'group_failed', 'merge_guard_blocked'].some(
+    (k) => ledger.latestEvent?.('group', groupId, k),
+  );
 }
 
 /** 後面還有幾群等著它進 base。空的就完全不提，不要多出一句沒資訊的話。 */

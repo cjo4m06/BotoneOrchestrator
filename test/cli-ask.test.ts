@@ -11,6 +11,7 @@ import {
 } from '../src/cli/ask.js';
 import { InboundRouter } from '../src/notify/notifier.js';
 import { createTmpLedger, createSilentLogger, type TmpLedger } from './helpers/index.js';
+import { openStuckGroupHandoff, openMergeApprovalHandoff } from '../src/core/handoff.js';
 import type { McpOut } from '../src/types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -47,29 +48,33 @@ describe('CLI ask — 本機互動入口', () => {
       return g.id;
     }
 
-    it('沒有 requeue_exhausted 也要列，並帶上最後一則失敗原因的第一行', () => {
-      const gid = failedGroup('g-a', 'T-A');
-      tmp.ledger.logEvent('group', gid, 'merge_guard_blocked', 'code_conflict: CONFLICT in a.ts\n第二行不該出現');
+    it('標成 failed 就一定出現在清單上，並帶上呼叫端給的理由', () => {
+      seedTask('T-A', '某任務');
+      const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-A'], footprint: [] });
+      tmp.ledger.updateGroupState(g.id, 'failed', { reason: 'code_conflict: CONFLICT in a.ts' });
 
       const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
 
       assert.equal(stuck.length, 1);
-      assert.match(stuck[0]!.detail, /需要你決定要不要重試/);
       assert.match(stuck[0]!.detail, /CONFLICT in a\.ts/);
-      assert.equal(/第二行不該出現/.test(stuck[0]!.detail), false, '清單只放第一行，細節去看事件');
       assert.deepEqual(stuck[0]!.actions, ['retry']);
     });
 
-    it('連原因都沒留下也要列（並講明去看 log）', () => {
+    // **這一條是這整套的核心保證**：呼叫端忘了給理由也絕不會讓群組消失。
+    // 文字漂不漂亮是次要的——先前它靠推論，而推論漏掉一種狀態就是 16 個任務靜靜堵著。
+    it('連原因都沒給也要列（並講明去看 log）', () => {
       failedGroup('g-b', 'T-B');
       const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
       assert.equal(stuck.length, 1);
       assert.match(stuck[0]!.detail, /沒有留下原因/);
     });
 
-    it('requeue 耗盡維持原本的說法（那是不同的處境）', () => {
-      const gid = failedGroup('g-c', 'T-C');
-      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '已重試 3 次');
+    it('requeue 耗盡走自己的產生端，說法與一般失敗分開（那是不同的處境）', () => {
+      seedTask('T-C', '某任務');
+      const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-C'], footprint: [] });
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: g.id, repo: 'o/r', why: '重新派工已達上限：已重試 3 次',
+      });
       const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
       assert.match(stuck[0]!.detail, /重新派工已達上限/);
     });
@@ -93,7 +98,10 @@ describe('CLI ask — 本機互動入口', () => {
 
     it('requeue 耗盡但停在 changes_requested → 要列出來', () => {
       const gid = stoppedGroup('g-d', 'T-D', 'changes_requested');
-      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '群組重新派工已達上限（3 次），停手交人處理｜停在 changes_requested');
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: gid, repo: 'o/r',
+        why: '重新派工已達上限：已重試 3 次（停在 changes_requested）',
+      });
 
       const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
 
@@ -104,7 +112,10 @@ describe('CLI ask — 本機互動入口', () => {
 
     it('reconcile_needs_human → 要列出來，而且說法要跟「重試用完」分開', () => {
       const gid = stoppedGroup('g-e', 'T-E', 'changes_requested');
-      tmp.ledger.logEvent('group', gid, 'reconcile_needs_human', '審查要求修改：目前沒有自動回頭改的路徑，需人工處理');
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: gid, repo: 'o/r',
+        why: '沒有自動處理的路徑：審查要求修改，需人工處理',
+      });
 
       const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
 
@@ -112,6 +123,20 @@ describe('CLI ask — 本機互動入口', () => {
       assert.match(stuck[0]!.detail, /沒有自動處理的路徑/);
       // 這兩件事處境不同：一個是「還要不要再試」，一個是「再按重試也不會有事發生」
       assert.equal(/重新派工已達上限/.test(stuck[0]!.detail), false);
+    });
+
+    // **這一條驗的是最後一道防線。**
+    // 前面每一條都假設「產生端記得開單」。萬一某條路徑忘了，症狀與「真的沒事」
+    // 完全一樣——所以要有一道反向檢查主動把它撈出來。
+    it('產生端忘了開單 → 自檢仍要把它撈出來（不會悄悄消失）', () => {
+      const gid = stoppedGroup('g-forgot', 'T-forgot', 'changes_requested');
+      // 只留停手的事件、故意不開單（模擬某條路徑漏接）
+      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '已重試 3 次');
+
+      const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
+
+      assert.equal(stuck.length, 1, '漏接的路徑必須被自檢接住');
+      assert.match(stuck[0]!.detail, /說不出它在等什麼/, '要明講這是系統的漏接，而不是假裝知道原因');
     });
 
     it('沒有交人事件的 changes_requested 群組不要列（它還在正常流程裡）', () => {
@@ -192,6 +217,9 @@ describe('CLI ask — 本機互動入口', () => {
       const g = tmp.ledger.listGroupsByState('ready')[0]!;
       tmp.ledger.updateGroupState(g.id, 'in_review');
       tmp.ledger.logEvent('group', g.id, 'policy_needs_human', '存在非「純樣式/文件」變更：gamma.js');
+      openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: g.id, title: `群組 ${g.id}（2 個任務）`, why: '存在非「純樣式/文件」變更：gamma.js', taskIds: ['T-1', 'T-2'],
+      });
 
       const items = collectPending(tmp.ledger);
 
@@ -209,6 +237,12 @@ describe('CLI ask — 本機互動入口', () => {
       const a = tmp.ledger.createGroup({ repo: 'o/r', branch: 'a', taskIds: ['T-1'], footprint: [] });
       tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-2'], footprint: [], afterGroups: [a.id] });
       tmp.ledger.createGroup({ repo: 'o/r', branch: 'c', taskIds: ['T-3'], footprint: [], afterGroups: [a.id] });
+      // 「還有幾群在等它」由產生端算好寫進單裡——那個數字直接代表
+      // 修好這一群能解開多少後續工作（沒有它，人看到的只是一則孤立的失敗）。
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: a.id, repo: 'o/r', why: '群組失敗',
+        waitingGroups: tmp.ledger.listGroupsByState('ready').filter((x) => x.afterGroups.includes(a.id)).map((x) => x.id),
+      });
       tmp.ledger.updateGroupState(a.id, 'failed');
 
       const stuck = collectPending(tmp.ledger).find((i) => i.kind === 'stuck_group');
@@ -389,6 +423,11 @@ describe('CLI ask — 本機互動入口', () => {
       tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
       const g = tmp.ledger.listGroupsByState('ready')[0]!;
       tmp.ledger.updateGroupState(g.id, 'in_review');
+      // 核准請求是**開單開出來的**，不是從 in_review 這個狀態推的——
+      // 那個推論先前把「有人在 GitHub 上開始看」也當成「等你核准」。
+      openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: g.id, title: `群組 ${g.id}`, why: '等待人工核准合併', taskIds: ['T-1'],
+      });
       const items = collectPending(tmp.ledger);
       const action = resolveAction(items, '1', ['approve']);
       assert.ok(typeof action !== 'string');

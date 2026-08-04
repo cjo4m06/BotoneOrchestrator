@@ -510,7 +510,18 @@ export class Ledger {
       .prepare(`UPDATE tasks SET state=@state, block_reason=NULL, block_detail=NULL, updated_at=@ts WHERE id=@id`)
       .run({ id, state: nextState, ts: this.now() });
     const ok = this.affected(res.changes, 'clearBlock', { id, state: nextState });
-    if (ok) this.emitTaskChanged(id);
+    if (ok) {
+      // **解除受阻 = 那張單處理完了。** 與 setBlock 對稱地放在這裡，理由相同：
+      // clearBlock 全 repo 有 5 個呼叫點（notifier ×4、worker ×1），
+      // 要每個都記得配一次「標記已處理」就是下一個「接線只接一半」。
+      //
+      // 沒有這個寫入點的後果是**清單只會單向增長**：人回答了澄清、任務回到 queued，
+      // 但那張單永遠留在「等你處理」上——比漏掉更糟，因為它看起來像系統壞了。
+      //
+      // 只收 to_role='human' 的：給 coder 的審查意見與交付說明不屬於「人處理完了」。
+      this.consumeHandoffsFor({ taskId: id, toRole: 'human' });
+      this.emitTaskChanged(id);
+    }
     return ok;
   }
 
@@ -767,7 +778,12 @@ export class Ledger {
   }
 
   /** @returns 是否真的更新到該群組（找不到 → warn + false）。 */
-  updateGroupState(id: string, state: GroupState, extra: { prUrl?: string; prNumber?: number } = {}): boolean {
+  updateGroupState(
+    id: string,
+    state: GroupState,
+    /** `reason` 只在 state='failed' 時用：交接單的說明。漏傳只會少一句話，不會讓群組從清單上消失。 */
+    extra: { prUrl?: string; prNumber?: number; reason?: string } = {},
+  ): boolean {
     const res = this.db
       .prepare(
         `UPDATE groups SET state=@state, updated_at=@ts,
@@ -777,6 +793,13 @@ export class Ledger {
     const ok = this.affected(res.changes, 'updateGroupState', { id, state });
     // 群層狀態會改變群內每張卡的呈現（done 的任務在 in_review 下要變成「等你核准合併」）
     if (ok) for (const tid of this.getGroup(id)?.taskIds ?? []) this.emitTaskChanged(tid);
+    // **停手交人是同一個寫入動作**（與 setBlock 同一個道理）。
+    // `failed` 全 repo 有 8 個設定點（group-runner 6、orchestrator 1、reconciler 1）——
+    // 要每個都記得配一次開單就是下一個「接線只接一半」。
+    //
+    // 已經有未處理的 stuck_group 單就不再開：orchestrator 的「重試用完」與 reconciler 的
+    // 「沒有自動路徑」會先開一張有具體理由的，這裡只負責兜底那些沒人開的路徑。
+    if (state === 'failed') this.openGroupStuckHandoff(id, extra.reason);
     return ok;
   }
 
@@ -1076,6 +1099,43 @@ export class Ledger {
     if (r.changes === 0) this.log.warn({ taskId }, '累加工具計數時找不到任務');
   }
 
+  /**
+   * 群組進 failed 時兜底開一張交接單。
+   *
+   * 這裡**不知道為什麼失敗**——理由由各個失敗路徑寫成事件。所以 body 取這一群
+   * 最近一則事件的內容：那通常就是剛剛寫下的失敗原因。取不到就誠實說「沒有留下原因」，
+   * 而不是編一個看起來像答案的東西。
+   *
+   * 重點不是文字漂亮，是**這一群一定會出現在清單上**。先前它靠 collectPending 推論，
+   * 而推論漏了 changes_requested 那一種，16 個任務就這樣堵著沒人知道。
+   */
+  private openGroupStuckHandoff(groupId: string, reason?: string): void {
+    try {
+      if (this.listHandoffs({ groupId, kind: 'stuck_group', unconsumedOnly: true, limit: 1 }).length > 0) return;
+      // 優先用呼叫端給的理由；沒給就退回這一群最近一則事件（多半就是剛寫下的失敗原因）。
+      // 兩者都沒有也照樣開單——**這一群一定要出現在清單上**才是重點，
+      // 文字漂不漂亮是次要的（先前它靠推論，而推論漏了 changes_requested，16 個任務堵著）。
+      const last = this.db
+        .prepare("SELECT kind, detail FROM events WHERE scope='group' AND ref_id=@id ORDER BY id DESC LIMIT 1")
+        .get({ id: groupId }) as Row | undefined;
+      const why = (reason ?? (last?.detail as string) ?? '').trim();
+      this.openHandoff({
+        groupId,
+        fromRole: 'program',
+        toRole: 'human',
+        kind: 'stuck_group',
+        title: `群組 ${groupId} 失敗，需要你決定`,
+        body: why || '（沒有留下原因，請看 log）',
+        options: HANDOFF_ACTIONS.stuck_group,
+      });
+    } catch (e) {
+      this.log.warn(
+        { groupId, err: e instanceof Error ? e.message : String(e) },
+        '開群組停手交接單失敗（群組照樣 failed，但清單上會看不到）',
+      );
+    }
+  }
+
   // ── check_runs：關卡執行的流水帳（純記帳、零解讀） ──────────────────
 
   /**
@@ -1256,12 +1316,13 @@ export class Ledger {
   }
 
   /** 把某個範圍內還沒處理的單一次標掉（例如群組結案時收掉它底下所有的單）。 */
-  consumeHandoffsFor(q: { groupId?: string; taskId?: string; kind?: string }): number {
+  consumeHandoffsFor(q: { groupId?: string; taskId?: string; kind?: string; toRole?: string }): number {
     const where: string[] = ['consumed_at IS NULL'];
     const params: Record<string, unknown> = { ts: this.now() };
     if (q.groupId) { where.push('group_id = @groupId'); params.groupId = q.groupId; }
     if (q.taskId) { where.push('task_id = @taskId'); params.taskId = q.taskId; }
     if (q.kind) { where.push('kind = @kind'); params.kind = q.kind; }
+    if (q.toRole) { where.push('to_role = @toRole'); params.toRole = q.toRole; }
     const r = this.db.prepare(`UPDATE handoffs SET consumed_at = @ts WHERE ${where.join(' AND ')}`).run(params);
     return r.changes;
   }

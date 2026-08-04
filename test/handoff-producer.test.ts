@@ -146,15 +146,83 @@ describe('新舊清單比對：浮出來的東西必須一樣', () => {
     assert.equal(oldIds.has('T-deps'), false, 'deps 兩邊都不該出現（自動等待不是要人處理的事）');
   });
 
-  it('唯一刻意的差異：認領不回來的卡從 needs_human 改標成 reclaim_blocked', (t) => {
+  // 舊推論沒有 reclaim_blocked 這條分支，一律標成 needs_human → 顯示「重試／中止」按鈕，
+  // 而按重試永遠沒用（解法在任務板：要把卡改回「待辦」）。實跑：使用者按了 4 次。
+  // `PendingKind` 早就宣告了這一種，只是從來沒有人產生它。
+  it('認領不回來的卡標成 reclaim_blocked，而且沒有按鈕可按', (t) => {
     const h = createTmpLedger();
     t.after(() => h.cleanup());
     h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-rc', title: 'x' }));
     h.ledger.setBlock('T-rc', 'needs_human', `${RECLAIM_BLOCK_PREFIX}：卡在進行中`);
 
-    // 舊推論沒有 reclaim_blocked 這條分支，一律標成 needs_human → 顯示「重試／中止」按鈕，
-    // 而按重試永遠沒用（解法在任務板：要把卡改回「待辦」）。實跑：使用者按了 4 次。
-    assert.equal(collectPending(h.ledger)[0]?.kind, 'needs_human');
-    assert.equal(h.ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true })[0]?.kind, 'reclaim_blocked');
+    const item = collectPending(h.ledger)[0];
+    assert.equal(item?.kind, 'reclaim_blocked');
+    assert.deepEqual(item?.actions, [], '給一顆按了沒用的按鈕比不給更糟');
+  });
+});
+
+/**
+ * clearBlock 一定要收單——**沒有這個寫入點，清單只會單向增長**。
+ *
+ * 原施工計畫的四條驗收全部只驗得到「看得見」，沒有一條驗「處理完會消失」。
+ * 那個漏洞的症狀是：人回答了澄清、任務回到 queued，但那張單永遠留在「等你處理」上
+ * ——比漏掉更糟，因為它看起來像系統壞了。
+ */
+describe('clearBlock 收單（處理完就從清單上消失）', () => {
+  function setup(t: { after(fn: () => void): void }) {
+    const h = createTmpLedger();
+    t.after(() => h.cleanup());
+    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-1', title: '做一個按鈕' }));
+    return h.ledger;
+  }
+
+  it('解除受阻 → 那張單標成已處理', (t) => {
+    const L = setup(t);
+    L.setBlock('T-1', 'needs_clarification', '要用哪種快取？');
+    assert.equal(collectPending(L).length, 1);
+
+    L.clearBlock('T-1', 'queued');
+
+    assert.deepEqual(collectPending(L), [], '人回答完了，那張單就不該還掛在「等你處理」上');
+    assert.equal(L.listHandoffs({ taskId: 'T-1' }).length, 1, '單本身留著當稽核軌跡');
+  });
+
+  it('同一任務多張單一次收乾淨', (t) => {
+    const L = setup(t);
+    L.setBlock('T-1', 'needs_clarification', '問題');
+    L.setBlock('T-1', 'needs_human', '另一件事');
+    assert.equal(collectPending(L).length, 2);
+
+    L.clearBlock('T-1', 'queued');
+
+    assert.deepEqual(collectPending(L), []);
+  });
+
+  it('不收別的任務的單', (t) => {
+    const L = setup(t);
+    L.upsertDiscoveredTask(makeDiscoveredTask({ id: 'T-2', title: '另一張卡' }));
+    L.setBlock('T-1', 'needs_human', 'a');
+    L.setBlock('T-2', 'needs_human', 'b');
+
+    L.clearBlock('T-1', 'queued');
+
+    assert.deepEqual(collectPending(L).map((i) => i.id), ['T-2']);
+  });
+
+  it('給 coder 的單（審查意見／交付說明）不被 clearBlock 收掉', (t) => {
+    const L = setup(t);
+    L.openHandoff({
+      taskId: 'T-1', groupId: 'g1', fromRole: 'reviewer', toRole: 'coder',
+      kind: 'review_feedback', title: 't', body: '這裡不符規格',
+    });
+    L.setBlock('T-1', 'needs_human', '等人');
+
+    L.clearBlock('T-1', 'queued');
+
+    assert.equal(
+      L.listHandoffs({ taskId: 'T-1', toRole: 'coder', unconsumedOnly: true }).length,
+      1,
+      '人處理完自己那件事，不代表 agent 那邊的意見也處理完了',
+    );
   });
 });
