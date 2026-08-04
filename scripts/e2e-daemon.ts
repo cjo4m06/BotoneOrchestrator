@@ -25,7 +25,36 @@ import { join, resolve } from 'node:path';
 import { createLogger } from '../src/observability/logger.js';
 import { Ledger } from '../src/store/ledger.js';
 import { Poller, type PollSource } from '../src/core/poller.js';
-import { Planner } from '../src/core/planner.js';
+import { Planner, type PlanAgentLike } from '../src/core/planner.js';
+
+/**
+ * 假的規劃 agent：**依共用的規格檔分群，依賴的併進同一群**。
+ *
+ * 這條規則以前寫在 planner 裡（關鍵字相似度 ＋ 共用 docRef 的啟發式），第 15 片刪掉了
+ * ——分群現在完全是 agent 的判斷，而這支 e2e 是刻意不碰網路的（沒有 Claude 認證）。
+ * 這裡把它做成假件，因為 e2e 驗的是**整條鏈的接線**，不是分群本身的品質。
+ */
+function fakePlanAgent(): PlanAgentLike {
+  return {
+    async plan(tasks) {
+      const keyOf = (id: string): string => {
+        const t = tasks.find((x) => x.id === id);
+        return (t?.docRefs[0] ?? id).split('#')[0]!;
+      };
+      const byKey = new Map<string, string[]>();
+      for (const t of tasks) {
+        // 有宣告依賴的任務跟著上游走（同一群才有「前一個任務的成果看得到」的語意）
+        const dep = t.dependencies.find((d) => tasks.some((x) => x.id === d));
+        const key = dep ? keyOf(dep) : keyOf(t.id);
+        byKey.set(key, [...(byKey.get(key) ?? []), t.id]);
+      }
+      const groups = [...byKey.entries()].map(([file, taskIds], i) => ({
+        id: `g${i + 1}`, taskIds, files: [file], why: `共用 ${file}`,
+      }));
+      return { groups, stages: [groups.map((g) => g.id)] };
+    },
+  };
+}
 import { Dispatcher } from '../src/core/dispatcher.js';
 import { GroupRunner, type PrManagerLike, type ProjectRuntime } from '../src/core/group-runner.js';
 import { Orchestrator } from '../src/core/orchestrator.js';
@@ -589,7 +618,7 @@ async function main(): Promise<void> {
   const orch = new Orchestrator(
     {
       poller: new Poller(sources, ledger, log),
-      planner: new Planner({ resolveRepoPath: (repo) => runtimes.get(repo)?.repoPath, log }),
+      planner: new Planner({ resolveRepoPath: (repo) => runtimes.get(repo)?.repoPath, log, planAgent: fakePlanAgent() }),
       dispatcher,
       ledger,
       log,

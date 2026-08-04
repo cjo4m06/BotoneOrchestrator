@@ -706,6 +706,43 @@ export class Orchestrator {
       } catch {
         // ledger 也壞了就只剩 log，但不能讓它擴散出去
       }
+      this.openPlanFailureHandoff(repo, why);
+    }
+  }
+
+  /**
+   * 規劃失敗 → 開一張給人的交接單。
+   *
+   * ── 為什麼光寫 tick_failed 不夠 ──
+   *
+   * 規劃是整條鏈的入口：它不成功，後面**什麼都不會發生**。而先前這條路只寫一筆
+   * `tick_failed` 事件，於是在沒有 Claude 認證的環境裡，daemon 每一輪都安靜地
+   * 失敗一次、什麼都不做——控制台上「現在在做什麼」是空的、「等你處理」也是空的，
+   * 看起來就像整台當機了，而實際上它只是需要有人去修一下認證。
+   *
+   * **同一個 repo 只開一張**：規劃每輪都會重試，不去重的話清單會被同一件事灌爆，
+   * 而那會讓人不再相信那份清單（正是交接單這整套要修掉的病）。
+   */
+  private openPlanFailureHandoff(repo: string, why: string): void {
+    const { ledger, log } = this.deps;
+    try {
+      const open = ledger.listHandoffs?.({ toRole: 'human', kind: 'needs_human', unconsumedOnly: true }) ?? [];
+      if (open.some((h) => h.title.includes(repo))) return; // 已經有一張在等人了
+      ledger.openHandoff?.({
+        fromRole: 'program',
+        toRole: 'human',
+        kind: 'needs_human',
+        title: `規劃 ${repo} 失敗，這個專案開不了工`,
+        body: why,
+        options: ['retry', 'abort'],
+        ifIgnored: '這個專案的任務會一直停在「已發現」，不會有任何群組被建出來——'
+          + '控制台看起來會像整台當機，但其實只是這一步過不去。',
+      });
+    } catch (err) {
+      log.warn(
+        { repo, err: err instanceof Error ? err.message : String(err) },
+        '開規劃失敗的交接單失敗（規劃照樣是失敗的，但清單上會看不到）',
+      );
     }
   }
 

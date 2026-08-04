@@ -27,6 +27,7 @@ import { loadEnv } from '../src/config/env.js';
 import { Ledger } from '../src/store/ledger.js';
 import { Poller, type PollSource } from '../src/core/poller.js';
 import { Planner } from '../src/core/planner.js';
+import { PlanAgent } from '../src/core/plan-agent.js';
 import { Dispatcher } from '../src/core/dispatcher.js';
 import { GroupRunner, type ProjectRuntime } from '../src/core/group-runner.js';
 import { Orchestrator } from '../src/core/orchestrator.js';
@@ -526,7 +527,13 @@ async function runFlow(repo: TempRepo): Promise<number> {
   const orchestrator = new Orchestrator(
     {
       poller: new Poller([{ client: mcp, repo: repo.full } as PollSource], ledger, log),
-      planner: new Planner({ resolveRepoPath: () => repo.localPath, log }),
+      // 分群一律走規劃 agent（第 15 片起沒有啟發式退路了）。
+      // 這支腳本本來就是對真實網路跑的，所以接真的那一個。
+      planner: new Planner({
+        resolveRepoPath: () => repo.localPath,
+        log,
+        planAgent: new PlanAgent({ log, usage: ledger, docs: () => undefined }),
+      }),
       dispatcher,
       ledger,
       log,

@@ -11,7 +11,8 @@ import {
   type ReviewWatcherLike,
 } from '../src/core/orchestrator.js';
 import { Dispatcher } from '../src/core/dispatcher.js';
-import { Planner } from '../src/core/planner.js';
+import { collectPending } from '../src/core/pending.js';
+import { Planner , type PlanAgentLike } from '../src/core/planner.js';
 import { ReviewFeedbackStore } from '../src/pr/review-watcher.js';
 import type { Group, GroupState, LifecycleEvent, MergeVerdict, PlanResult, Task, TaskDetail } from '../src/types.js';
 import { Poller } from '../src/core/poller.js';
@@ -92,6 +93,30 @@ async function tickUntilDispatched(o: { tick(s?: AbortSignal): Promise<void>; se
   await o.tick();
 }
 
+/**
+ * 假的規劃 agent：**依共用的規格檔分群**。
+ *
+ * 這條規則以前寫在 planner 裡（關鍵字相似度 ＋ 共用 docRef 的啟發式），第 15 片刪掉了——
+ * 分群現在完全是 agent 的判斷。這裡把它做成測試替身，是因為這一批測試驗的是
+ * **tick 的主流程**（poll → plan → 建群 → 派工），不是分群本身的品質；
+ * 需要的只是一個「行為可預期」的規劃者。
+ */
+function fakePlanAgent(): PlanAgentLike {
+  return {
+    async plan(tasks) {
+      const byDoc = new Map<string, string[]>();
+      for (const t of tasks) {
+        const key = (t.docRefs[0] ?? t.id).split('#')[0]!;
+        byDoc.set(key, [...(byDoc.get(key) ?? []), t.id]);
+      }
+      const groups = [...byDoc.entries()].map(([file, taskIds], i) => ({
+        id: `g${i + 1}`, taskIds, files: [file], why: `共用 ${file}`,
+      }));
+      return { groups, stages: [groups.map((g) => g.id)] };
+    },
+  };
+}
+
 describe('Orchestrator — 主控迴圈', () => {
   let tmp: TmpLedger;
   beforeEach(() => {
@@ -112,7 +137,7 @@ describe('Orchestrator — 主控迴圈', () => {
       );
     const deps: OrchestratorDeps = {
       poller: asPoller(poller),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher,
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -148,6 +173,44 @@ describe('Orchestrator — 主控迴圈', () => {
 
     assert.deepEqual(dispatched.map((x) => x.id), [g.id]);
     assert.equal(dispatched[0]?.branch, g.branch, '派出的群必須已帶分支名');
+  });
+
+  /**
+   * **規劃失敗必須看得見。**
+   *
+   * 規劃是整條鏈的入口：它不成功，後面什麼都不會發生。先前這條路只寫一筆
+   * `tick_failed` 事件，於是在沒有 Claude 認證的環境裡，daemon 每一輪都安靜地
+   * 失敗一次、什麼都不做——控制台上「現在在做什麼」是空的、「等你處理」也是空的，
+   * 看起來就像整台當機了，而其實只是需要有人去修一下認證。
+   */
+  it('沒有規劃 agent → 開一張交接單交人，不是每輪安靜地失敗', async () => {
+    const poller = fakePoller(tmp, [[{ id: 'T-1', docRefs: ['spec/a.md#1'] }]]);
+    // 沒有 planAgent ＝ 沒有 Claude 認證的環境
+    const { orch } = build(poller, { planner: new Planner({ resolveRepoPath: () => '/repo' }) });
+
+    await tickAndPlan(orch);
+
+    const pending = collectPending(tmp.ledger);
+    assert.equal(pending.length, 1, '這件事必須出現在「等你處理」上');
+    assert.match(pending[0]!.detail, /認證/, '要講得出怎麼修');
+    assert.equal(tmp.ledger.listGroupsByState('ready').length, 0, '不可以安靜地建出零群就當沒事');
+  });
+
+  it('規劃連續失敗 → 同一個專案只開一張單（不可以每輪灌一張）', async () => {
+    const poller = fakePoller(tmp, [
+      [{ id: 'T-1', docRefs: ['spec/a.md#1'] }],
+      [{ id: 'T-2', docRefs: ['spec/b.md#1'] }],
+    ]);
+    const { orch } = build(poller, { planner: new Planner({ resolveRepoPath: () => '/repo' }) });
+
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+
+    assert.equal(
+      collectPending(tmp.ledger).length,
+      1,
+      '同一件事灌爆清單會讓人不再相信那份清單——那正是交接單這整套要修掉的病',
+    );
   });
 
   it('不相關的任務各自成群，群間可並行派出', async () => {
@@ -616,7 +679,7 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     const dispatched: Group[] = [];
     const deps: OrchestratorDeps = {
       poller: idlePoller() as unknown as Poller,
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -974,7 +1037,7 @@ describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路�
     const dispatched: Group[] = [];
     const deps: OrchestratorDeps = {
       poller: idlePoller() as unknown as Poller,
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1290,7 +1353,7 @@ describe('Orchestrator — 等上游依賴（deps）的退避與計數', () => {
   function build(over: Partial<OrchestratorDeps> = {}) {
     const deps: OrchestratorDeps = {
       poller: idlePoller() as unknown as Poller,
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async () => {}, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1430,7 +1493,7 @@ describe('Orchestrator — 群組狀態黑洞防護', () => {
     const dispatched: Group[] = [];
     const deps: OrchestratorDeps = {
       poller: idlePoller() as unknown as Poller,
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1499,7 +1562,7 @@ describe('Orchestrator — 靜置期閘門', () => {
     const dispatched: Group[] = [];
     const deps: OrchestratorDeps = {
       poller: asPoller(poller),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1584,7 +1647,7 @@ describe('Orchestrator — 靜置期（真實 Poller + MCP 時間戳）', () => 
     const dispatched: Group[] = [];
     const orch = new Orchestrator({
       poller: new Poller([{ client, repo: 'acme/web', mine: true }], tmp.ledger, createSilentLogger()),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(2, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1620,7 +1683,7 @@ describe('Orchestrator — 花費上限', () => {
     const notices: string[] = [];
     const deps: OrchestratorDeps = {
       poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1734,7 +1797,7 @@ describe('Orchestrator — 花費上限', () => {
     const dispatched: Group[] = [];
     const orch = new Orchestrator({
       poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1773,7 +1836,7 @@ describe('Orchestrator — 核准憑證要跨行程與跨重啟', () => {
     const gw = fakeGateway();
     const deps: OrchestratorDeps = {
       poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(2, async () => {}, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1879,7 +1942,7 @@ describe('Orchestrator — 待處理事項不會無聲卡住', () => {
     const notices: string[] = [];
     const orch = new Orchestrator({
       poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(2, async () => {}, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1964,7 +2027,7 @@ describe('Orchestrator — 待處理事項不會無聲卡住', () => {
     seedPending();
     const orch = new Orchestrator({
       poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-      planner: new Planner(),
+      planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
       dispatcher: new Dispatcher(2, async () => {}, createSilentLogger()),
       ledger: tmp.ledger,
       log: createSilentLogger(),
@@ -1998,7 +2061,7 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     const orch = new Orchestrator(
       {
         poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-        planner: new Planner(),
+        planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
         dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
         ledger: tmp.ledger,
         log: createSilentLogger(),
@@ -2179,7 +2242,7 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
     const orch = new Orchestrator(
       {
         poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-        planner: new Planner(),
+        planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
         dispatcher: new Dispatcher(4, async () => {}, createSilentLogger()),
         ledger: tmp.ledger,
         log: createSilentLogger(),
@@ -2245,7 +2308,7 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
     const orch = new Orchestrator(
       {
         poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-        planner: new Planner(),
+        planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
         dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
         ledger: tmp.ledger,
         log: rec.logger,
@@ -2287,7 +2350,7 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
     const orch = new Orchestrator(
       {
         poller: asPoller({ calls: 0, async pollOnce() { return []; } }),
-        planner: new Planner(),
+        planner: new Planner({ planAgent: fakePlanAgent(), resolveRepoPath: () => '/repo' }),
         dispatcher: new Dispatcher(4, async (g) => { dispatched.push(g); }, createSilentLogger()),
         ledger: tmp.ledger,
         log: createSilentLogger(),

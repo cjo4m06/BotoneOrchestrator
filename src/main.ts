@@ -1483,8 +1483,11 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       planner: new Planner({
         resolveRepoPath: (repo) => registry.runtimeOf(repo)?.repoPath,
         // 分群與排序交給 agent：判準是「這幾個任務會不會動到同一批程式碼」，
-        // 那要看懂任務在講什麼再對應到 repo。沒有 Claude 認證時才退回啟發式，
-        // 並且明講——不然它會安靜地用一套已知會出錯的規則在跑。
+        // 那要看懂任務在講什麼再對應到 repo。
+        //
+        // 沒有 Claude 認證時**不接**，而 Planner 沒有 planAgent 就會明確擲錯，
+        // Orchestrator 據此開一張交接單。先前這裡會退回一套關鍵字相似度的啟發式——
+        // 那是「換一塊任務板就安靜地分錯群，而症狀要到合併衝突才看得到」。
         ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, docs: docsSourceOf, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
