@@ -637,6 +637,58 @@ describe('Worker — 單任務監督迴圈', () => {
     assert.deepEqual(await worker.runTask({ task, ...cfg }), { status: 'done' });
   });
 
+  /**
+   * **規格問題不回灌給 coder。**
+   *
+   * 實跑（zZb5MGTMdQRZ）：reviewer 每一輪都正確地發現不符，每一輪都只能說 fail，
+   * 每一輪都把它送回一個 coder 解不了的地方。四輪、$36.64，
+   * 最後那個 PR 帶著一條沒滿足的 DoD 被人按核准合併，而「這是刻意的特例」
+   * 沒有留在任何地方。
+   */
+  it('reviewer 判 spec_problem → 立刻交人，不再燒任何一輪 agent', async () => {
+    const task = makeTask();
+    seed(task);
+    const agent = fakeAgent([{}, {}, {}]);
+    const { worker } = build({
+      agent,
+      reviewer: fakeReviewer([{
+        status: 'spec_problem',
+        problem: '三條要求在幾何上無法同時成立（兩鍵中心距 28px）',
+        conflicting: ['熱區至少 44×44', '不得改變視覺外觀', '相鄰熱區不得重疊'],
+      }]),
+    });
+
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.ok(out.status === 'blocked' && out.reason === 'needs_human');
+    assert.equal(agent.inputs.length, 1, '判定之後不可以再送回去讓它重試——再退幾次也不會變好');
+    assert.equal(
+      collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length,
+      1,
+      '停下來就一定要有人被告知',
+    );
+    const why = tmp.ledger.getTask('T-1')?.block?.detail ?? '';
+    assert.match(why, /不是實作的錯/);
+    assert.match(why, /熱區至少 44×44/, '是哪幾條在打架要列出來，人才裁決得了');
+    assert.match(why, /相鄰熱區不得重疊/);
+  });
+
+  it('reviewer 判 fail（一般不合格）照樣回灌給 agent 續做，不會被誤停', async () => {
+    const task = makeTask();
+    seed(task);
+    const agent = fakeAgent([{}, {}]);
+    const { worker } = build({
+      agent,
+      reviewer: fakeReviewer([
+        { status: 'fail', violations: [{ requirement: '要有錯誤提示', problem: '沒有' }] },
+        { status: 'pass', notes: [] },
+      ]),
+    });
+
+    assert.deepEqual(await worker.runTask({ task, ...cfg }), { status: 'done' });
+    assert.equal(agent.inputs.length, 2, '一般的不合格是正常迴圈，coder 修得動');
+  });
+
   it('回饋只在真的有失敗關卡時才傳給 agent（空失敗清單不回灌）', async () => {
     const task = makeTask();
     seed(task);

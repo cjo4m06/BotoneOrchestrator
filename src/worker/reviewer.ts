@@ -49,6 +49,22 @@ export interface UiChecked {
 export type ReviewVerdict =
   | { status: 'pass'; notes: string[]; uiChecked?: UiChecked }
   | { status: 'fail'; violations: ReviewViolation[]; uiChecked?: UiChecked }
+  /**
+   * **這不是實作的錯，是規格的問題。**
+   *
+   * ── 為什麼需要第三種判決 ──
+   *
+   * 先前只有 pass / fail / skipped。撞到「規格自相矛盾」「這幾條 DoD 無法同時成立」
+   * 「要求改的東西 agent 碰不到」時，reviewer 只能判 fail——而 fail 的語意是
+   * 「coder，去修」。coder 修不動，於是下一輪再送一次、再被退一次。
+   *
+   * 實跑（zZb5MGTMdQRZ，2026-08-04）：reviewer 每一輪都正確地發現不符，
+   * 每一輪都只能說 fail，每一輪都把它送回一個解不了的地方。四輪、$36.64，
+   * 最後那個 PR 帶著一條沒滿足的 DoD 被人按核准合併。
+   *
+   * 這條判決**不回灌給 coder**，直接開交接單給人——因為要動的是規格，不是程式碼。
+   */
+  | { status: 'spec_problem'; problem: string; conflicting: string[]; uiChecked?: UiChecked }
   | { status: 'skipped'; reason: string };
 
 export interface ReviewOutcome {
@@ -310,13 +326,22 @@ export function buildReviewPrompt(
   p.push(
     `\n## 輸出格式（只輸出一個 JSON 程式碼區塊，不要其他文字）\n` +
       '```json\n' +
-      `{"status":"pass"|"fail","notes":["..."],` +
+      `{"status":"pass"|"fail"|"spec_problem","notes":["..."],` +
       `"uiChecked":{"looked":true|false,"detail":"看了 /profile 與 /settings（375 與 1440）"｜"沒看：這次只改 API 序列化"},` +
       `"violations":[{"docRef":"檔名#段落","requirement":"規格要求","problem":"實作哪裡不符","suggestion":"建議修法"}]}\n` +
       'uiChecked 在 status=pass 時**必填**，空白會被退回（先前「沒驗畫面」在報告上一個字都沒有，' +
       '於是它與「驗過而且沒問題」長得一模一樣）。\n' +
       '```\n' +
-      `status=pass 時 violations 必須為空陣列。`,
+      `status=pass 時 violations 必須為空陣列。\n\n` +
+      '**status=spec_problem**：規格本身有問題，不是實作的錯。用在：\n' +
+      '· 幾條要求**無法同時成立**（例如「熱區至少 44×44」＋「不改變視覺外觀」＋「相鄰不重疊」，' +
+      '而兩顆鍵中心距只有 28px——三條在幾何上湊不出來）\n' +
+      '· 規格自相矛盾，或已被後續設計覆寫，與這張卡的 DoD 直接打架\n' +
+      '· 要求改的東西**不在 coder 碰得到的範圍**（例如要它更新 repo 外的 spec 檔案）\n\n' +
+      '這條路**不會回灌給 coder**，會直接交給人裁決——所以要填：\n' +
+      '`"problem":"一句話說清楚衝突在哪"`、`"conflicting":["要求A","要求B",...]`（至少兩條，指名道姓）。\n' +
+      '**指不出是哪幾條就不要用它**，改用 fail。\n' +
+      '判斷基準是「再退回幾次也不會變好嗎」——如果 coder 有辦法自己解決，那就是 fail 不是 spec_problem。',
   );
   return p.join('\n');
 }
@@ -342,6 +367,25 @@ export function parseReviewResponse(text: string): ReviewVerdict | null {
   const notes = Array.isArray(parsed.notes) ? parsed.notes.filter((n): n is string => typeof n === 'string') : [];
   const uiChecked = toUiChecked(parsed.uiChecked);
 
+  if (status === 'spec_problem') {
+    // **說「規格有問題」就一定要指得出是哪幾條。** 指不出來的話人無從裁決，
+    // 而這條路是不回灌給 coder 的——講不清楚就等於把任務停在一句空話上。
+    // 退回成 fail 讓 coder 再跑一輪，總比停下來卻沒人知道要決定什麼好。
+    const conflicting = Array.isArray(parsed.conflicting)
+      ? parsed.conflicting.filter((c): c is string => typeof c === 'string' && c.trim() !== '')
+      : [];
+    const problem = typeof parsed.problem === 'string' ? parsed.problem.trim() : '';
+    if (problem !== '' && conflicting.length > 0) {
+      return { status: 'spec_problem', problem, conflicting, ...(uiChecked ? { uiChecked } : {}) };
+    }
+    return {
+      status: 'fail',
+      violations: violations.length > 0
+        ? violations
+        : [{ requirement: '符合規格', problem: 'reviewer 說規格有問題，但沒指出是哪幾條互相衝突' }],
+      ...(uiChecked ? { uiChecked } : {}),
+    };
+  }
   if (status === 'fail') {
     // 說 fail 卻沒給理由 → 補一條泛用理由，否則回灌時 coder 不知道要改什麼
     return {
@@ -401,6 +445,20 @@ export function reviewGateReport(verdict: ReviewVerdict): GateReport {
     return { green: false, checks };
   }
 
+  if (verdict.status === 'spec_problem') {
+    // 這份報告不會被回灌給 coder（Worker 走交人那條路），但**絕不可以是綠的**——
+    // 它會被寫進 PR 內文與事件表，印成綠燈就是在說謊。
+    return {
+      green: false,
+      checks: [{
+        name: 'reviewer',
+        ok: false,
+        detail: `規格本身有問題，不是實作的錯：${verdict.problem}\n互相衝突的要求：\n`
+          + verdict.conflicting.map((c, i) => `${i + 1}. ${c}`).join('\n'),
+      }],
+    };
+  }
+
   const detail = verdict.status === 'pass' ? verdict.notes.join('；') || 'ok' : `略過：${verdict.reason}`;
   const checks: CheckResult[] = [{ name: 'reviewer', ok: true, detail }];
   return { green: true, checks };
@@ -409,7 +467,9 @@ export function reviewGateReport(verdict: ReviewVerdict): GateReport {
 /** 包裝成 Worker 期望的形狀（ok + asGateReport）。 */
 export function toReviewOutcome(verdict: ReviewVerdict): ReviewOutcome {
   return {
-    ok: verdict.status !== 'fail',
+    // spec_problem 一樣不放行（規格沒解決就不該 complete_task），
+    // 但它走的是**交人**那條路，不是回灌給 coder——見 Worker.review。
+    ok: verdict.status !== 'fail' && verdict.status !== 'spec_problem',
     verdict,
     asGateReport: () => reviewGateReport(verdict),
   };

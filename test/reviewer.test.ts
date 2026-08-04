@@ -126,6 +126,51 @@ describe('reviewGateReport / toReviewOutcome', () => {
     assert.equal(reviewGateReport({ status: 'skipped', reason: '無金鑰' }).green, true);
   });
 
+  /**
+   * **第三種判決：這不是實作的錯，是規格的問題。**
+   *
+   * 先前只有 pass / fail / skipped。撞到「這幾條 DoD 無法同時成立」時 reviewer 只能判 fail，
+   * 而 fail 的語意是「coder 去修」——coder 修不動，於是下一輪再送一次、再被退一次。
+   * 實跑（zZb5MGTMdQRZ）四輪 $36.64，最後帶著一條沒滿足的 DoD 被人按核准合併。
+   */
+  describe('spec_problem：規格本身有問題', () => {
+    it('解析得出來，並保留「是哪幾條在打架」', () => {
+      const v = parseReviewResponse(JSON.stringify({
+        status: 'spec_problem',
+        problem: '三條要求在幾何上無法同時成立（兩鍵中心距 28px）',
+        conflicting: ['熱區至少 44×44', '不得改變視覺外觀', '相鄰熱區不得重疊'],
+        uiChecked: { looked: true, detail: '看了 /chat（375）' },
+      }));
+
+      assert.equal(v?.status, 'spec_problem');
+      assert.ok(v?.status === 'spec_problem' && v.conflicting.length === 3, '人要看得出是哪幾條在打架才裁決得了');
+    });
+
+    it('**指不出是哪幾條 → 退回成 fail**（不可以把任務停在一句空話上）', () => {
+      const v = parseReviewResponse(JSON.stringify({ status: 'spec_problem', problem: '規格怪怪的' }));
+
+      assert.equal(
+        v?.status,
+        'fail',
+        '這條路不回灌給 coder——講不清楚就等於停下來卻沒人知道要決定什麼；讓它再跑一輪比較好',
+      );
+    });
+
+    it('不算放行（規格沒解決就不該 complete_task）', () => {
+      const out = toReviewOutcome({ status: 'spec_problem', problem: 'x', conflicting: ['a', 'b'] });
+      assert.equal(out.ok, false);
+    });
+
+    it('**報告不可以印成綠燈**——它會進 PR 內文與事件表', () => {
+      const g = reviewGateReport({ status: 'spec_problem', problem: '三條互斥', conflicting: ['A', 'B', 'C'] });
+
+      assert.equal(g.green, false);
+      assert.match(g.checks[0]?.detail ?? '', /不是實作的錯/);
+      assert.match(g.checks[0]?.detail ?? '', /三條互斥/);
+      assert.match(g.checks[0]?.detail ?? '', /1\. A/, '衝突清單要逐條列出來');
+    });
+  });
+
   it('違規內容原樣進 detail：規格要求、哪裡不符、建議都在', () => {
     const g = reviewGateReport({
       status: 'fail',

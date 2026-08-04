@@ -416,6 +416,12 @@ export class Worker {
         // baseRef 一定要傳，而且**不要 `?? 'HEAD'`**——讓 undefined 一路傳到 reviewer，
         // 由它決定「沒有基準就不審」。退回 HEAD 正是這個 bug 的源頭。
         const review = await this.review(detail, docs, cwd, threadTs, reviewRejections, gateConfig.diff?.baseRef, input.groupId);
+        // **規格問題直接停手交人**，不進回灌迴圈。
+        //
+        // 實跑（zZb5MGTMdQRZ）：reviewer 每一輪都正確地發現不符，每一輪都只能說 fail，
+        // 每一輪都把它送回一個 coder 解不了的地方——四輪、$36.64，最後那個 PR
+        // 帶著一條沒滿足的 DoD 被人按核准合併。
+        if ('specProblem' in review) return this.parkSpecProblem(detail, review.specProblem, threadTs);
         if (review.rejected) {
           reviewRejections += 1;
           effective = review.report;
@@ -503,6 +509,33 @@ export class Worker {
    * 外加一條沒滿足的 DoD 被人按核准合併、而「這是刻意的特例」沒有留在任何地方。
    * 所以偏向多停。
    */
+  /**
+   * reviewer 判定「規格本身有問題」→ park 交人裁決。
+   *
+   * 與 parkStuck 的差別：那個是**數出來的**（同一個障礙第二次），這個是
+   * **審查者讀完規格與 diff 之後說的**。兩條路都通向同一個地方——人——
+   * 但這條通常更早、而且帶著「是哪幾條在打架」的具體清單。
+   */
+  private parkSpecProblem(
+    detail: TaskDetail,
+    sp: { problem: string; conflicting: string[] },
+    threadTs: string | undefined,
+  ): TaskOutcome {
+    const { ledger, log } = this.deps;
+    const why =
+      `審查者判定**這不是實作的錯，是規格的問題**，需要你裁決。\n\n` +
+      `${sp.problem}\n\n` +
+      `互相衝突的要求：\n${sp.conflicting.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n\n` +
+      '請決定哪一條讓步（或補一條特例），然後按重試——它會接著原本的 session 續做。\n' +
+      '**這條路沒有回灌給 agent**：再退回幾次也不會變好，成因不在它手上。';
+
+    ledger.setBlock(detail.id, 'needs_human', truncate(why, 1200));
+    ledger.logEvent('task', detail.id, 'spec_problem_parked', `${sp.problem}\n${sp.conflicting.join(' / ')}`);
+    this.say(threadTs, { type: 'problem', detail: why }, detail);
+    log.error({ taskId: detail.id, conflicting: sp.conflicting }, '⚠️ 規格問題，park 交人裁決（可恢復）');
+    return { status: 'blocked', reason: 'needs_human', detail: why };
+  }
+
   private parkStuck(detail: TaskDetail, stuck: RepeatedObstacle, threadTs: string | undefined): TaskOutcome {
     const { ledger, log } = this.deps;
     const why =
@@ -1050,7 +1083,12 @@ export class Worker {
     baseRef: string | undefined,
     /** 所屬群組——審查 session 要以群為單位共用。 */
     groupId: string | undefined,
-  ): Promise<{ rejected: false } | { rejected: true; report: GateReport }> {
+  ): Promise<
+    | { rejected: false }
+    | { rejected: true; report: GateReport }
+    /** 規格本身有問題 → **不回灌給 coder**，交人裁決（見 ReviewVerdict 的 spec_problem）。 */
+    | { specProblem: { problem: string; conflicting: string[] }; report: GateReport }
+  > {
     const { reviewer, notifier, log } = this.deps;
     if (!reviewer) return { rejected: false };
 
@@ -1090,6 +1128,14 @@ export class Worker {
         detail,
       );
       return { rejected: false };
+    }
+
+    // **規格問題不回灌。** 它的成因不在 coder 手上（幾條要求互斥、規格被覆寫、
+    // 要改的檔案它碰不到），退回去只會讓它再送一次、再被退一次——實跑那四輪就是這樣。
+    if (outcome.verdict.status === 'spec_problem') {
+      const v = outcome.verdict;
+      log.warn({ taskId: detail.id, conflicting: v.conflicting }, 'reviewer 判定「規格本身有問題」→ 交人裁決，不回灌');
+      return { specProblem: { problem: v.problem, conflicting: v.conflicting }, report };
     }
 
     // 理由要留得下來：先前只記了「rejections: 1」這個數字，退回原因**哪裡都沒有**——
