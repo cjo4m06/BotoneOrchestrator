@@ -49,6 +49,13 @@ export interface ConsoleDeps {
   /** daemon 是否在同一個行程裡（顯示用）。 */
   inProcess?: boolean;
   /**
+   * 主控迴圈的輪詢間隔（秒）。用來告訴人「按下去之後最多等多久才會真的動」。
+   *
+   * 沒有它的話按鈕只會回一句「已送出」，而實際動手要等下一輪——
+   * 人看到的就是「點了沒反應」，然後再按一次（實跑撞到兩輪）。
+   */
+  pollIntervalSec?: () => number;
+  /**
    * 停用專案時清掉它的本地狀態（見 core/project-purge.ts）。
    *
    * **必填。** 少接的話「停用」就只是改個旗標，下次啟用會拿舊快照在跑；
@@ -435,9 +442,22 @@ export class ConsoleServer {
         await router.handleControl({ type: 'confirm_no_change', taskId: id, userId: 'console' });
         return { ok: true };
       case 'approve':
-      case 'deny':
+      case 'deny': {
         router.handleMergeDecision({ groupId: id, approved: action === 'approve', userId: 'console' });
-        return { ok: true };
+        // **講出「什麼時候會真的動」。**
+        //
+        // 裁決是當下寫進 ledger 的，但實際合併要等下一輪 tick（預設 180 秒）。
+        // 先前只回 { ok: true }，畫面跳一句「已送出」就沒了——從人的角度
+        // 與「點了沒反應」完全一樣，於是同一顆按鈕被連按兩次（實跑撞到兩輪）。
+        const sec = this.deps.pollIntervalSec?.() ?? 0;
+        const when = sec > 0 ? `，最多 ${sec} 秒後開始` : '';
+        return {
+          ok: true,
+          detail: action === 'approve'
+            ? `已核准${when}（合併要跑建置與測試，需要幾分鐘）`
+            : `已退回${when}，agent 會帶著意見重做`,
+        };
+      }
       default:
         return { ok: false, error: `未知的動作：${action}` };
     }

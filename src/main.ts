@@ -1822,6 +1822,8 @@ export async function main(): Promise<void> {
   const consoleServer = new ConsoleServer({
     store, ledger, log, router, inProcess: true,
     port: boot.consolePort,
+    // 讓按鈕講得出「最多等多久才會真的動」（設定改了也會跟著變，不必重啟）
+    pollIntervalSec: () => store.settings().pollIntervalSec ?? 0,
     // 停用專案＝清乾淨。留著的話下次啟用是拿舊快照在跑，而且停用期間每一輪 tick
     // 都會在規劃那一步擲錯，連帶讓整個 tick 的後半段全部跳過。
     purgeProject: projectPurgerOf({ store, ledger, worktreeBase: worktreeBaseOf(boot.dataRoot), log }),

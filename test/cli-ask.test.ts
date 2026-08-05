@@ -126,6 +126,53 @@ describe('CLI ask — 本機互動入口', () => {
   });
 
   /**
+   * **人回答了，那張單就要當場消失。**
+   *
+   * 實跑（2026-08-05）：核准會把群組推進 merge_guard，而消化規則是
+   * 「離開 in_review／merge_guard 才消化」——正好不涵蓋這一步。
+   * 於是按完之後「待核准合併」還掛著、按鈕也還在，人很自然會再按一次。
+   * 同一群被連按兩次 ×2 輪（13:42:16/20、14:37:17/30）。
+   */
+  it('核准之後那張核准單當場消失（否則人會重複按同一顆按鈕）', () => {
+    seedTask('T-AP', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-AP'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'in_review');
+    openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+      groupId: g.id, title: '等你核准合併', why: 'x', taskIds: ['T-AP'],
+    });
+    assert.equal(collectPending(tmp.ledger).filter((i) => i.id === g.id).length, 1, '前置：在等核准');
+
+    new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() })
+      .handleMergeDecision({ groupId: g.id, approved: true, userId: 'console' });
+
+    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'merge_guard');
+    assert.equal(
+      collectPending(tmp.ledger).filter((i) => i.id === g.id).length,
+      0,
+      '核准會把群組推進 merge_guard——而消化規則不涵蓋這一步，所以要在裁決時直接消化',
+    );
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ groupId: g.id, kind: 'merge_approval', unconsumedOnly: true }),
+      [],
+      '直接驗資料：那筆單要真的被標成已處理，不只是畫面上看不到',
+    );
+  });
+
+  it('退回也一樣當場消失（人已經回答過了）', () => {
+    seedTask('T-DN', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-DN'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'in_review');
+    openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+      groupId: g.id, title: '等你核准合併', why: 'x', taskIds: ['T-DN'],
+    });
+
+    new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() })
+      .handleMergeDecision({ groupId: g.id, approved: false, reason: '先不要', userId: 'console' });
+
+    assert.equal(collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length, 0);
+  });
+
+  /**
    * **畫面上給的按鈕，按下去就要能動。**
    *
    * 實跑（2026-08-05，g_da31b3e8c2ac）：清單對 changes_requested 的群組開「停手」單、

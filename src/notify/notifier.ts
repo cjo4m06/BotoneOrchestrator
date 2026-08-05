@@ -493,6 +493,17 @@ export class InboundRouter {
       ledger.updateGroupState(d.groupId, next);
       ledger.logEvent('group', d.groupId, d.approved ? 'merge_approved' : 'merge_rejected', d.userId ?? '');
 
+      // **人回答了，那張單當場結案**——不是等狀態變化。
+      //
+      // 核准會把群組推進 merge_guard，而 updateGroupState 的規則是「離開
+      // in_review／merge_guard 才消化」——正好不涵蓋這一步。於是按完之後
+      // 「待核准合併」還掛在清單上，按鈕也還在，人很自然會再按一次。
+      //
+      // 實跑（2026-08-05）：同一群被連按兩次 ×2 輪（13:42:16/20、14:37:17/30）。
+      // 而真正動手要等下一輪 tick（預設 180 秒），期間畫面完全沒有變化——
+      // 從人的角度就是「點了沒反應」。
+      ledger.consumeHandoffsFor?.({ groupId: d.groupId, toRole: 'human', kind: 'merge_approval' });
+
       // 退回**必須帶意見**，否則 agent 只知道「被退回」卻不知道哪裡錯——
       // 下一輪多半原封不動再送一次，人再退一次，形成純燒錢的迴圈。
       // 意見寫進與 ReviewWatcher 共用的 ReviewFeedbackStore，GroupRunner 會把它交給 agent。
