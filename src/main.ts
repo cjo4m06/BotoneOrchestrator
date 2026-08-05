@@ -1962,15 +1962,19 @@ export async function main(): Promise<void> {
 
   // 常駐 + 優雅停止
   //
-  // ⚠️ 已知限制（下一輪處理）：這個 signal 只會讓 orchestrator.run 的 sleep 提早醒來，
-  //    **沒有傳進 GroupRunner / Worker / AgentRuntime**，所以 SIGTERM 之後進行中的 agent
-  //    不會被中止，只會被「等 shutdownGraceSec 秒」然後留下 unclean 標記。
-  //    要真的能中止，需要這些檔案一起改（不在本檔範圍）：
-  //      - core/dispatcher.ts：把 signal 傳給每個 job
-  //      - core/group-runner.ts：run(signal) → 傳給 worker 迴圈，回合之間檢查 aborted
-  //      - worker/worker.ts、worker/agent-runtime.ts：把 signal 交給 execa（kill 子行程）
-  //      - worker/verifier.ts：DoD 指令也要能被中止
-  //    在那之前，「收尾逾時保留鎖 + 標記 unclean」是唯一能避免下一個實例誤刪的防線。
+  // 這個 signal **一路串到底**（那幾條接線已經完成，清單留著是為了讓人知道要檢查哪裡）：
+  //   dispatcher.dispatch(ready, signal) → 每個 job
+  //   group-runner.runGroup(..., signal) → worker 迴圈
+  //   worker → agent.iterate({ signal })  → SDK query 的 AbortController
+  //   worker → verifier.check({ signal }) → execa 的 cancelSignal（+ forceKillAfterDelay 5s）
+  //
+  // 所以 SIGTERM 之後：進行中的 agent 會被中止、關卡的子行程會被殺掉，
+  // 已 commit 的成果留在群分支上、未提交的留在 worktree 裡（park 不刪現場）。
+  // 重啟後對帳把 in_progress 推回 queued 重跑，而**已完成的任務不會重跑、
+  // 已認領的卡不會重新認領**。代價只有「中止那一輪的 token」。
+  //
+  // 「收尾逾時保留鎖 + 標記 unclean」仍然留著：中止不保證秒退（SDK 可能正在等 API），
+  // 逾時就寧可留下鎖讓下一個實例知道上一位走得不乾淨，也不要讓它誤刪還在用的現場。
   const abort = new AbortController();
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.on(sig, () => {
