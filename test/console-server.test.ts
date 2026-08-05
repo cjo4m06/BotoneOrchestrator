@@ -360,3 +360,75 @@ describe('控制台 — 跨站請求', () => {
     assert.equal(res.status, 200, '不能把正常使用擋掉');
   });
 });
+
+/**
+ * 群組列表要回答的兩個問題：**這一群有什麼**、**它在等誰**。
+ *
+ * 先前只有 id／專案／狀態／PR，於是 `ready` 看起來像「準備好要跑」，
+ * 實際多半是「排隊等前面的群進 base」——使用者因此以為開了 3 個 worker 卻只跑 1 個
+ * 是 worker 壞掉（實跑 2026-08-05）。
+ *
+ * 三個欄位全部來自既有資料，**一個預測都沒有**。
+ */
+describe('群組列表：有幾個任務、在等誰、已經等多久', () => {
+  let h: Harness;
+  beforeEach(async () => { h = await start(); });
+  afterEach(async () => { await h.close(); });
+
+  function seed(id: string, title: string): void {
+    h.ledger.upsertDiscoveredTask(makeDiscoveredTask({ id, title, repo: 'o/r' }));
+  }
+  async function groupRow(id: string) {
+    const { body } = await get(h, '/api/state');
+    const groups = (body as { groups: Record<string, unknown>[] }).groups;
+    return groups.find((x) => x.id === id) as Record<string, unknown> & { waitingFor: unknown[]; tasks: { title: string }[] };
+  }
+
+  it('帶出任務數與任務清單（不然人不知道群裡面有什麼）', async () => {
+    seed('T-1', '版本公告管理頁');
+    const g = h.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+
+    const row = await groupRow(g.id);
+
+    assert.equal(row.taskCount, 1);
+    assert.equal(row.tasks[0]?.title, '版本公告管理頁', '要看得到群裡面是什麼，不只是一個數字');
+  });
+
+  it('**在等誰**：帶出 afterGroups 與那幾群現在的狀態', async () => {
+    seed('A', 'A'); seed('B', 'B');
+    const a = h.ledger.createGroup({ repo: 'o/r', branch: 'a', taskIds: ['A'], footprint: [] });
+    const b = h.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['B'], footprint: [] });
+    h.ledger.updateGroupState(a.id, 'merge_guard');
+    h.ledger.upsertGroup({ ...h.ledger.getGroup(b.id)!, afterGroups: [a.id] });
+
+    assert.deepEqual(
+      (await groupRow(b.id)).waitingFor,
+      [{ id: a.id, state: 'merge_guard' }],
+      '只說 ready 的話，人看不出它其實在排隊，會以為 worker 壞了',
+    );
+  });
+
+  it('已終態的前置不再列出來（它們不擋人了）', async () => {
+    seed('A', 'A'); seed('B', 'B');
+    const a = h.ledger.createGroup({ repo: 'o/r', branch: 'a', taskIds: ['A'], footprint: [] });
+    const b = h.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['B'], footprint: [] });
+    h.ledger.updateGroupState(a.id, 'merged');
+    h.ledger.upsertGroup({ ...h.ledger.getGroup(b.id)!, afterGroups: [a.id] });
+
+    assert.deepEqual((await groupRow(b.id)).waitingFor, [], '已經合併的前置還列著，只會讓人以為它還在擋');
+  });
+
+  it('**只給「已經等多久」，不給「還要多久」**', async () => {
+    seed('T', 'T');
+    const g = h.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T'], footprint: [] });
+
+    const row = await groupRow(g.id);
+
+    assert.ok(typeof row.sinceMs === 'number' && row.sinceMs >= 0, 'sinceMs 是事實：距離上次狀態變動多久');
+    assert.equal(
+      row.etaMs,
+      undefined,
+      '「還要多久」要看 agent 寫多久、build 跑多久、人什麼時候按核准——一個都預測不了，不可以編',
+    );
+  });
+});

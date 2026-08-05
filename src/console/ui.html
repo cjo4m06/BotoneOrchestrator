@@ -668,11 +668,26 @@ async function loadState() {
         <div class="meta"><code>${esc(r.id)}</code> ${esc(shortRepo(r.repo))}</div></div></div>`).join('') + waits;
 
   const gs = s.groups.filter((x) => x.state !== 'merged');
+  // 「在等誰」「已經等多久」都是**事實**（after_groups ＋ updated_at）。
+  // 刻意不顯示「還要多久」——那要看 agent 寫多久、build 跑多久、人什麼時候按核准，
+  // 一個都預測不了，編一個數字出來只會讓人依賴一個假的東西。
+  const waitNote = (x) => {
+    if (!x.waitingFor?.length) return '';
+    const who = x.waitingFor.map((w) => `<code>${esc(w.id)}</code>（${esc(w.state)}）`).join('、');
+    return `<div class="meta">排隊中 · 等 ${who} 進 base</div>`;
+  };
+  const taskList = (x) => (x.tasks ?? [])
+    .map((t) => `<div class="meta">· ${esc(t.title)} <span class="tag">${esc(t.state)}</span></div>`).join('');
+
   $('groups').innerHTML = gs.length === 0
     ? '<tr><td class="empty">沒有進行中的群組</td></tr>'
-    : '<tr><th>群組</th><th>專案</th><th>狀態</th><th>PR</th></tr>'
-      + gs.map((x) => `<tr><td><code>${esc(x.id)}</code></td><td>${esc(shortRepo(x.repo))}</td>
+    : '<tr><th>群組</th><th>任務</th><th>專案</th><th>狀態</th><th>已停留</th><th>PR</th></tr>'
+      + gs.map((x) => `<tr>
+        <td><details><summary><code>${esc(x.id)}</code></summary>${taskList(x)}</details>${waitNote(x)}</td>
+        <td>${x.taskCount ?? '—'}</td>
+        <td>${esc(shortRepo(x.repo))}</td>
         <td><span class="tag info">${esc(x.state)}</span></td>
+        <td>${x.sinceMs === undefined ? '—' : esc(elapsed(x.sinceMs))}</td>
         <td>${x.prUrl ? `<a href="${esc(x.prUrl)}" target="_blank" rel="noreferrer">開啟</a>` : '—'}</td></tr>`).join('');
 }
 

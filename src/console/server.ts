@@ -338,8 +338,32 @@ export class ConsoleServer {
       groupCounts: counts(GROUP_STATES, (k) => st.groupsByState[k]),
       running: [...st.tasksByState.in_progress, ...st.tasksByState.verifying].map(brief),
       blocked: st.tasksByState.blocked.map(brief),
+      // 群組列表。**「有幾個任務」與「在等誰」是這張表唯一有用的兩欄**——
+      // 先前只有 id／專案／狀態／PR，於是 `ready` 看起來像「準備好要跑」，
+      // 實際多半是「排隊等前面的群進 base」，而人完全看不出它在等誰、等多久
+      //（實跑：使用者以為開了 3 個 worker 卻只跑 1 個，是 worker 壞了）。
+      //
+      // 三個欄位全部來自既有資料，**沒有任何預測**：
+      // · taskCount  ＝ task_ids 的長度
+      // · waitingFor ＝ after_groups ＋ 那幾群現在的狀態（已終態的不列，它們不再擋人）
+      // · sinceMs    ＝ 距離上次狀態變動多久。**這是「已經等了多久」不是「還要多久」**——
+      //   後者要看 agent 寫多久、build 跑多久、人什麼時候按核准，一個都預測不了。
       groups: GROUP_STATES.flatMap((s) =>
-        st.groupsByState[s].map((g) => ({ id: g.id, repo: g.repo, state: g.state, prUrl: g.prUrl ?? null })),
+        st.groupsByState[s].map((g) => ({
+          id: g.id,
+          repo: g.repo,
+          state: g.state,
+          prUrl: g.prUrl ?? null,
+          taskCount: g.taskIds.length,
+          tasks: g.taskIds.map((id) => {
+            const t = ledger.getTask(id);
+            return { id, state: t?.state ?? '?', title: t?.title ?? '(查不到)' };
+          }),
+          waitingFor: (g.afterGroups ?? [])
+            .map((id) => ({ id, state: ledger.getGroup(id)?.state }))
+            .filter((x) => x.state !== undefined && x.state !== 'merged' && x.state !== 'failed'),
+          sinceMs: now - g.updatedAt,
+        })),
       ),
       // 現在誰在做什麼。**這是唯一能回答「平台是不是掛了」的東西**——
       // 規劃、審查、視覺驗證、合併把關期間 ledger 完全靜止，
