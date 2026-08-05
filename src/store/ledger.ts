@@ -800,6 +800,23 @@ export class Ledger {
     // 已經有未處理的 stuck_group 單就不再開：orchestrator 的「重試用完」與 reconciler 的
     // 「沒有自動路徑」會先開一張有具體理由的，這裡只負責兜底那些沒人開的路徑。
     if (state === 'failed') this.openGroupStuckHandoff(id, extra.reason);
+
+    // **離開「等核准」的狀態就把那張核准單消化掉**（與 clearBlock 消化 block 單同一個道理）。
+    //
+    // 核准是對「這一群現在這個樣子」的裁決。群組被守衛擋下退回 changes_requested、
+    // 或已經合併、或整個失敗之後，那張單講的事情就不存在了——但它先前**沒有任何消費端**，
+    // 於是永遠掛在「等你處理」上。
+    //
+    // 實跑（2026-08-05，g_da31b3e8c2ac）：13:40 開單 → 13:42 人核准 → 13:45 守衛擋下退回
+    // changes_requested → 那張單還在。人重啟後看到「待核准合併」再按一次，換來
+    //   ⚠️ 這個群組正在等人回覆（park），不是等合併核准 — 已忽略此次核准
+    // 而真正該處理的那張 stuck_group 單就排在它旁邊，人分不出該點哪一個。
+    //
+    // 只有 in_review / merge_guard 這兩個狀態底下「等核准」才成立；其餘一律消化。
+    if (ok && state !== 'in_review' && state !== 'merge_guard') {
+      const n = this.consumeHandoffsFor({ groupId: id, kind: 'merge_approval', toRole: 'human' });
+      if (n > 0) this.log.info({ groupId: id, state, consumed: n }, '群組已離開等核准的狀態 → 核准單一併消化');
+    }
     return ok;
   }
 

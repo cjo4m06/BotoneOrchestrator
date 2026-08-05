@@ -62,7 +62,70 @@ describe('CLI ask — 本機互動入口', () => {
       assert.deepEqual(stuck[0]!.actions, ['retry', 'land-anyway']);
     });
 
-    // **這一條是這整套的核心保證**：呼叫端忘了給理由也絕不會讓群組消失。
+    /**
+   * **核准單只有在群組真的還在等核准時才算數。**
+   *
+   * 實跑（2026-08-05，g_da31b3e8c2ac）：13:40 開核准單 → 13:42 人核准 →
+   * 13:45 守衛擋下退回 changes_requested → **那張單還掛著**。
+   * 人重啟後看到「待核准合併」再按一次，換來
+   *   「這個群組正在等人回覆（park），不是等合併核准 — 已忽略此次核准」
+   * 而真正該處理的 stuck_group 單就排在它旁邊，兩張長得一樣，人分不出該點哪一個。
+   */
+  it('群組離開 in_review 之後 → 核准單自動消化，不再出現在清單上', () => {
+    seedTask('T-M', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-M'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'in_review');
+    openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+      groupId: g.id, title: '等你核准合併', why: 'x', taskIds: ['T-M'],
+    });
+    assert.equal(collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length, 1, '前置：在等核准');
+
+    // 守衛擋下 → 退回 changes_requested
+    tmp.ledger.updateGroupState(g.id, 'changes_requested');
+
+    assert.equal(
+      collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length,
+      0,
+      '核准是對「這一群現在這個樣子」的裁決；被退回之後那張單講的事情就不存在了',
+    );
+    // **直接驗資料，不是驗畫面。** 讀取端也有一道過濾（給舊資料用），
+    // 只斷言 collectPending 的話，寫入端整個不做事也會過——那筆單會永遠留在庫裡
+    // 未結案，而 Slack App Home 之類直接讀 handoffs 的地方就還是看得到它。
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ groupId: g.id, kind: 'merge_approval', unconsumedOnly: true }),
+      [],
+      '離開等核准的狀態時，那張單要真的被標成已處理',
+    );
+  });
+
+  it('**舊資料也要消失**：單子早就掛在庫裡，群組狀態已經不對了', () => {
+    seedTask('T-N', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-N'], footprint: [] });
+    // 模擬升級前留下來的：單在、群組狀態已經是 changes_requested，而且不會再有狀態變化
+    tmp.ledger.updateGroupState(g.id, 'changes_requested');
+    openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+      groupId: g.id, title: '等你核准合併', why: 'x', taskIds: ['T-N'],
+    });
+
+    assert.equal(
+      collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length,
+      0,
+      '寫入端只對之後的狀態變化有效——已經卡在庫裡的舊單要靠讀取端才會消失',
+    );
+  });
+
+  it('還在 in_review → 核准單照常出現（別把正常的也濾掉）', () => {
+    seedTask('T-O', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-O'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'in_review');
+    openMergeApprovalHandoff(tmp.ledger, createSilentLogger(), {
+      groupId: g.id, title: '等你核准合併', why: 'x', taskIds: ['T-O'],
+    });
+
+    assert.equal(collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length, 1);
+  });
+
+  // **這一條是這整套的核心保證**：呼叫端忘了給理由也絕不會讓群組消失。
     // 文字漂不漂亮是次要的——先前它靠推論，而推論漏掉一種狀態就是 16 個任務靜靜堵著。
     it('連原因都沒給也要列（並講明去看 log）', () => {
       failedGroup('g-b', 'T-B');

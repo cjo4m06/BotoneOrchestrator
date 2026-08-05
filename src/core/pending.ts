@@ -99,6 +99,18 @@ export function collectPending(ledger: AskLedger): PendingItem[] {
   for (const h of ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true })) {
     const meta = h.taskId ? ledger.getTask?.(h.taskId) : undefined;
     const group = h.groupId ? ledger.getGroup?.(h.groupId) : undefined;
+
+    // **核准單只有在群組真的還在等核准時才算數。**
+    //
+    // 寫入端（Ledger.updateGroupState）現在會在群組離開 in_review／merge_guard 時消化它，
+    // 但那只對**之後**的狀態變化有效——已經卡在庫裡的舊單需要這一道讀取端才會消失。
+    //
+    // 實跑（2026-08-05，g_da31b3e8c2ac）：群組早就被守衛退回 changes_requested，
+    // 13:40 那張核准單還掛著。人按下去換來「這個群組正在等人回覆，不是等合併核准」，
+    // 而真正該處理的 stuck_group 單就排在它旁邊——兩張長得一樣，人分不出該點哪一個。
+    if (h.kind === 'merge_approval' && group && group.state !== 'in_review' && group.state !== 'merge_guard') {
+      continue;
+    }
     items.push({
       kind: h.kind as PendingKind,
       // 任務單掛任務、群組單掛群組——UI 的動作要打到對的東西上
