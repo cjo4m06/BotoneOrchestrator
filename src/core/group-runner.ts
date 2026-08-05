@@ -983,7 +983,7 @@ export class GroupRunner {
       // 不會靜默降級成「沒查」（那會被下游當成「查過沒事」）。
       guardOptions.experimentBudget = { runsLeft: 3, msLeft: 10 * 60_000 };
       if (this.deps.recordCheck) guardOptions.recordCheck = this.deps.recordCheck;
-      guardOptions.prepareTree = async (treePath: string) => {
+      guardOptions.prepareTree = async (treePath: string) => {  // 這裡只驗自己這一群，repoPath 已在閉包裡
         await prepareNodeModules(proj.repoPath, treePath, log, this.deps.nodeModulesEnv);
         await prepareLocalFiles(proj.repoPath, treePath, log, proj.localFiles);
       };

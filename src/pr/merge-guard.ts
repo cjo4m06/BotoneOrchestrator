@@ -47,7 +47,14 @@ export interface MergeGuardOptions {
    * 驗收樹建好之後的準備工作（node_modules、本機設定檔）。
    * **一定要接**：沒有依賴就跑關卡，紅的是環境不是程式碼，而 agent 會去修一個沒壞的東西。
    */
-  prepareTree?: (treePath: string) => Promise<void>;
+  /**
+   * 樹建好之後的準備工作（node_modules、本機設定檔）。**跑關卡前一定要有。**
+   *
+   * 第二個參數是**這一次驗的是哪個 repo 的路徑**——第二個呼叫點（核准後那次）
+   * 用的是整個 daemon 共用的一個守衛實例，建構時還不知道會驗到哪個專案。
+   * 沒有它，那個實例就只能不準備，於是驗收樹沒有 node_modules → build 直接紅。
+   */
+  prepareTree?: (treePath: string, repoPath: string) => Promise<void>;
   /** 取最新 base 的 remote 名稱。預設 'origin' */
   remote?: string;
   /** 是否在 attempt() 前 fetch 最新 base。預設 true；設 false 等於明示「接受基於本地狀態的驗證」 */
@@ -148,7 +155,7 @@ export class MergeGuard {
       // **一定要把注入的 git 傳下去。** 不傳的話守衛會用到兩條不同的 git 路徑：
       // 一條可被測試/呼叫端替換，一條寫死用 execa——那種不一致查起來特別花時間。
       git: (cwd, args) => this.git(cwd, args),
-      ...(this.opts.prepareTree ? { prepare: this.opts.prepareTree } : {}),
+      ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, repoPath) } : {}),
     });
     if (!built.ok) {
       if (built.reason === 'conflict') {
@@ -248,7 +255,7 @@ export class MergeGuard {
           budget,
           log: this.log,
           git: (cwd, args) => this.git(cwd, args),
-          ...(this.opts.prepareTree ? { prepare: this.opts.prepareTree } : {}),
+          ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, input.repoPath) } : {}),
           ...(input.repo ? { repo: input.repo } : {}),
           ...(this.opts.recordCheck ? { record: this.opts.recordCheck } : {}),
         }),

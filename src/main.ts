@@ -663,6 +663,8 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
   const git = input.git ?? defaultGitRun;
 
   const byRepo = new Map<string, MergeProject>();
+  /** 合併工作區路徑 → 專案 runtime（守衛的 prepareTree 要靠它拿 localFiles）。 */
+  const runtimeByWorkspace = new Map<string, ProjectRuntime>();
 
   /** 重建某個 repo 的合併工作區（含 node_modules 與本機設定檔）。 */
   const rebuildMergeWorkspace = async (repo: string, proj: MergeProject): Promise<void> => {
@@ -704,6 +706,8 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       log.warn({ path, err: e instanceof Error ? e.message : String(e) }, '合併工作區的本機設定檔準備失敗'),
     );
 
+    // 守衛拿到的是**合併工作區**的路徑，不是主 clone；反查要靠這張表。
+    runtimeByWorkspace.set(path, runtime);
     byRepo.set(runtime.repo, {
       // 合併路徑的工作目錄＝專用 worktree，不是 runtime.repoPath（使用者的主 clone）
       repoPath: path,
@@ -746,7 +750,33 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       }
       return proj;
     },
-    guard: input.guard ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log),
+    // **第二個 Merge Guard 呼叫點（核准之後的那次）。**
+    //
+    // 它先前是 `new MergeGuard(verifier, log)`——**一個選項都沒給**，而群組執行那一側
+    // 給了 prepareTree（把 node_modules 與本機設定檔帶進拋棄式驗收樹）。
+    //
+    // 第 10 片把守衛從「在 worktree 裡 rebase」改成「在 /tmp 的拋棄式樹上驗」之後，
+    // 樹不再自帶依賴——於是這個呼叫點的 `npm run build` 一定會紅：
+    //
+    //   Cannot find package 'tsx' imported from /tmp/orch-merge-XXXX/apps/web/
+    //
+    // 實跑（2026-08-05，g_da31b3e8c2ac）：群組執行那次 13:39 通過 → 人 13:42 核准 →
+    // 這裡 13:45 重跑，樹沒有 node_modules → 判 semantic_drift → 憑證作廢、
+    // 退回 changes_requested、42 則「build 紅了」的意見回灌給 agent，
+    // 而 agent 改不動一個不存在的依賴問題。**任何需要建置的專案都合併不了。**
+    //
+    // 兩個呼叫點的選項要一起給，是這個 repo 反覆踩到的同一種病：
+    // 能力做好了、第二個建構點漏掉，而症狀是一個看起來像程式碼問題的紅燈。
+    guard:
+      input.guard
+      ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log, {
+        prepareTree: async (treePath, repoPath) => {
+          await prepareNodeModules(repoPath, treePath, log);
+          // 這個實例是全 daemon 共用的，建構時不知道會驗到哪個專案 →
+          // 用 repoPath 反查回專案，才拿得到它自己的 localFiles 清單。
+          await prepareLocalFiles(repoPath, treePath, log, runtimeByWorkspace.get(repoPath)?.localFiles);
+        },
+      }),
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {

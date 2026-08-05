@@ -1,4 +1,5 @@
 import { test, describe, it, beforeEach, afterEach } from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1310,3 +1311,46 @@ describe('各角色的模型設定要真的接到 agent 上', () => {
   // 畫面改由審查者自己開瀏覽器判斷（它的模型接線在 reviewer 那幾條測試裡）。
 });
 
+/**
+ * **兩個 Merge Guard 呼叫點的選項要一起給。**
+ *
+ * 實跑（2026-08-05，g_da31b3e8c2ac）：群組執行那一側的守衛 13:39 通過 →
+ * 人 13:42 核准 → 核准後那次在 13:45 重跑，驗收樹**沒有 node_modules**：
+ *
+ *   Cannot find package 'tsx' imported from /tmp/orch-merge-nhveOH/apps/web/
+ *
+ * 於是判 semantic_drift、憑證作廢、退回 changes_requested，並把 42 則
+ * 「build 紅了」的意見回灌給 agent——而它改不動一個不存在的依賴問題。
+ * **任何需要建置的專案都合併不了。**
+ *
+ * 根因：第 10 片把守衛從「在 worktree 裡 rebase」改成「在 /tmp 的拋棄式樹上驗」，
+ * 樹不再自帶依賴。群組執行那一側加了 prepareTree，`main.ts` 這個共用實例沒加——
+ * `new MergeGuard(verifier, log)`，一個選項都沒給。
+ */
+describe('Merge Guard 的兩個呼叫點', () => {
+  it('核准後那次的守衛也要有 prepareTree（沒有的話驗收樹沒依賴，build 必紅）', () => {
+    const src = readFileSync('src/main.ts', 'utf8');
+    // 用 `?? new MergeGuard(` 當錨點：單純 indexOf('new MergeGuard(') 會先命中
+    // 上方註解裡引用的那一句，然後把真正的建構切在 slice 外面（這條測試自己踩過）。
+    const i = src.indexOf('?? new MergeGuard(');
+    assert.ok(i >= 0, 'main 裡找不到 MergeGuard 的建構');
+    assert.match(
+      src.slice(i, i + 500),
+      /prepareTree/,
+      '這是第二個呼叫點（核准之後那次）。少了它，驗收樹沒有 node_modules，'
+      + '任何要 build 的專案都會被判 semantic_drift 而永遠合併不了',
+    );
+  });
+
+  it('群組執行那一側也有（兩邊都要，漏一邊就是一半的專案會壞）', () => {
+    assert.match(readFileSync('src/core/group-runner.ts', 'utf8'), /guardOptions\.prepareTree\s*=/);
+  });
+
+  it('prepareTree 收得到 repoPath——共用實例建構時不知道會驗到哪個專案', () => {
+    assert.match(
+      readFileSync('src/pr/merge-guard.ts', 'utf8'),
+      /prepareTree\?:\s*\(treePath: string, repoPath: string\)/,
+      '只收 treePath 的話，全 daemon 共用的那個守衛實例就不知道要從哪裡帶 node_modules',
+    );
+  });
+});
