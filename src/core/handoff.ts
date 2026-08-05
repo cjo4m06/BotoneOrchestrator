@@ -44,6 +44,32 @@ export function handoffKindOfBlock(reason: BlockReason | undefined, detail: stri
   return 'needs_human';
 }
 
+/**
+ * 「這一群停在這裡、需要人動手」的狀態。
+ *
+ * ── 為什麼要共用一份 ──
+ *
+ * 這份清單決定**兩件必須一致的事**：
+ *   1. `collectPending` 對哪些狀態開「停手」單、給「重試」按鈕
+ *   2. `InboundRouter.reviveGroup` 願意復活哪些狀態
+ *
+ * 先前是兩份：清單那邊列了三個狀態，復活那邊只認 `failed`。於是
+ * `changes_requested` 與 `merge_guard` 的群組**畫面上有重試按鈕、按下去必定失敗**——
+ * 回一句「無法復活這個群組（可能已被清掉或狀態已改變）」，而群組好端端地在那裡。
+ *
+ * 實跑（2026-08-05，g_da31b3e8c2ac）：使用者照著按，連按數次都是這句話。
+ *
+ * 這是這個 repo 反覆踩到的形狀：**能力在一邊、判斷在另一邊，兩邊各寫一次**。
+ * 共用之後，加狀態只改這裡，按鈕與處理端一起跟上。
+ */
+export const STUCK_GROUP_STATES = ['changes_requested', 'failed', 'merge_guard'] as const;
+export type StuckGroupState = (typeof STUCK_GROUP_STATES)[number];
+
+/** 這個群組是不是停在「等人動手」的狀態（＝重試按得動）。 */
+export function isStuckGroupState(state: string | undefined): state is StuckGroupState {
+  return (STUCK_GROUP_STATES as readonly string[]).includes(state ?? '');
+}
+
 /** 各 kind 對應的動作組（UI 靠 kind 路由，這裡是唯一的定義）。 */
 export const HANDOFF_ACTIONS: Record<HandoffKind, string[]> = {
   clarification: ['<你的答案>', '--default', 'abort'],

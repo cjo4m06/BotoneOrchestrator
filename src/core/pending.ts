@@ -2,7 +2,7 @@ import { NO_CHANGE_BLOCK_PREFIX, RECLAIM_BLOCK_PREFIX } from '../notify/notifier
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Group, Task } from '../types.js';
 import type { HandoffRow } from '../store/ledger.js';
-import { HANDOFF_ACTIONS } from './handoff.js';
+import { STUCK_GROUP_STATES, HANDOFF_ACTIONS } from './handoff.js';
 
 /**
  * 「有哪些事在等人」的唯一定義。
@@ -181,7 +181,8 @@ function noChangeExtras(ledger: AskLedger, taskId: string | undefined): Partial<
 }
 
 /** 自檢要看的狀態：跑到一半停住、而且系統不會自己再動它的那些。 */
-const SELF_CHECK_STATES: Group['state'][] = ['changes_requested', 'failed', 'merge_guard'];
+/** 見 handoff.ts：這份清單與 reviveGroup 願意復活的狀態**必須是同一份**。 */
+const SELF_CHECK_STATES: readonly Group['state'][] = STUCK_GROUP_STATES;
 
 /** 這一群留下過「停手交人」的痕跡嗎（事件層，與交接單獨立）。 */
 function hasStopSignal(ledger: AskLedger, groupId: string): boolean {

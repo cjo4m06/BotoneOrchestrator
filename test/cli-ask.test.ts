@@ -11,7 +11,7 @@ import {
 } from '../src/cli/ask.js';
 import { InboundRouter } from '../src/notify/notifier.js';
 import { createTmpLedger, createSilentLogger, type TmpLedger } from './helpers/index.js';
-import { openStuckGroupHandoff, openMergeApprovalHandoff } from '../src/core/handoff.js';
+import { openStuckGroupHandoff, openMergeApprovalHandoff, STUCK_GROUP_STATES } from '../src/core/handoff.js';
 import type { McpOut } from '../src/types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -123,6 +123,56 @@ describe('CLI ask — 本機互動入口', () => {
     });
 
     assert.equal(collectPending(tmp.ledger).filter((i) => i.kind === 'merge_approval').length, 1);
+  });
+
+  /**
+   * **畫面上給的按鈕，按下去就要能動。**
+   *
+   * 實跑（2026-08-05，g_da31b3e8c2ac）：清單對 changes_requested 的群組開「停手」單、
+   * 給「重試」按鈕，而 `reviveGroup` 只認 `failed` ——使用者連按數次，每次都拿到
+   * 「無法復活這個群組（可能已被清掉或狀態已改變）」，而群組好端端地在那裡。
+   *
+   * 兩邊各寫一份狀態清單就是這樣壞的。現在共用 STUCK_GROUP_STATES。
+   */
+  for (const st of STUCK_GROUP_STATES) {
+    it(`${st} 的群組：清單給了重試按鈕，reviveGroup 就要真的復活得了`, async () => {
+      seedTask(`T-${st}`, '某任務');
+      const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: [`T-${st}`], footprint: [] });
+      tmp.ledger.updateGroupState(g.id, st);
+
+      // 正式那群是走**交接單**路徑（不是自檢），這裡照同一條路來
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), {
+        groupId: g.id, repo: 'o/r', why: `停在 ${st}`,
+      });
+
+      const item = collectPending(tmp.ledger).find((i) => i.id === g.id);
+      assert.ok(item, `${st} 應該要出現在待處理清單上`);
+      assert.ok(item.actions.includes('retry'), `${st} 的單有「重試」按鈕`);
+
+      const ok = await new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() })
+        .reviveGroup({ groupId: g.id, userId: 'test' });
+
+      assert.equal(ok, true, `按鈕給了卻復活不了——這正是使用者按到「無法復活這個群組」的那個 bug`);
+      assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready');
+      // 按過的東西要從清單上消失，否則人會一直看到它、一直再按一次
+      assert.equal(
+        collectPending(tmp.ledger).filter((i) => i.id === g.id).length,
+        0,
+        '復活了但單子還掛著 → 使用者會重複按同一顆按鈕',
+      );
+    });
+  }
+
+  it('已合併的群組不可以被「復活」（那是終態，復活會讓它再跑一次）', async () => {
+    seedTask('T-MG', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-MG'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'merged');
+
+    const ok = await new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() })
+      .reviveGroup({ groupId: g.id, userId: 'test' });
+
+    assert.equal(ok, false);
+    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'merged');
   });
 
   // **這一條是這整套的核心保證**：呼叫端忘了給理由也絕不會讓群組消失。

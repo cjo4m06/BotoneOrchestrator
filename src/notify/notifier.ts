@@ -15,6 +15,7 @@ import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Logger } from '../observability/logger.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from '../core/merge-credential.js';
 import { STANDING_DECISION } from '../worker/human-reply.js';
+import { isStuckGroupState } from '../core/handoff.js';
 import type { FeedbackSource } from '../pr/review-watcher.js';
 
 /** 事件轉為簡短中文摘要（Slack 與 console 共用文案）。 */
@@ -325,12 +326,18 @@ export class InboundRouter {
       log.warn({ groupId: input.groupId }, '要復活的群組不存在');
       return false;
     }
-    if (g.state !== 'failed') {
-      log.info({ groupId: input.groupId, state: g.state }, '群組不是 failed，不需要復活');
+    // **能開單的狀態就要復活得了。** 先前這裡只認 `failed`，而清單對
+    // changes_requested / merge_guard 也會給重試按鈕——按下去必定回
+    // 「無法復活這個群組」，而群組好端端地在那裡（實跑：使用者連按數次）。
+    if (!isStuckGroupState(g.state)) {
+      log.info({ groupId: input.groupId, state: g.state }, '群組不在停手狀態，不需要復活');
       return false;
     }
     ledger.updateGroupState(input.groupId, 'ready');
     ledger.logEvent('group', input.groupId, 'group_revived', `由 ${input.userId ?? 'unknown'} 手動復活`);
+    // **按過的東西要從清單上消失。** landAnyway 有做這件事，這裡先前沒有——
+    // 於是按了重試、群組確實回到待派工，但那張單還掛著，人會再按一次、再一次。
+    ledger.consumeHandoffsFor?.({ groupId: input.groupId, toRole: 'human', kind: 'stuck_group' });
     log.info({ groupId: input.groupId, userId: input.userId }, '♻️ 群組已復活，回到待派工');
     return true;
   }
