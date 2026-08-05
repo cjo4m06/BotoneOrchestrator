@@ -1016,18 +1016,36 @@ export function classifyAgentError(input: {
  *
  * 沒有失敗關卡就回 undefined：全綠卻掛「未通過」的標題會讓 agent 去猜哪裡錯、
  * 反而動到不該動的東西（審查者回灌的報告有可能每一條 check 都是 ok）。
+ *
+ * ── 這裡**不放機器輸出** ──
+ *
+ * 程式跑了指令、拿到非 0，它知道的就這兩件事。「哪裡壞了」要讀輸出才知道，
+ * 而讀輸出是 agent 的事：它有 Bash、在同一個工作區、剛剛才自己跑過。
+ * 先前這裡貼整份 stdout（每條最多 256KB，四條都紅近 1MB，**而且每一輪重貼**），
+ * 結果是規格與 diff 被擠出 context、真正的錯誤埋在進度條裡，
+ * 而截斷之後 agent 連「被砍掉什麼」都不知道卻以為看到了全部。
  */
 export function formatGateFeedback(feedback: GateReport | undefined): string | undefined {
   const failed = feedback?.checks.filter((c) => !c.ok) ?? [];
   if (failed.length === 0) return undefined;
-  const lines = ['\n## 上一輪驗證未通過，請修正後再完成'];
+
+  const lines = ['\n## 上一輪把關沒過'];
   for (const c of failed) {
-    // failingIds 現在只剩**種類碼**（timeout / redline / exec-error / no-changes…），
-    // 那是驗證器自己產生的封閉列舉，講的是「這一條是怎麼失敗的」。
-    // 從輸出撈失敗測試名的那一套已經下線——原始輸出整份在 detail 裡，讀得懂的是你。
-    const kind = c.failingIds?.length ? `（${c.failingIds.join(', ')}）` : '';
-    lines.push(`- [${c.name}]${kind} ${c.detail}`);
+    // 有指令 ＝ 我們跑了它、拿到非 0。**只講這兩件事**，輸出不貼。
+    if (c.command) {
+      lines.push(`- \`${c.name}\` 紅了：跑 \`${c.command}\` 回 exit code ${c.exitCode ?? '未知'}`);
+      continue;
+    }
+    // 沒有指令 ＝ 這不是「跑了某個指令而失敗」，而是程式自己知道的事實
+    //（拒絕執行、跑不起來、工作區沒有變更、專案沒設關卡）。那幾句是程式寫的短句，
+    // 不是機器輸出，照原樣給——不給的話 agent 根本不知道發生了什麼。
+    lines.push(`- \`${c.name}\`：${c.detail}`);
   }
+  lines.push(
+    '',
+    '**輸出沒有貼在這裡。** 自己跑上面那幾個指令看錯在哪——你在同一個工作區，',
+    '要重跑幾次、要只跑一個檔案、要換 reporter 都由你決定。',
+  );
   return lines.join('\n');
 }
 

@@ -475,18 +475,26 @@ export class Verifier {
     }
 
     const ok = res.exitCode === 0;
-    // **紅了就把整份輸出交出去，不挑行、不抽測試名。**
+    // **紅了不把輸出交出去。**
     //
-    // 先前這裡做兩件事：`lastLines(output, 30)` 只留最後 30 行，
-    // 以及用正則從輸出撈「失敗的測試叫什麼」。兩件都是程式在**猜語意**：
-    // · 最後 30 行對 vitest 是摘要、對 tsc 是最後幾個錯誤、對 gradle 是一堆進度條——
-    //   換一個工具鏈就會剛好切掉真正的失敗原因，而且切掉了沒有人會知道。
-    // · 抽測試名的正則只認得 TAP／node:test／jest 三種格式，其餘一律回空陣列。
+    // 程式跑了指令、拿到一個非 0 的結束碼——它知道的就只有這兩件事。
+    // 「哪裡壞了」要讀輸出才知道，而讀輸出是 agent 的事：它有 Bash、在同一個 cwd、
+    // 剛剛才自己跑過，想重跑、想只跑一個檔案、想加 --reporter 都可以。
     //
-    // 讀得懂輸出的是 agent，不是這裡。超長輸出用 splitOutput 保留頭尾並**明講省略了幾個字元**
-    //（全文在 check_runs 的 output_path），這與「悄悄只留 30 行」是不同的事。
+    // 先前這裡貼整份輸出（最多 256KB／條，四條都紅可以灌近 1MB 進 prompt，而且**每一輪重貼**）。
+    // 那不是幫忙：vitest 的進度條、gradle 的下載列、tsc 的全量錯誤會把規格與 diff 擠出 context，
+    // 真正的錯誤行埋在中間；一旦截斷，agent 連「被砍掉的是什麼」都不知道，
+    // 卻會以為自己看到了全部。
+    //
+    // 全文完整落在 check_runs（含 output_path）——那是給人事後查的，不是給 prompt 的傳輸管道。
     return {
-      result: { name, ok, detail: ok ? 'ok' : splitOutput(output).inline },
+      result: {
+        name,
+        ok,
+        detail: ok ? 'ok' : `跑了 \`${cmd}\`，exit code ${res.exitCode}`,
+        command: cmd,
+        exitCode: res.exitCode,
+      },
       exitCode: res.exitCode,
       output,
     };

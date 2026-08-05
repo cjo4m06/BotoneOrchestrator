@@ -61,8 +61,8 @@ test('完成要求永遠壓在最後（避免被前面的規格內容淹沒）',
   const idx = (s: string) => p.indexOf(s);
   assert.ok(idx('## 任務描述') < idx('## 規格文件'));
   assert.ok(idx('## 規格文件') < idx('## 澄清答覆'));
-  assert.ok(idx('## 澄清答覆') < idx('## 上一輪驗證未通過'));
-  assert.ok(idx('## 上一輪驗證未通過') < idx('## 完成要求'));
+  assert.ok(idx('## 澄清答覆') < idx('## 上一輪把關沒過'));
+  assert.ok(idx('## 上一輪把關沒過') < idx('## 完成要求'));
   // 指示區塊（完成要求 + 最終總結格式）必須壓在所有「輸入」之後，才不會被規格內容淹沒。
   // 總結格式本身是一份含多個標題的範本，所以不能用「之後沒有其他 ##」來斷言。
   assert.ok(idx('## 完成要求') < idx('## 最終總結的格式'));
@@ -105,14 +105,17 @@ test('回饋只列失敗關卡；通過的關卡不干擾 agent', () => {
       feedback: makeGateReport({
         green: false,
         checks: [
-          { name: 'typecheck', ok: true, detail: '通過' },
-          { name: 'test', ok: false, detail: '2 個測試失敗' },
+          { name: 'test', ok: false, detail: 'x', command: 'npm test', exitCode: 1 },
+          { name: 'lint', ok: true, detail: 'ok' },
         ],
       }),
     }),
   );
-  assert.match(p, /- \[test\] 2 個測試失敗/);
-  assert.equal(p.includes('typecheck'), false, '通過的關卡不應出現在修正清單');
+
+  // 只看回饋那一段——「完成要求」裡本來就會提到 lint/build/test
+  const section = p.slice(p.indexOf('## 上一輪把關沒過'), p.indexOf('## 完成要求'));
+  assert.match(section, /`test` 紅了/);
+  assert.doesNotMatch(section, /lint/, '通過的關卡不必占版面');
 });
 
 /**
@@ -121,34 +124,21 @@ test('回饋只列失敗關卡；通過的關卡不干擾 agent', () => {
  * 從輸出用正則撈「失敗的測試叫什麼」那一套已於第 14 片下線——它只認得三種格式，
  * 其餘工具鏈一律撈不到，而下游還是用肯定句對 agent 說「失敗項：…」。
  */
-test('回饋帶種類碼時把它標出來，讓 agent 分得出這是逾時還是測試紅', () => {
+test('紅燈只講指令與 exit code，輸出不進 prompt', () => {
   const p = buildAgentPrompt(
     input({
       feedback: makeGateReport({
         green: false,
-        checks: [{ name: 'test', ok: false, detail: '逾時：指令超過 600000ms 仍未結束', failingIds: ['timeout'] }],
+        checks: [{ name: 'test', ok: false, detail: 'x', command: 'npm test', exitCode: 1 }],
       }),
     }),
   );
-  assert.match(p, /- \[test\]（timeout） 逾時：指令超過 600000ms 仍未結束/);
+
+  assert.match(p, /`test` 紅了：跑 `npm test` 回 exit code 1/);
+  assert.match(p, /輸出沒有貼在這裡/, '要明講沒貼，否則 agent 以為那就是全部');
 });
 
-test('紅燈的完整輸出原樣進 prompt（不截斷、不挑行）', () => {
-  const output = ['FAIL src/a.test.ts', ...Array.from({ length: 200 }, (_, i) => `  第 ${i} 行細節`)].join('\n');
-  const p = buildAgentPrompt(
-    input({ feedback: makeGateReport({ green: false, checks: [{ name: 'test', ok: false, detail: output }] }) }),
-  );
 
-  assert.match(p, /FAIL src\/a\.test\.ts/, '第一行是失敗的檔名——只留最後 30 行的話它會被切掉');
-  assert.match(p, /第 199 行細節/);
-});
-
-test('failingIds 為空陣列時不輸出括號', () => {
-  const p = buildAgentPrompt(
-    input({ feedback: makeGateReport({ green: false, checks: [{ name: 'lint', ok: false, detail: '3 warnings', failingIds: [] }] }) }),
-  );
-  assert.match(p, /- \[lint\] 3 warnings$/m);
-});
 
 test('回饋內所有關卡都通過時，整段不輸出（空標題會讓 agent 亂猜哪裡錯）', () => {
   const p = buildAgentPrompt(input({ feedback: makeGateReport({ green: true, checks: [{ name: 'build', ok: true, detail: 'ok' }] }) }));

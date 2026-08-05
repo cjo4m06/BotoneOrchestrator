@@ -546,147 +546,29 @@ describe('Worker — 單任務監督迴圈', () => {
    * 而那要好幾輪之後才看得出來，看出來時已經燒掉一整群的預算。所以這兩件事要被測住：
    * (1) 上一輪的失敗真的送到 agent 手上；(2) 「它收到了什麼」查得到，不必去翻 log 猜。
    */
-  it('上一輪的失敗（含完整輸出）要出現在 agent 下一輪的輸入，而且原樣落成事件', async () => {
+  it('上一輪紅了 → 下一輪只收到「哪個指令、exit code」，而且那句話原樣落成事件', async () => {
     const task = makeTask();
     seed(task);
     const agent = fakeAgent([{}, {}]);
-    const longOutput = ['逾時：指令超過 600000ms 仍未結束', ...Array.from({ length: 120 }, (_, i) => `輸出第 ${i} 行`)].join('\n');
     const { worker } = build({
       agent,
       verifier: fakeVerifier([
-        { green: false, checks: [{ name: 'test', ok: false, detail: longOutput, failingIds: ['timeout'] }] },
+        { green: false, checks: [{ name: 'test', ok: false, detail: 'x', command: 'npm test', exitCode: 1 }] },
         green(),
       ]),
     });
 
     await worker.runTask({ task, ...cfg });
 
-    // (1) 送到 agent 面前
-    const second = agent.inputs[1];
-    assert.ok(second?.feedback, '第二輪的 agent 必須收得到上一輪的失敗，否則它只能盲改');
-    const sentDetail = second.feedback?.checks.find((c) => !c.ok)?.detail ?? '';
-    assert.match(sentDetail, /輸出第 119 行/, '完整輸出要在——只留最後幾行的話真正的失敗原因可能剛好被切掉');
+    // (1) 送到 agent 面前，而且**沒有輸出**
+    const sent = agent.inputs[1]?.feedback?.checks.find((c) => !c.ok);
+    assert.equal(sent?.command, 'npm test', 'agent 要能自己重跑，就得知道指令');
+    assert.equal(sent?.exitCode, 1);
 
-    // (2) 查得到
+    // (2) 「它收到了什麼」查得到
     const ev = tmp.ledger.latestEvent('task', 'T-1', 'feedback_to_agent');
-    assert.ok(ev, '「agent 這一輪收到了什麼」必須是查得到的事實');
-    assert.match(ev?.detail ?? '', /\[test\]（timeout）/, '記的要是 prompt 實際會輸出的那段，不是另外拼的摘要');
-    assert.match(ev?.detail ?? '', /輸出第 119 行/);
-  });
-
-  /**
-   * **同一個障礙第二次擋住它 → 停下來交人。**
-   *
-   * 實跑（zZb5MGTMdQRZ）：agent 在第 1 次退回之後 13 分鐘就講出了確切的阻礙
-   *（「spec 寫不進去」），卻又跑了三輪、多花 27 美元，最後那個 PR 帶著一條
-   * 沒滿足的 DoD 被人按核准合併——而「這是刻意的特例」沒有留在任何地方。
-   */
-  it('同一類 friction 回報第二次 → park 交人，不再燒下一輪', async () => {
-    const task = makeTask();
-    seed(task);
-    const agent = fakeAgent([{}, {}, {}]);
-    const { worker } = build({ agent, verifier: fakeVerifier([red(), red(), green()]) });
-
-    // 模擬 agent 前兩輪各回報一次同類障礙（實跑就是這個形狀）
-    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
-      JSON.stringify({ kind: 'system_limitation', what: 'spec/ 不在 repo，docs MCP 唯讀' }));
-    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
-      JSON.stringify({ kind: 'system_limitation', what: '審查要我改 spec，但我寫不進去' }));
-
-    const out = await worker.runTask({ task, ...cfg });
-
-    assert.equal(out.status, 'blocked');
-    assert.ok(out.status === 'blocked' && out.reason === 'needs_human', 'park 不是 failed——成果與 worktree 都要留著');
-    // **一定要是 needs_human**：`deps` 代表「自動等上游」，不會開交接單——
-    // 那會變成「任務停了、但沒有人被告知」，正是這整套要修掉的病。
-    assert.equal(
-      collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length,
-      1,
-      '停下來就一定要有人被告知，否則它會靜靜地卡在那裡',
-    );
-    assert.equal(agent.inputs.length, 0, '偵測在迴圈開頭，不該再燒任何一輪 agent');
-    const block = tmp.ledger.getTask('T-1')?.block;
-    assert.match(block?.detail ?? '', /spec\/ 不在 repo/, '兩次的原話都要帶給人');
-    assert.match(block?.detail ?? '', /我寫不進去/);
-  });
-
-  it('同一份規格被退回兩次 → park，並點出「這幾條可能無法同時成立」', async () => {
-    const task = makeTask();
-    seed(task);
-    const { worker } = build({ verifier: fakeVerifier([green()]) });
-
-    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 1 次退回：\n1. [spec/buttons.md#觸控目標] 熱區不足 44×44');
-    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 2 次退回：\n1. [spec/buttons.md#觸控目標] 相鄰熱區重疊');
-
-    const out = await worker.runTask({ task, ...cfg });
-
-    assert.ok(out.status === 'blocked' && out.reason === 'needs_human');
-    assert.equal(collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length, 1, '要出現在「等你處理」上');
-    assert.match(tmp.ledger.getTask('T-1')?.block?.detail ?? '', /無法同時成立/);
-  });
-
-  it('只回報一次、只退回一次 → 照常續做（不可以動不動就停整個群組）', async () => {
-    const task = makeTask();
-    seed(task);
-    const { worker } = build({ verifier: fakeVerifier([green()]) });
-
-    tmp.ledger.logEvent('task', 'T-1', 'friction_report',
-      JSON.stringify({ kind: 'system_limitation', what: 'PMM 沒授權（不擋交付）' }));
-    tmp.ledger.logEvent('task', 'T-1', 'review_rejected', '第 1 次退回：[spec/a.md#x] 不符');
-
-    assert.deepEqual(await worker.runTask({ task, ...cfg }), { status: 'done' });
-  });
-
-  /**
-   * **規格問題不回灌給 coder。**
-   *
-   * 實跑（zZb5MGTMdQRZ）：reviewer 每一輪都正確地發現不符，每一輪都只能說 fail，
-   * 每一輪都把它送回一個 coder 解不了的地方。四輪、$36.64，
-   * 最後那個 PR 帶著一條沒滿足的 DoD 被人按核准合併，而「這是刻意的特例」
-   * 沒有留在任何地方。
-   */
-  it('reviewer 判 spec_problem → 立刻交人，不再燒任何一輪 agent', async () => {
-    const task = makeTask();
-    seed(task);
-    const agent = fakeAgent([{}, {}, {}]);
-    const { worker } = build({
-      agent,
-      reviewer: fakeReviewer([{
-        status: 'spec_problem',
-        problem: '三條要求在幾何上無法同時成立（兩鍵中心距 28px）',
-        conflicting: ['熱區至少 44×44', '不得改變視覺外觀', '相鄰熱區不得重疊'],
-      }]),
-    });
-
-    const out = await worker.runTask({ task, ...cfg });
-
-    assert.ok(out.status === 'blocked' && out.reason === 'needs_human');
-    assert.equal(agent.inputs.length, 1, '判定之後不可以再送回去讓它重試——再退幾次也不會變好');
-    assert.equal(
-      collectPending(tmp.ledger).filter((i) => i.id === 'T-1').length,
-      1,
-      '停下來就一定要有人被告知',
-    );
-    const why = tmp.ledger.getTask('T-1')?.block?.detail ?? '';
-    assert.match(why, /不是實作的錯/);
-    assert.match(why, /熱區至少 44×44/, '是哪幾條在打架要列出來，人才裁決得了');
-    assert.match(why, /相鄰熱區不得重疊/);
-  });
-
-  it('reviewer 判 fail（一般不合格）照樣回灌給 agent 續做，不會被誤停', async () => {
-    const task = makeTask();
-    seed(task);
-    const agent = fakeAgent([{}, {}]);
-    const { worker } = build({
-      agent,
-      reviewer: fakeReviewer([
-        { status: 'fail', violations: [{ requirement: '要有錯誤提示', problem: '沒有' }] },
-        { status: 'pass', notes: [] },
-      ]),
-    });
-
-    assert.deepEqual(await worker.runTask({ task, ...cfg }), { status: 'done' });
-    assert.equal(agent.inputs.length, 2, '一般的不合格是正常迴圈，coder 修得動');
+    assert.match(ev?.detail ?? '', /`test` 紅了：跑 `npm test` 回 exit code 1/);
+    assert.match(ev?.detail ?? '', /輸出沒有貼在這裡/);
   });
 
   it('回饋只在真的有失敗關卡時才傳給 agent（空失敗清單不回灌）', async () => {

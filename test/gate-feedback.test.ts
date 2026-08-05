@@ -1,4 +1,6 @@
 import { describe, it, before, after } from 'node:test';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { Verifier, NO_GATES_COMMAND, ONLY_DIFF_COMMAND } from '../src/worker/verifier.js';
 import { formatGateFeedback } from '../src/worker/agent-runtime.js';
@@ -24,40 +26,45 @@ function recorderSpy() {
   return { runs, recorder: { record: (i: CheckRunInput) => { runs.push(i); return 1; } } };
 }
 
-describe('紅燈的完整輸出交給 agent，不挑行也不猜測試名', () => {
+/**
+ * **紅燈時輸出不進 prompt。**
+ *
+ * 程式跑了指令、拿到非 0，它知道的就這兩件事。「哪裡壞了」要讀輸出才知道，
+ * 而讀輸出是 agent 的事——它有 Bash、在同一個工作區、剛剛才自己跑過。
+ *
+ * 先前這裡貼整份 stdout（每條最多 256KB，四條都紅近 1MB，而且每一輪重貼）。
+ * 那不是幫忙：真正的錯誤埋在進度條裡，而截斷之後 agent 連「被砍掉什麼」都不知道。
+ */
+describe('紅燈只記帳，不把輸出塞進回饋', () => {
   let dir: TmpDir;
   before(() => { dir = createTmpDir('gate-feedback-'); });
   after(() => dir.cleanup());
 
-  it('失敗關卡的 detail 是整份輸出——第一行與第兩百行都在', async () => {
+  it('**輸出一個字都不進 detail**，只留指令與 exit code', async () => {
     const v = new Verifier(createSilentLogger());
-    // 200 行輸出，關鍵資訊在**第一行**：舊版只留最後 30 行，正好會把它切掉
-    const script = `node -e "console.log('FAIL src/a.test.ts'); for(let i=0;i<200;i++)console.log('  第 '+i+' 行細節'); process.exit(1)"`;
+    // 標記字串**只出現在輸出裡**，不出現在指令裡——不然斷言會抓到指令本身的回顯
+    writeFileSync(join(dir.path, 'noisy.js'), "console.log('AAABBBCCC'); for(let i=0;i<200;i++)console.log('第 '+i+' 行'); process.exit(1)");
+    const script = 'node noisy.js';
 
     const gate = await v.check({ cwd: dir.path, config: { test: script } });
 
     assert.equal(gate.green, false);
-    const detail = gate.checks[0]?.detail ?? '';
-    assert.match(detail, /FAIL src\/a\.test\.ts/, '第一行是失敗的檔名，不可以被截掉');
-    assert.match(detail, /第 199 行細節/);
+    const c = gate.checks[0]!;
+    assert.doesNotMatch(c.detail, /AAABBBCCC/, '輸出不可以出現在回饋裡');
+    assert.doesNotMatch(c.detail, /第 199 行/);
+    assert.equal(c.command, script, '要留下指令，agent 才重跑得了');
+    assert.equal(c.exitCode, 1);
   });
 
-  it('不再從輸出撈失敗的測試名（那個正則只認得三種格式）', async () => {
-    const v = new Verifier(createSilentLogger());
-    const script = `node -e "console.log('not ok 1 - alpha'); process.exit(1)"`;
+  it('全文照樣完整記進 check_runs（那是給人事後查的）', async () => {
+    const spy = recorderSpy();
+    const v = new Verifier(createSilentLogger(), { checkRecorder: spy.recorder, checkContext: CTX });
+    writeFileSync(join(dir.path, 'boom.js'), "console.log('DDDEEEFFF'); process.exit(1)");
 
-    const gate = await v.check({ cwd: dir.path, config: { test: script } });
+    await v.check({ cwd: dir.path, config: { test: 'node boom.js' } });
 
-    assert.equal(
-      gate.checks[0]?.failingIds,
-      undefined,
-      '「alpha」是從輸出猜出來的語意——換一套測試框架就撈不到，而下游還是會用肯定句講出來',
-    );
-    assert.match(gate.checks[0]?.detail ?? '', /not ok 1 - alpha/, '但原始輸出必須在，讀得懂的是 agent');
+    assert.match(spy.runs[0]?.output ?? '', /DDDEEEFFF/, '不給 prompt ≠ 不記帳');
   });
-
-  // 「簽章不再產生」那條退場：GateReport.signature 這個欄位本身已於第 15 片刪掉，
-  // 由 typecheck 守著（誰想加回來會當場編不過），不必再用執行期斷言。
 });
 
 describe('formatGateFeedback：agent 這一輪會看到的那段文字', () => {
@@ -70,17 +77,28 @@ describe('formatGateFeedback：agent 這一輪會看到的那段文字', () => {
     );
   });
 
-  it('種類碼標出來，讓 agent 分得出逾時與測試紅', () => {
+  it('**只講指令與 exit code，並叫它自己去跑**', () => {
     const text = formatGateFeedback({
       green: false,
       checks: [
-        { name: 'test', ok: false, detail: '逾時：超過 600000ms', failingIds: ['timeout'] },
+        { name: 'test', ok: false, detail: '跑了 `npm test`，exit code 1', command: 'npm test', exitCode: 1 },
         { name: 'build', ok: true, detail: 'ok' },
       ],
-    });
+    }) ?? '';
 
-    assert.match(text ?? '', /\[test\]（timeout） 逾時/);
-    assert.doesNotMatch(text ?? '', /build/, '只列失敗項，通過的不必占版面');
+    assert.match(text, /`test` 紅了：跑 `npm test` 回 exit code 1/);
+    assert.match(text, /輸出沒有貼在這裡/, '要明講沒貼，否則 agent 會以為那就是全部');
+    assert.match(text, /自己跑/);
+    assert.doesNotMatch(text, /build/, '只列失敗項');
+  });
+
+  it('程式自己知道的事實（沒跑指令那幾種）照原樣給——不給它就不知道發生什麼', () => {
+    const text = formatGateFeedback({
+      green: false,
+      checks: [{ name: 'diff', ok: false, detail: '工作區相對任務起點沒有任何變更', failingIds: ['no-changes'] }],
+    }) ?? '';
+
+    assert.match(text, /沒有任何變更/, '這是程式寫的短句，不是機器輸出');
   });
 });
 

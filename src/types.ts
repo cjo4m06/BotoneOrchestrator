@@ -139,7 +139,26 @@ export interface PlanResult { groups: PlannedGroup[]; schedule: ScheduleEdge[]; 
 // ── Worker / Verifier / Progress ──
 export interface WorkerCtx { worktree: string; branch: string; threadTs?: string; }
 export interface VerifyCtx { cwd: string; task: TaskDetail; }
-export interface CheckResult { name: string; ok: boolean; detail: string; failingIds?: string[]; }
+export interface CheckResult {
+  name: string;
+  ok: boolean;
+  /**
+   * 給人／agent 看的一句話。
+   *
+   * **紅燈時這裡不放機器輸出。** 程式跑了指令、拿到非 0，它知道的就只有這兩件事；
+   * 「哪裡壞了」要看輸出才知道，而看輸出是 agent 的事——它有 Bash、在同一個 cwd、
+   * 想跑幾次、想只跑一個檔案都可以。程式把輸出貼進 prompt 只會做到三件壞事：
+   * 灌爆 context、把真正的錯誤埋在進度條裡、而且截斷之後 agent 連「被砍掉什麼」都不知道。
+   *
+   * 全文照樣完整落在 check_runs（含 output_path），那是給人事後查的。
+   */
+  detail: string;
+  /** 實際跑的指令字串。agent 要自己重跑就靠它。 */
+  command?: string;
+  /** 指令的結束碼。undefined ＝ 根本沒跑起來（與「跑了但失敗」是不同的事）。 */
+  exitCode?: number;
+  failingIds?: string[];
+}
 export interface GateReport {
   green: boolean;
   checks: CheckResult[];
