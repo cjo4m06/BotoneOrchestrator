@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
 import { Planner } from '../src/core/planner.js';
@@ -149,4 +150,31 @@ test('tick 整輪失敗會留在 ledger，控制台看得到', async (t) => {
   const e = h.ledger.latestEvent('system', null, TICK_FAILED_EVENT);
   assert.ok(e, '整輪失敗只留在 log 的話，控制台永遠看不出來出過事');
   assert.match(e.detail ?? '', /規劃 agent 無法產出可用的計畫/, '要留下真正的原因，不是「發生錯誤」');
+});
+
+/**
+ * **每一條會跑 agent 的路徑都要記「現在在做什麼」。**
+ *
+ * 實跑（2026-08-05 21:36）：Merge Guard 把群組打回來之後，group-runner 走的是
+ * 「依審查意見重做」那條迴圈——它直接呼叫 agent.iterate，**沒有包 withActivity**。
+ * 於是那十幾分鐘裡控制台顯示「閒著（沒有任何工作在進行）」，而 agent 正在寫程式，
+ * 使用者因此以為系統卡住了。
+ *
+ * 一般任務那條有包、重做那條沒包——又是「能力有、一條路徑漏接」。
+ */
+test('重做迴圈有包 withActivity（不然重做期間畫面是「閒著」）', () => {
+  const src = readFileSync('src/core/group-runner.ts', 'utf8');
+  const i = src.indexOf("'依審查意見重做'");
+  assert.ok(i >= 0, '找不到重做迴圈');
+  assert.match(
+    src.slice(i, i + 700),
+    /withActivity\(/,
+    '重做那一輪可以跑十幾分鐘不留任何 log——沒有 activity 就等於系統看起來死了',
+  );
+});
+
+test('活動標題帶得出是第幾輪（人要看得出它在動，不是卡著）', () => {
+  const src = readFileSync('src/core/group-runner.ts', 'utf8');
+  const i = src.indexOf("'依審查意見重做'");
+  assert.match(src.slice(i, i + 700), /第 \$\{round\}/);
 });

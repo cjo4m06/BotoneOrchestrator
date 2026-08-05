@@ -1302,13 +1302,32 @@ export class GroupRunner {
 
     for (let round = 1; round <= max; round += 1) {
       log.info({ group: group.id, round, max }, '依審查意見重做');
-      const r = await agent.iterate({
-        cwd: wtPath,
-        task,
-        docs,
-        ...(feedback ? { feedback } : {}),
-        ...(session ? { resumeSessionId: session } : {}),
-      });
+      // **重做也要記「現在在做什麼」。**
+      //
+      // 一般任務那條路徑有包（見上面 withActivity 的說明），這條沒有——於是
+      // 被審查或 Merge Guard 打回來之後的重做，在控制台上完全看不見：
+      // 畫面顯示「閒著（沒有任何工作在進行）」，而 agent 其實正在寫程式。
+      //
+      // 實跑（2026-08-05 21:36）：使用者看到「什麼都沒有」而以為系統卡住，
+      // 但 daemon 好端端地在跑第 1 輪重做——那一輪可以跑十幾分鐘不留任何 log。
+      const r = await withActivity(
+        ledger,
+        {
+          id: `rework:${task.id}`,
+          kind: 'code',
+          repo: group.repo,
+          refId: task.id,
+          title: `${task.id}　${task.title}`,
+          detail: `依審查意見重做（第 ${round}/${max} 輪）`,
+        },
+        () => agent.iterate({
+          cwd: wtPath,
+          task,
+          docs,
+          ...(feedback ? { feedback } : {}),
+          ...(session ? { resumeSessionId: session } : {}),
+        }),
+      );
       session = r.sessionId ?? session;
 
       if (r.askedClarification) {
