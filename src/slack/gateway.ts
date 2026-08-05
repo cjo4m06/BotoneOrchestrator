@@ -279,6 +279,15 @@ export function parseMessageEvent(event: unknown): InboundMessage | undefined {
   return { text, threadTs, channel: str(e, 'channel'), userId: str(e, 'user') };
 }
 
+/**
+ * 設定值看起來已經是頻道 ID 嗎（`C…` 公開／`G…` 私密／`D…` 私訊）。
+ *
+ * 名稱長成 `#dev-orchestrator` 或 `dev-orchestrator`，一定有小寫或 `#`，不會誤判。
+ */
+export function looksLikeChannelId(v: string | undefined): boolean {
+  return typeof v === 'string' && /^[CGD][A-Z0-9]{6,}$/.test(v);
+}
+
 /** thread 內的控制指令（DESIGN §8）。純文字比對，認不出來就回 undefined（當成一般回覆）。 */
 export function parseControlCommand(text: string, taskId: string): ExtendedControlCommand | undefined {
   const t = text.trim().toLowerCase();
@@ -353,10 +362,26 @@ export class SlackGateway implements HumanGateway {
   /** 已按「退回」但還沒說明原因的 thread → groupId（下一則文字就是修改意見）。 */
   private pendingReject = new Map<string, string>();
   /** 首次 postMessage 回傳的 channel id；files.uploadV2 需要 id 而非 "#name"。 */
+  /**
+   * 這個頻道的真實 ID（`C…` / `G…`）。
+   *
+   * ── 為什麼不能直接用設定裡那個值 ──
+   *
+   * Slack 的 API 對「頻道名稱」的容忍度**不一致**：`chat.postMessage` 吃得下
+   * `#dev-orchestrator`，但 `chat.update`／`chat.delete`／`conversations.replies`／
+   * `files.uploadV2` 一律只吃 ID，拿名稱去打會回 `channel_not_found`。
+   *
+   * 實跑（2026-08-05）：`清除任務卡失敗 err: channel_not_found`，而同一時間所有
+   * 通知訊息都正常——因為只有 postMessage 那條路吃得下名稱。錯誤訊息還會把人
+   * 引去錯的方向：它說「找不到頻道」，實際是「我們還沒解析出這個頻道的 ID」。
+   */
   private channelId?: string;
   private started = false;
 
   constructor(private deps: SlackGatewayDeps) {
+    // 設定值本來就是 ID → 直接用，那四個需要 ID 的呼叫從第一秒就能動。
+    if (looksLikeChannelId(this.deps.channel)) this.channelId = this.deps.channel;
+
     this.throttle = new EventThrottle(deps.throttle ?? {}, deps.now ?? Date.now);
   }
 
@@ -429,7 +454,8 @@ export class SlackGateway implements HumanGateway {
   private async dismissCard(taskId: string): Promise<void> {
     const ts = this.taskThread.get(taskId) ?? this.deps.resolveCard?.(taskId)?.ts;
     if (!ts) return;
-    const channel = this.channelId ?? this.deps.channel;
+    const channel = this.idChannel('清除任務卡');
+    if (!channel) return;
     const del = this.deps.client.chat.delete;
     if (!del) return;
 
@@ -485,8 +511,10 @@ export class SlackGateway implements HumanGateway {
     if (!update) return;
     const status = state.status;
     try {
+      const channel = this.idChannel('更新任務卡');
+      if (!channel) return;
       await update.call(this.deps.client.chat, {
-        channel: this.channelId ?? this.deps.channel,
+        channel,
         ts,
         text: taskCardText(state.card, status),
         blocks: taskCardBlocks(state.card, status, {
@@ -553,7 +581,11 @@ export class SlackGateway implements HumanGateway {
       this.deps.log.warn({ paths }, 'Slack：截圖檔案不存在，略過上傳');
       return;
     }
-    const channel = this.channelId ?? this.deps.channel;
+    const channel = this.idChannel('上傳截圖');
+    if (!channel) {
+      this.deps.log.warn({ paths }, 'Slack：略過截圖上傳（頻道 ID 未知），驗證流程不受影響');
+      return;
+    }
     try {
       await this.deps.client.files.uploadV2({
         channel_id: channel,
@@ -588,8 +620,11 @@ export class SlackGateway implements HumanGateway {
       this.deps.log.warn('Slack：未提供 app token，入站互動停用（只出站）');
       return;
     }
-    socket.onAction((a) => this.handleAction(a));
-    socket.onMessage((m) => this.handleMessage(m));
+    // **入站事件本來就帶著頻道 ID**，先前解析出來卻丟掉。
+    // 記住它等於多一個免費的來源：只要有人在 Slack 上按過按鈕或回過話，
+    // 那四個需要 ID 的呼叫就能動——不必等我們自己先發出一則訊息。
+    socket.onAction((a) => { this.rememberChannel(a.channel); void this.handleAction(a); });
+    socket.onMessage((m) => { this.rememberChannel(m.channel); void this.handleMessage(m); });
     try {
       await socket.start();
       this.deps.log.info({ channel: this.deps.channel }, 'Slack Socket Mode 已連線');
@@ -778,6 +813,39 @@ export class SlackGateway implements HumanGateway {
     }
   }
 
+  /**
+   * 需要**頻道 ID**的呼叫（update／delete／replies／檔案上傳）用這個取。
+   *
+   * 拿不到就回 undefined，呼叫端要略過——**不可以退回設定裡的名稱**：
+   * 那會回一個 `channel_not_found`，看起來像「頻道不存在」，實際是
+   * 「我們還沒解析出 ID」，把查的人引去完全錯的方向（實跑撞到）。
+   *
+   * 通常只有「這個行程還沒發過任何訊息」的空窗期會拿不到——第一則訊息貼出去、
+   * 或第一個人在 Slack 上按了按鈕，ID 就記住了。要完全避開這個空窗，
+   * 在設定裡把頻道填成 ID（`C…`）而不是名稱。
+   */
+  /**
+   * 從**權威來源**記住頻道 ID（postMessage 的回應、入站事件）。
+   *
+   * 這裡刻意**不驗格式**：Slack 自己告訴我們的就是 ID，再拿正則去審一次
+   * 只會多一種「明明拿到了卻不認」的失敗（而且那種失敗是靜默的）。
+   * 格式檢查只用在**設定值**上——那才需要分辨人填的是名稱還是 ID。
+   */
+  private rememberChannel(id: string | undefined): void {
+    if (this.channelId || !id) return;
+    this.channelId = id;
+    this.deps.log.info({ channelId: id }, 'Slack：已解析出頻道 ID');
+  }
+
+  private idChannel(what: string): string | undefined {
+    if (this.channelId) return this.channelId;
+    this.deps.log.warn(
+      { channel: this.deps.channel, what },
+      'Slack：還沒解析出這個頻道的 ID，暫時略過（設定填頻道 ID 而不是名稱可完全避免）',
+    );
+    return undefined;
+  }
+
   /** 所有出站訊息的唯一出口：吞掉 API 錯誤並記住 channel id。 */
   private async post(msg: { text: string; blocks?: KnownBlock[]; thread_ts?: string | undefined }): Promise<string | undefined> {
     try {
@@ -787,7 +855,7 @@ export class SlackGateway implements HumanGateway {
         ...(msg.blocks ? { blocks: msg.blocks } : {}),
         ...(msg.thread_ts ? { thread_ts: msg.thread_ts } : {}),
       });
-      if (res.channel) this.channelId = res.channel;
+      this.rememberChannel(res.channel);
       return res.ts;
     } catch (err) {
       this.deps.log.error({ err: String(err), text: msg.text }, 'Slack 發送失敗（已忽略，不影響任務）');

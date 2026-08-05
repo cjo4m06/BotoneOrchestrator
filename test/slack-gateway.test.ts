@@ -110,13 +110,19 @@ const task: TaskDetail = {
   docRefs: ['spec.md#a'],
 };
 
-async function setup(opts: { socket?: FakeSocket; updateFails?: boolean } = {}) {
+async function setup(opts: { socket?: FakeSocket; updateFails?: boolean; channel?: string; card?: { ts: string } } = {}) {
   const client = new FakeSlackWeb();
   client.updateFails = opts.updateFails === true;
   const gw = new SlackGateway({
     client,
-    channel: '#dev',
+    // **預設用頻道 ID 不是名稱。** update／delete／replies／檔案上傳只吃 ID，
+    // 拿名稱去打會回 channel_not_found（實跑 2026-08-05 撞到）。
+    // 假件先前填 '#dev' 卻照樣通過，是因為它自己不管參數長怎樣。
+    // 想測「設定填名稱、ID 靠 API 學回來」那條路的，傳 opts.channel 進來。
+    channel: opts.channel ?? 'C999DEV',
     log,
+    // 模擬「daemon 重啟後從 ledger 重建卡片位置」——那正是還沒發過訊息就要動卡片的時機
+    ...(opts.card ? { resolveCard: () => ({ ts: opts.card!.ts, card: { id: task.id, title: 't', repo: 'acme/web', category: 'dev' as const } }) } : {}),
     ...(opts.socket ? { socket: opts.socket } : {}),
     // 節流關掉時間因素，讓多數測試專注在行為
     throttle: { iterateMinIntervalMs: 0 },
@@ -132,7 +138,7 @@ test('postTaskCard：貼到頻道（非 thread）並回傳 thread_ts', async () 
   const ts = await gw.postTaskCard(task);
   assert.equal(ts, 'ts-1');
   assert.equal(client.sent.length, 1);
-  assert.equal(client.sent[0]!.channel, '#dev');
+  assert.equal(client.sent[0]!.channel, 'C999DEV');
   assert.equal(client.sent[0]!.thread_ts, undefined);
   assert.ok(client.sent[0]!.blocks && client.sent[0]!.blocks.length > 0);
 });
@@ -194,12 +200,50 @@ test('EventThrottle：重複的「遇到問題」有冷卻，時間到就放行'
 });
 
 
+/**
+ * 實跑（2026-08-05）：`清除任務卡失敗 err: channel_not_found`，而同一時間所有通知都正常。
+ *
+ * 成因：Slack 對「頻道名稱」的容忍度不一致——`chat.postMessage` 吃得下 `#dev`，
+ * 但 `chat.update`／`chat.delete`／`conversations.replies`／`files.uploadV2` 只吃 ID。
+ * 而程式對這四個都用同一段 `channelId ?? deps.channel` 退回名稱。
+ *
+ * 錯誤訊息還會把人引去錯的方向：它說「找不到頻道」，實際是「我們還沒解析出 ID」。
+ */
+test('頻道 ID 未知時，需要 ID 的呼叫要略過而不是拿名稱去打 API', async () => {
+  // 設定填的是名稱，而且這個行程還沒發過任何訊息 —— 正是實跑出事的時機（重啟後）
+  const { client, gw } = await setup({ channel: '#dev', card: { ts: '900.1' } });
+
+  await gw.updateTaskCard(task.id, 'reviewing');
+
+  assert.deepEqual(client.updates, [], '拿名稱去打 chat.update 會回 channel_not_found');
+});
+
+test('設定直接填頻道 ID → 第一秒就能更新卡片，不必等我們先發訊息', async () => {
+  const { client, gw } = await setup({ channel: 'C0123456789', card: { ts: '900.1' } });
+
+  await gw.updateTaskCard(task.id, 'reviewing');
+
+  assert.equal(client.updates.length, 1);
+  assert.equal(client.updates[0]!.channel, 'C0123456789');
+});
+
+test('設定填名稱、但發過訊息之後 → 用 API 學回來的 ID，不是名稱', async () => {
+  const { client, gw } = await setup({ channel: '#dev' });
+  await gw.postTaskCard(task);
+
+  await gw.updateTaskCard(task.id, 'reviewing');
+
+  assert.equal(client.updates.length, 1);
+  assert.equal(client.updates[0]!.channel, 'C999', '退回 #dev 會 channel_not_found');
+});
+
 test('postScreenshots：uploadV2 帶 channel id、thread_ts 與檔名；不存在的檔案略過', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'slack-shot-'));
   const png = join(dir, 'home-1280.png');
   writeFileSync(png, 'fake');
 
-  const { client, gw } = await setup();
+  // 設定填的是**名稱**，ID 要從 postMessage 的回應學回來——這條路正是實跑出事的地方。
+  const { client, gw } = await setup({ channel: '#dev' });
   const ts = (await gw.postTaskCard(task))!; // 先讓 gateway 記住 channel id
   await gw.postScreenshots(ts, [png, join(dir, 'missing.png')]);
 
@@ -552,7 +596,7 @@ test('resolveTaskByThread：重啟後靠 ledger 反查也能接受控制指令',
   const client = new FakeSlackWeb();
   const gw = new SlackGateway({
     client,
-    channel: '#dev',
+    channel: 'C999DEV',
     log,
     socket,
     resolveTaskByThread: (ts) => (ts === 'ts-old' ? 'T-old' : undefined),
@@ -792,7 +836,7 @@ test('任務卡：daemon 重啟後仍能更新先前貼出的卡（從 ledger �
   const client = new FakeSlackWeb();
   const gw = new SlackGateway({
     client,
-    channel: '#dev',
+    channel: 'C999DEV',
     log,
     // 模擬重啟：這個 gateway 沒有貼過任何卡，只能靠 ledger 反查
     resolveCard: (taskId) =>
@@ -810,7 +854,7 @@ test('任務卡：daemon 重啟後仍能更新先前貼出的卡（從 ledger �
 
 test('任務卡：ledger 也查不到（Slack 當時未啟用）→ 安全略過', async () => {
   const client = new FakeSlackWeb();
-  const gw = new SlackGateway({ client, channel: '#dev', log, resolveCard: () => undefined });
+  const gw = new SlackGateway({ client, channel: 'C999DEV', log, resolveCard: () => undefined });
   await assert.doesNotReject(() => gw.updateTaskCard('T-9', 'merged'));
   assert.equal(client.updates.length, 0);
 });
@@ -858,7 +902,7 @@ test('裁決後更新整群的卡片：記憶體查不到時改問 ledger', asyn
   const client = new FakeSlackWeb();
   const socket = new FakeSocket();
   const gw = new SlackGateway({
-    client, channel: '#dev', log, socket,
+    client, channel: 'C999DEV', log, socket,
     resolveGroupTasks: (g) => (g === 'g1' ? ['T-9'] : []),
     resolveCard: (id) => (id === 'T-9' ? { ts: 'ts-舊', card: { id: 'T-9', title: 'x', repo: 'acme/web', category: 'dev' } } : undefined),
   });
@@ -936,7 +980,7 @@ test('過期卡片：舊 thread 上的核准鈕不觸發裁決，並提示去看
   const client = new FakeSlackWeb();
   const gw = new SlackGateway({
     client,
-    channel: '#dev',
+    channel: 'C999DEV',
     log,
     socket,
     // ledger 記錄的「現行卡片」是 ts-new；ts-old 是上一輪留下的殘卡
@@ -965,7 +1009,7 @@ test('現行卡片上的同一顆按鈕照常生效（別把正常操作也擋�
   const client = new FakeSlackWeb();
   const gw = new SlackGateway({
     client,
-    channel: '#dev',
+    channel: 'C999DEV',
     log,
     socket,
     resolveCard: (taskId) => (taskId === 'T-1' ? { ts: 'ts-new', card: task } : undefined),
@@ -987,7 +1031,7 @@ test('現行卡片上的同一顆按鈕照常生效（別把正常操作也擋�
 test('認不出任務時放行（寧可漏擋，也不要擋掉正常操作）', async () => {
   const socket = new FakeSocket();
   const client = new FakeSlackWeb();
-  const gw = new SlackGateway({ client, channel: '#dev', log, socket });
+  const gw = new SlackGateway({ client, channel: 'C999DEV', log, socket });
   await gw.start();
 
   const merges: unknown[] = [];
