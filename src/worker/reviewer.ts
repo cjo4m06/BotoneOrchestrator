@@ -1,7 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { createGitInspectServer } from './git-inspect.js';
-import { browserServerConfig } from './agent-runtime.js';
+import { browserServerConfig, scratchDirFor, scratchRule } from './agent-runtime.js';
 import { serversFor, toolsFor } from './capabilities.js';
 import { execa } from 'execa';
 import { createHash } from 'node:crypto';
@@ -204,6 +204,9 @@ export class Reviewer {
       docs,
       opts.baseRef,
       opts.decisions ?? [],
+      // 審查者也會截圖（實跑：review-1440-assistant.png 進了 main）。它跑在 coder
+      // 的工作區裡，掉在那裡的檔案一樣會被下一次提交掃進 PR。
+      scratchDirFor(this.deps.browserOutputRoot, `review-${task.id}`),
     );
     let text: string;
     try {
@@ -321,11 +324,15 @@ export function buildReviewPrompt(
   /** 比較基準。**不給 diff 內容**——審查者用唯讀 git 自己查（見 check 裡的說明）。 */
   baseRef: string,
   decisions: { question: string; answer: string }[] = [],
+  /** 暫存檔的去處（worktree 外）。未給就不提——沒有瀏覽器時它也不會產出檔案。 */
+  scratchDir?: string,
 ): string {
   const p: string[] = [];
   p.push(`# 審查任務 ${task.id}：${task.title}`);
   p.push(`類別：${task.category}｜repo：${task.repo}`);
   p.push(`\n## 任務描述\n${task.description}`);
+
+  if (scratchDir) p.push(scratchRule(scratchDir));
 
   p.push(`\n## 規格（逐段核對，共 ${docs.length} 份）`);
   for (const d of docs) p.push(`\n### ${d.ref}\n${d.content}`);
@@ -361,8 +368,9 @@ export function buildReviewPrompt(
       `{"status":"pass"|"fail"|"spec_problem","notes":["..."],` +
       `"uiChecked":{"looked":true|false,"detail":"看了 /profile 與 /settings（375 與 1440）"｜"沒看：這次只改 API 序列化"},` +
       `"violations":[{"docRef":"檔名#段落","requirement":"規格要求","problem":"實作哪裡不符","suggestion":"建議修法"}]}\n` +
-      'uiChecked 在 status=pass 時**必填**，空白會被退回（先前「沒驗畫面」在報告上一個字都沒有，' +
-      '於是它與「驗過而且沒問題」長得一模一樣）。\n' +
+      // 必填的理由（「沒驗畫面」與「驗過沒問題」先前長得一模一樣）是給改這段的人看的，
+      // 不是給審查者看的——它只要知道空白會被退回。
+      'uiChecked 在 status=pass 時**必填**，空白會被退回。\n' +
       '```\n' +
       `status=pass 時 violations 必須為空陣列。\n\n` +
       '**status=spec_problem**：規格本身有問題，不是實作的錯。用在：\n' +

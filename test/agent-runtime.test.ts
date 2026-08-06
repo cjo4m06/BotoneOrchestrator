@@ -76,7 +76,7 @@ test('prompt 叫 agent 用 report_summary 交結構，不是寫在對話裡', ()
   const p = buildAgentPrompt(input());
 
   assert.match(p, /呼叫 report_summary/);
-  assert.match(p, /寫在對話裡的東西程式讀不到/, '要講出為什麼——先前是用正則猜它的標題，猜不中就整段丟掉');
+  assert.match(p, /寫在對話裡的程式讀不到/, '要講出後果，否則它會兩邊都寫（或只寫對話）');
   assert.match(p, /不要填「無」或「待補」/);
 });
 

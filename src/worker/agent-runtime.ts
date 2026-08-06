@@ -56,6 +56,11 @@ export interface IterateInput {
    */
   priorDeliveries?: { taskId: string; text: string }[];
   /**
+   * 這一輪的暫存目錄（worktree 外）。有值才會在提示詞裡告訴 agent 暫存檔放哪。
+   * 由 AgentRuntime 從 browserOutputRoot 算出來，見 scratchDirFor。
+   */
+  scratchDir?: string;
+  /**
    * 這個 repo 上「人已經拍板、而且說了以後都這樣」的決定。
    *
    * ── 為什麼是 repo 層級不是任務層級 ──
@@ -271,9 +276,7 @@ export function browserServerConfig(
   taskId: string,
 ): { command: string; args: string[] } | undefined {
   if (!outputRoot?.trim()) return undefined;
-  // 一任務一目錄：多個 worktree 並行時互不覆蓋，清理也好對應
-  const dir = join(outputRoot, sanitizeSegment(taskId));
-  mkdirSync(dir, { recursive: true });
+  const dir = scratchDirFor(outputRoot, taskId)!;
   return {
     command: 'npx',
     args: [
@@ -286,6 +289,32 @@ export function browserServerConfig(
       '--output-dir', dir,
     ],
   };
+}
+
+/**
+ * 這一輪的暫存目錄（**在 worktree 外**）：瀏覽器的 `--output-dir`，同時也是提示詞裡
+ * 告訴 agent「自己的暫存檔放這裡」的那個路徑。
+ *
+ * 兩者共用同一個目錄是刻意的：一任務一格，清理與對應都只有一個地方。
+ *
+ * ── 為什麼提示詞要講 ──
+ *
+ * `--output-dir` 只管得到瀏覽器 MCP **自己**的落地檔。agent 用 Bash／Write 建的檔案
+ * 它管不到，而 agent 會建——實跑（2026-08-05，Dinosaur）它把驗證截圖存成
+ * `step1-1440.png`、`before-3000-blank-home.png` 放在 repo 根目錄，23 張、1174 KB
+ * 全部進了 commit、進了 PR、進了 main。
+ *
+ * 而程式擋不掉：`git add -A` 當時排除的是 `node_modules` 與 `.playwright-mcp` 兩個
+ * **寫死的名字**，agent 取的名字對不上就全掃進去。「這個檔案屬不屬於這次改動」是判斷，
+ * 靠副檔名或位置猜都會錯（repo 裡 `apps/web/public/` 就有合法的 .png）。
+ * 建檔案的是 agent，知道它是不是暫存的也只有 agent——所以直接告訴它放哪。
+ */
+export function scratchDirFor(outputRoot: string | undefined, taskId: string): string | undefined {
+  if (!outputRoot?.trim()) return undefined;
+  // 一任務一目錄：多個 worktree 並行時互不覆蓋，清理也好對應
+  const dir = join(outputRoot, sanitizeSegment(taskId));
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 /** 任務 id 直接當目錄名不安全（可能含 / 或 ..）。 */
@@ -455,6 +484,7 @@ export class AgentRuntime {
     const docsSource = this.deps.docs?.(input.task.repo);
     const docsServer = docsSource ? createDocsServer(docsSource, this.log) : undefined;
     const browser = browserServerConfig(this.deps.browserOutputRoot, input.task.id);
+    const scratch = scratchDirFor(this.deps.browserOutputRoot, input.task.id);
     // 能力清單在 capabilities.ts；這裡只備材料。宣告了卻沒材料 → missing，大聲講。
     const { servers, missing } = serversFor('coder', {
       ask: () => askServer,
@@ -476,7 +506,10 @@ export class AgentRuntime {
     }
 
     const stream = query({
-      prompt: buildAgentPrompt(input),
+      prompt: buildAgentPrompt(
+        // 瀏覽器與暫存檔共用同一格；沒設 browserOutputRoot 就兩者都沒有
+        { ...input, ...(scratch ? { scratchDir: scratch } : {}) },
+      ),
       options: {
         // 中止：SDK 會停止查詢並收掉它自己的子行程樹
         ...(abortController ? { abortController } : {}),
@@ -1210,9 +1243,21 @@ export function buildAgentPrompt(input: IterateInput): string {
   );
 
   p.push(EXTERNAL_ACTION_RULE);
+  if (input.scratchDir) p.push(scratchRule(input.scratchDir));
 
   p.push(SUMMARY_FORMAT);
   return p.join('\n');
+}
+
+/**
+ * 暫存檔的去處。**只有 agent 知道自己建的檔案是不是暫存的**，所以直接告訴它放哪，
+ * 不要讓程式事後去猜（見 scratchDirFor 的說明：猜過，猜錯了 23 張圖進了 main）。
+ */
+export function scratchRule(scratchDir: string): string {
+  return `
+## 暫存檔放這裡
+截圖、log、草稿一律放 \`${scratchDir}\`（已建好），不要放在工作目錄裡。
+**工作目錄裡的檔案都會被提交進這次的 PR。**`;
 }
 
 /**
@@ -1242,10 +1287,13 @@ const EXTERNAL_ACTION_RULE = `
  * 刻意要求「不適用就整段省略」而不是填「無」：硬湊段落只會讓審查者讀到廢話，
  * 也會讓「（待補）」失去它原本的意義（真的沒寫 vs 不適用）。
  */
+/**
+ * 為什麼要明講「用工具交」：先前是讓 agent 寫成散文、再用中文關鍵字正則猜每一段
+ * 屬於 PR 的哪一欄，猜不中就整段丟掉。改成 report_summary 之後這段只需要說規則。
+ */
 const SUMMARY_FORMAT = `
 ## 做完之後：呼叫 report_summary 交總結
-那份總結會被放進 PR 給人審查。**用工具交，不要只寫在對話裡**——
-寫在對話裡的東西程式讀不到（先前是用正則猜你的標題屬於哪一欄，猜不中就整段丟掉）。
+那份總結會被放進 PR 給人審查。**用工具交，寫在對話裡的程式讀不到。**
 不適用的欄位整個省略，不要填「無」或「待補」。`;
 
 
