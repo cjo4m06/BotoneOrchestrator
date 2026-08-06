@@ -242,9 +242,6 @@
           <label for="s-timeout">指令逾時（秒）</label>
           <input type="number" id="s-timeout" min="1">
           <div class="hint">單一驗收指令跑多久算逾時。大型專案的 build/test 常超過預設 10 分鐘</div>
-          <label for="s-rounds">無進展判定輪數</label>
-          <input type="number" id="s-rounds" min="1">
-          <div class="hint">連續幾輪結果一模一樣就視為卡住，交人處理</div>
           <label for="s-merge">自動合併</label>
           <select id="s-merge"><option value="false">關閉</option><option value="true">開啟</option></select>
           <div class="hint">關閉＝照常開 PR 與跑 Merge Guard，最後那一步等你自己按</div>
@@ -918,7 +915,6 @@ async function loadSettings() {
   $('s-poll').value = effective.pollIntervalSec;
   $('s-workers').value = effective.maxConcurrentWorkers;
   $('s-timeout').value = effective.commandTimeoutSec;
-  $('s-rounds').value = effective.noProgress.rounds;
   $('s-merge').value = String(effective.allowLocalMerge);
   $('k-enabled').value = String(effective.slack.enabled);
   $('k-channel').value = raw.slack?.channel ?? effective.slack.channel;
@@ -956,7 +952,6 @@ $('saveSettings').onclick = async () => {
       pollIntervalSec: Number($('s-poll').value),
       maxConcurrentWorkers: Number($('s-workers').value),
       commandTimeoutSec: Number($('s-timeout').value),
-      noProgress: { rounds: Number($('s-rounds').value) },
       allowLocalMerge: $('s-merge').value === 'true',
     }) });
     toast('已儲存（下一輪生效）', 'ok');

@@ -142,6 +142,13 @@ export const OrchestratorSchema = z.object({
    * 那條路本來就走不完，不該存在。
    */
   allowLocalMerge: z.boolean().default(false),
+  /**
+   * **目前沒有任何消費端。** 保留只是為了不讓既有設定檔驗證失敗。
+   *
+   * 它曾經接在 GroupRunnerDeps.progressRounds 上，但那個欄位從頭到尾只有宣告與賦值、
+   * 沒有人讀——控制台上因此有一個「按了什麼都不會發生」的欄位（2026-08-06 已從 UI 移除）。
+   * 要做「連續 N 輪無進展就交人」的話，接上之後再把欄位加回 UI。
+   */
   noProgress: z.object({ rounds: z.number().default(3) }).prefault({}),
   /**
    * agent 宣告「本任務無需改動」時的處置（見 worker.ts 的 NoChangePolicy）。

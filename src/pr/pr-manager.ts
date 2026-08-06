@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import { z } from 'zod';
 import type { PullRequest } from '../types.js';
 import type { Logger } from '../observability/logger.js';
-import { withFetchLock } from '../git/fetch-lock.js';
+import { withFetchLock, FETCH_TIMEOUT_MS } from '../git/fetch-lock.js';
 
 /** 外部指令的執行結果（已正規化：連「指令不存在」都回結果而不丟例外）。 */
 export interface CommandResult {
@@ -16,7 +16,7 @@ export interface CommandResult {
  *   1. 測試必須能注入假件——絕不允許測試真的去碰 git remote 或真實 PR。
  *   2. 之後要加權限閘門/稽核時，只要包一層 runner 即可，不必動 PrManager。
  */
-export type CommandRunner = (file: string, args: string[], opts?: { cwd?: string }) => Promise<CommandResult>;
+export type CommandRunner = (file: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => Promise<CommandResult>;
 
 /**
  * 預設執行器：execa + reject:false。
@@ -25,7 +25,12 @@ export type CommandRunner = (file: string, args: string[], opts?: { cwd?: string
  */
 export const execaRunner: CommandRunner = async (file, args, opts = {}) => {
   try {
-    const r = await execa(file, args, { cwd: opts.cwd, reject: false });
+    const r = await execa(file, args, {
+      cwd: opts.cwd,
+      reject: false,
+      // 逾時要傳下去：execa 預設 0（停用），而 fetch 卡住會把整個 fetch 佇列凍住
+      ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+    });
     return { exitCode: r.exitCode ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
   } catch (e) {
     // 指令不存在（ENOENT）等 spawn 期失敗仍可能丟；一律轉成 exitCode -1，
@@ -85,8 +90,8 @@ const PrListSchema = z.array(PrRowSchema);
 export class PrManager {
   constructor(private log: Logger, private run: CommandRunner = execaRunner) {}
 
-  private git(repoPath: string, args: string[]): Promise<CommandResult> {
-    return this.run('git', ['-C', repoPath, ...args]);
+  private git(repoPath: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<CommandResult> {
+    return this.run('git', ['-C', repoPath, ...args], opts);
   }
 
   /** 本地 git 步驟出錯屬致命（不該默默往下走）→ 保留既有「失敗即丟」語意。 */
@@ -281,7 +286,7 @@ export class PrManager {
     //   (b) 這個分支上有 **已合併** 的 PR——GitHub 說進去了就是進去了（squash 合併走這條）
     // 少了 (b) 這條路實際上是死的：預設合併方式是 squash，它會把整條分支壓成一顆新
     // commit，原本的 commits 一顆都不是 base 的祖先，(a) 永遠不成立。
-    await withFetchLock(repoPath, () => this.git(repoPath, ['fetch', 'origin', branch, base]));
+    await withFetchLock(repoPath, () => this.git(repoPath, ['fetch', 'origin', branch, base], { timeoutMs: FETCH_TIMEOUT_MS }));
     const remoteTip = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${branch}`])).stdout.trim();
     const baseTip = (await this.git(repoPath, ['rev-parse', `refs/remotes/origin/${base}`])).stdout.trim();
     const ancestor =

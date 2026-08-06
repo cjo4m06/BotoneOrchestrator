@@ -497,7 +497,6 @@ async function runFlow(repo: TempRepo): Promise<number> {
       checkRecorder: createCheckRecorder({ ledger, log }),
       ...(ctx ? { checkContext: ctx } : {}),
     }),
-    progressRounds: 3,
     notifier: Object.assign(notifier, { askMergeApproval: (ts: string | undefined, g: { groupId: string }) => gateway.askMergeApproval(ts, g) }),
     allowLocalMerge: false, // 有 PR 時一律走 PR 合併路徑（不本地合併，避免孤兒 PR）
     feedback,

@@ -125,7 +125,12 @@ export class WorktreeManager {
     const entries = ['.playwright-mcp/'];
     try {
       // worktree 的 .git 是檔案不是目錄，內容指向真正的 git dir
-      const gitDir = await this.git(worktreePath, ['rev-parse', '--git-dir']);
+      // **必須是 --git-common-dir，不是 --git-dir。**
+      // git 讀的是 $GIT_COMMON_DIR/info/exclude；worktree 自己那個 gitdir 底下的
+      // info/exclude **完全不會被讀**（實測：寫進去之後 `git status` 照樣列出該檔）。
+      // 也就是說這段先前是空轉的——`.playwright-mcp/` 從來沒有被排除過，
+      // 擋住它的一直只有 --output-dir 那道（而那道正是「換版本就可能失效」的那道）。
+      const gitDir = await this.git(worktreePath, ['rev-parse', '--git-common-dir']);
       if (!gitDir) return;
       const abs = isAbsolute(gitDir) ? gitDir : join(worktreePath, gitDir);
       const file = join(abs, 'info', 'exclude');

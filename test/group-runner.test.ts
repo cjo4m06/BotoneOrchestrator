@@ -362,7 +362,6 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
       resolveProject: (repo) => (repo === 'acme/web' ? project : undefined),
       agent,
       makeVerifier: greenVerifier,
-      progressRounds: 3,
       notifier,
       diffHash: async () => 'd1',
       readDiff: async () => over.diff ?? DOCS_DIFF,
@@ -667,6 +666,48 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
         tmp.ledger.takeKnownRedWaiver(group.id),
         '不在範圍內的判決不該把人的放行吃掉——那張還要留給真正的那個紅',
       );
+    });
+
+    /**
+     * **這一條是這顆按鈕真正會遇到的情境。**
+     *
+     * 舊的放行清單是白名單 `{tests_red, post_merge_red}`，而真守衛的 attempt()
+     * 一個都產不出來（post_merge_red 只有零呼叫端的 postMergeCheck 會回，
+     * tests_red 全庫沒有產生端）。歸咎實驗證明「base 上本來就紅」時，
+     * 判決一律以 semantic_drift 回來——正好是白名單排除掉的那個。
+     * 於是人按了「照樣落地」，票據原封留著、群組再次被擋，按鈕靜默無效。
+     * 舊測試之所以綠：fakeGuard 餵的是真守衛產不出來的值。
+     */
+    it('語意飄移（＝真守衛紅燈時實際會回的那個）＋ 有放行 → 落得了地', async () => {
+      const group = seedGroup(['薪資欄位']);
+      tmp.ledger.grantKnownRedWaiver(group.id, '歸咎實驗已證明 base 上也紅', 'kchen');
+      const h = build({
+        guard: fakeGuard({ ok: false, reason: 'semantic_drift', detail: '[test] 3 個案例失敗（base 上同樣紅）' }),
+        allowLocalMerge: true,
+      });
+
+      await h.runner.run(group);
+
+      assert.notEqual(tmp.ledger.getGroup(group.id)?.state, 'changes_requested',
+        '人看完歸咎實驗證據按的放行，不該被程式的 reason 字串否決');
+      assert.ok(h.pr.prs.length > 0, 'PR 要開得出來，否則這顆按鈕還是無效');
+      assert.equal(tmp.ledger.takeKnownRedWaiver(group.id), undefined, '放行是一次性的');
+    });
+
+    it('前置失敗 ＋ 有放行 → 照樣擋下（根本沒驗到，談不上「已知的紅」）', async () => {
+      const group = seedGroup(['某任務']);
+      tmp.ledger.grantKnownRedWaiver(group.id, '我知道那個紅', 'kchen');
+      const h = build({
+        guard: fakeGuard({ ok: false, reason: 'precondition_failed', detail: '驗收樹建不起來' }),
+        allowLocalMerge: true,
+      });
+
+      await h.runner.run(group);
+
+      // 前置失敗走的是 failed（不是交回 agent 修——根本沒驗到，沒有東西可修）
+      assert.equal(tmp.ledger.getGroup(group.id)?.state, 'failed');
+      assert.equal(h.pr.prs.length, 0);
+      assert.ok(tmp.ledger.takeKnownRedWaiver(group.id), '不在範圍內就不該把人的放行吃掉');
     });
 
     it('沒有放行 → 合併後測試紅照常交回 agent（放行不是預設行為）', async () => {
@@ -1150,9 +1191,6 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     const guard: MergeGuardLike = {
       async attempt(): Promise<MergeVerdict> {
         opts?.onBaseFreshness?.({ ref: 'main', fetched: false, caveat: '未能取得最新 base（離線），本次驗證基於本地狀態' });
-        return { ok: true };
-      },
-      async postMergeCheck(): Promise<MergeVerdict> {
         return { ok: true };
       },
     };

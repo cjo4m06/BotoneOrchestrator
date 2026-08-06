@@ -29,7 +29,7 @@ import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { GateReport, Group, GroupState, MergeVerdict, PullRequest, Task, TaskDetail, TaskState } from '../types.js';
 import { withActivity } from '../observability/activity.js';
-import { withFetchLock } from '../git/fetch-lock.js';
+import { withFetchLock, FETCH_TIMEOUT_MS } from '../git/fetch-lock.js';
 
 /** 一個專案在執行期需要的東西（由 registry 解析）。 */
 /** 與 MergeGuard 相同的 git 執行方式（reject:false，讓呼叫端自己判 exitCode）。 */
@@ -87,15 +87,21 @@ export interface PrManagerLike {
   }): Promise<{ ok: boolean; detail: string }>;
 }
 
-/** MergeGuard 的結構介面。 */
+/**
+ * MergeGuard 的結構介面。
+ *
+ * **刻意只有 attempt。** `postMergeCheck`（合併後回頭驗 base）曾經列在這裡，
+ * 但 daemon 從來沒有呼叫它——列在介面上會讓人以為「合併後有保險」，
+ * 而實際上那個缺口是開著的（只有 scripts/e2e-full.ts 這支手動腳本會跑它）。
+ * 要補那個缺口就正式接一條路徑進來，不要靠一個沒人呼叫的方法簽名。
+ */
 export interface MergeGuardLike {
   attempt(input: MergeGuardInput): Promise<MergeVerdict>;
-  postMergeCheck(repoPath: string, base: string, config: VerifierConfig): Promise<MergeVerdict>;
 }
 
 
 export interface GitResult { exitCode: number; stdout: string; stderr: string }
-export type GitRunner = (cwd: string, args: string[]) => Promise<GitResult>;
+export type GitRunner = (cwd: string, args: string[], opts?: { timeoutMs?: number }) => Promise<GitResult>;
 
 /** 任務卡輸入（結構對映 slack/blocks.ts 的 TaskCardInput，避免反向相依 Slack 模組）。 */
 export interface TaskCardLike {
@@ -180,13 +186,13 @@ export interface GroupRunnerDeps {
    * 「同一條分支九分鐘前才通過同一道關卡」這種證據只有這張表查得到。
    */
   recordCheck?: (input: CheckRunInput) => void;
-  progressRounds: number;
   notifier: Notifier;
   /**
    * 自動合併：Merge Guard 通過後直接合併那個 PR，不等人審查。
    * 預設 false——每個 PR 都停下來等人。合併會動到 base 分支，那是唯一不可逆的動作。
    */
-  allowLocalMerge?: boolean;
+  /** 系統可不可以自己合併。**傳函式才會熱重載**；傳 boolean 就是開機當下那個值。 */
+  allowLocalMerge?: boolean | (() => boolean);
   /**
    * 合併風險判斷者。只在 allowLocalMerge 開著時會被呼叫：
    * 使用者說了「一般改動不必問我」，這一關只攔「做錯了救不回來」的那種。
@@ -913,12 +919,25 @@ export class GroupRunner {
       // 之後，這一群依然落不了地——會累積一批「已裁定非我方責任、但卡著」的群。
       // 這顆放行是人看完證據後的決定，程式的職責只是**認得它、用掉它、記下來**。
       //
-      // 只對 tests_red / post_merge_red 生效。code_conflict、semantic_drift、
-      // precondition_failed 講的都是**這一群自己**的問題（衝突是這群改的、飄移是這群做的、
-      // 前置失敗代表根本沒驗到）——把它們也放行等於關掉守衛，那不是人按那顆按鈕的意思。
-      const WAIVABLE = new Set(['tests_red', 'post_merge_red']);
+      // ── 為什麼是「排除法」而不是白名單（2026-08-06 改） ──
+      //
+      // 這裡原本是 `new Set(['tests_red', 'post_merge_red'])`，而那兩個 reason
+      // **真守衛一個都產不出來**：post_merge_red 的唯一產生端在零呼叫端的 postMergeCheck，
+      // tests_red 全庫沒有任何產生端。attempt() 只會回 code_conflict／precondition_failed／
+      // semantic_drift／ok，所以底下那段放行**永遠執行不到**——人按了「照樣落地」，
+      // 票據原封留在 ledger 沒被用掉，群組再次被擋，按鈕靜默無效。
+      // 測試之所以一直是綠的：fakeGuard 餵的是真守衛產不出來的值。
+      //
+      // 而那顆按鈕唯一要解的情境（歸咎實驗證明「base 上本來就紅」），現在一律
+      // 以 semantic_drift 回來——正好是舊白名單排除掉的那一個。
+      //
+      // 改成排除法之後，判準回到它本來該有的樣子：**人看完證據決定落地**，
+      // 程式只負責認得票據、用掉它、記下來。仍然不可放行的只有兩種——
+      //  · code_conflict     ：檔案是衝突的，硬合出來的東西不是任何人審過的內容
+      //  · precondition_failed：根本沒驗到（工作區壞了／樹建不起來），沒有「已知的紅」可言
+      const NOT_WAIVABLE = new Set(['code_conflict', 'precondition_failed']);
       let waived: string | undefined;
-      if (!verdict.ok && WAIVABLE.has(verdict.reason)) {
+      if (!verdict.ok && !NOT_WAIVABLE.has(verdict.reason)) {
         waived = ledger.takeKnownRedWaiver?.(group.id);
         if (waived !== undefined) {
           const summary = `人工放行的已知紅燈（${verdict.reason}）：${waived}`;
@@ -972,7 +991,11 @@ export class GroupRunner {
       // 開著＝使用者已經表明「一般改動不必問我」，這時唯一還值得攔一次的，
       // 是**做錯了救不回來**的那種——而那要看得懂這個 repo 才判得出來，
       // 不是比對一組寫死的檔案路徑（見 merge-risk-judge.ts）。
-      const risk = this.deps.allowLocalMerge
+      // 現拿：控制台關掉自動合併要立刻生效（那是不可逆的外部副作用）
+      const canMerge = typeof this.deps.allowLocalMerge === 'function'
+        ? this.deps.allowLocalMerge()
+        : this.deps.allowLocalMerge;
+      const risk = canMerge
         ? await this.judgeMergeRisk(group, proj, wtPath, details, tasks)
         : { needsHuman: true as const, risks: [{ what: '自動合併未開啟', why: '每個 PR 都由人審查' }] };
       ledger.logEvent(
@@ -1068,7 +1091,7 @@ export class GroupRunner {
     if (!verifiedSha) return undefined;
     const ref = `${proj.remote ?? 'origin'}/${proj.baseBranch}`;
     const fetched = await withFetchLock(proj.repoPath, () =>
-      this.git(proj.repoPath, ['fetch', '--quiet', proj.remote ?? 'origin', proj.baseBranch]));
+      this.git(proj.repoPath, ['fetch', '--quiet', proj.remote ?? 'origin', proj.baseBranch], { timeoutMs: FETCH_TIMEOUT_MS }));
     if (fetched.exitCode !== 0) return undefined; // 取不到最新狀態就不亂擋（守衛自己已標但書）
     const now = (await this.git(proj.repoPath, ['rev-parse', ref])).stdout.trim();
     if (!now || now === verifiedSha) return undefined;

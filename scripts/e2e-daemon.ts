@@ -580,7 +580,6 @@ async function main(): Promise<void> {
       checkRecorder: createCheckRecorder({ ledger, log }),
       ...(ctx ? { checkContext: ctx } : {}),
     }),
-    progressRounds: 3,
     notifier: gateway,
     allowLocalMerge: true, // 只動 /tmp 的 fixture
     prManager: fakePr,

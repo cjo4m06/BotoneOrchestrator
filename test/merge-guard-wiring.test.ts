@@ -133,3 +133,36 @@ test('MergeProject 帶主 clone 路徑（不然工廠無從知道 .env 該去哪
   assert.match(src, /sourceRepoPath: string;/);
   assert.match(codeOf('src/main.ts'), /sourceRepoPath: runtime\.repoPath/);
 });
+
+// ── 調度器丟進工作區的檔案，不可以被算成「這一群改了東西」 ──
+
+test('prepareLocalConfig 帶進去的檔案會自動排除，不會被 git 當成未追蹤變更', async () => {
+  const { execa } = await import('execa');
+  const { prepareLocalConfig } = await import('../src/core/local-config.js');
+  const main = mkdtempSync(join(tmpdir(), 'orch-src-'));
+  const wt = mkdtempSync(join(tmpdir(), 'orch-wt-'));
+  try {
+    // 一個**沒有 .gitignore** 的 repo——那正是鏈條會完整的情況（data/test/repos/demo2 就是）
+    await execa('git', ['-C', main, 'init', '-q']);
+    await execa('git', ['-C', main, 'config', 'user.email', 't@t'], { reject: false });
+    await execa('git', ['-C', main, 'config', 'user.name', 't'], { reject: false });
+    writeFileSync(join(main, 'README.md'), '# x\n');
+    await execa('git', ['-C', main, 'add', '-A']);
+    await execa('git', ['-C', main, 'commit', '-qm', 'init']);
+    // 被 gitignore 不到的本機設定檔
+    writeFileSync(join(main, '.env'), 'SECRET=xyz\n');
+
+    rmSync(wt, { recursive: true, force: true });
+    await execa('git', ['-C', main, 'worktree', 'add', '-q', '--detach', wt]);
+
+    const copied = await prepareLocalConfig(main, wt, createSilentLogger());
+    assert.ok(copied.includes('.env'), '.env 要帶進去（它沒有版控對照物）');
+
+    const status = await execa('git', ['-C', wt, 'status', '--porcelain']);
+    assert.equal(status.stdout.trim(), '',
+      '調度器自己丟進去的檔案被算成未追蹤變更 ⇒「diff 非空」的 DoD 在 agent 一行沒改時就綠，而且會被 git add -A 吃進 PR');
+  } finally {
+    await (await import('execa')).execa('git', ['-C', main, 'worktree', 'remove', '--force', wt], { reject: false });
+    for (const d of [main, wt]) rmSync(d, { recursive: true, force: true });
+  }
+});

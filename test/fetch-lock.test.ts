@@ -140,3 +140,45 @@ test('所有 git fetch 呼叫點都在鎖裡面', () => {
     }
   }
 });
+
+// ── 看門狗：卡住的 fetch 不可以把整個佇列凍住 ──
+//
+// 五個 fetch 呼叫點裡先前只有 base-freshness 給了 git 指令逾時。而這把鎖是序列佇列，
+// 所以另外四個之中隨便一個卡住，**連唯一有逾時的那個也會卡在排隊階段**（計時器還沒開始）。
+// 症狀難認：控制台顯示「執行中」、心跳照打，orchestrator 只用 log.debug 記「本輪跳過」。
+
+test('卡住的 fetch 會被看門狗放掉鎖，不會無限持有', async () => {
+  // 刻意不用 assert.rejects：看門狗若被拿掉，那個寫法會**掛住**而不是紅——
+  // 掛住的測試在 CI 上看起來像逾時，不像「這個保護不見了」。用 race 讓它明確地紅。
+  const outcome = await Promise.race([
+    withFetchLock('/repo-watchdog', () => new Promise(() => {}), { watchdogMs: 60 })
+      .then(() => 'resolved', (e: Error) => (/沒有回應/.test(e.message) ? 'watchdog' : `其他錯誤：${e.message}`)),
+    new Promise<string>((r) => setTimeout(() => r('掛住了'), 3_000).unref?.()),
+  ]);
+  assert.equal(outcome, 'watchdog', '卡住的 fetch 必須被看門狗放掉，否則整個佇列會凍住');
+});
+
+test('卡住之後，後面排隊的照樣跑得到（先前會永遠排隊）', async () => {
+  const hung = withFetchLock('/repo-queue', () => new Promise(() => {}), { watchdogMs: 60 }).catch(() => 'timeout');
+  const next = await Promise.race([
+    withFetchLock('/repo-queue', async () => 'ok', { watchdogMs: 1_000 }),
+    new Promise<string>((r) => setTimeout(() => r('還在排隊'), 3_000).unref?.()),
+  ]);
+  assert.equal(await hung, 'timeout');
+  assert.equal(next, 'ok', '前一個卡住就讓後面永遠排不到 ＝ 這個 repo 的合併全部凍住');
+});
+
+test('正常完成不受影響，也不會留下撐住事件迴圈的計時器', async () => {
+  assert.equal(await withFetchLock('/repo-normal', async () => 42), 42);
+});
+
+test('每個 withFetchLock 呼叫點都要給 git 指令逾時（看門狗只放得掉鎖，殺不掉行程）', () => {
+  const files = ['src/main.ts', 'src/core/group-runner.ts', 'src/pr/pr-manager.ts', 'src/git/base-freshness.ts'];
+  for (const f of files) {
+    const code = readFileSync(f, 'utf8')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    for (const call of code.match(/withFetchLock\([\s\S]{0,320}?\)\);/g) ?? []) {
+      assert.match(call, /timeoutMs|timeout:/, `${f} 有一個 withFetchLock 呼叫沒給 git 指令逾時：\n${call}`);
+    }
+  }
+});

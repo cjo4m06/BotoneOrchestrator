@@ -223,6 +223,14 @@ export type MergeVerdict =
       ok: false;
       // precondition_failed：守衛的前置條件不成立（如分支不存在、checkout 失敗）。
       // 必須與其他 reason 區分——它代表「這次根本沒驗到」，不可當成驗證通過。
+      /**
+       * 合併守衛的判決理由。
+       *
+       * **attempt() 只產得出前三個**；`post_merge_red` 只有 postMergeCheck 會回
+       * （daemon 沒有接線，見 MergeGuardLike 的說明），`tests_red` 全庫沒有產生端。
+       * 保留是為了不動既有的持久化資料，但**不要拿它們寫判斷式**——
+       * group-runner 的人工放行就是這樣壞掉的：白名單只認這兩個，於是永遠不成立。
+       */
       reason: 'precondition_failed' | 'code_conflict' | 'semantic_drift' | 'tests_red' | 'post_merge_red';
       detail: string;
       /**

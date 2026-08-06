@@ -39,6 +39,16 @@ export interface RegisteredProject {
 export type ProjectFactory = (p: ProjectConfig) => Promise<Omit<RegisteredProject, 'fingerprint'> | undefined>;
 
 /**
+ * 設定變了但**連線不必重建**時，把新設定套進既有 runtime。
+ *
+ * 為什麼需要：指紋只涵蓋連線相關欄位，其餘（驗收指令、指令逾時、靜置分鐘數）
+ * 改了之後 registry 原本只換 `config`，**runtime 原封不動**——而讀取端拿的是
+ * `runtimeOf()`，也就是 runtime。於是控制台改了驗收指令或逾時，畫面顯示成功、
+ * DB 也寫進去了，daemon 卻永遠用開機那份。未注入 → 維持舊行為（只換 config）。
+ */
+export type ProjectRuntimeUpdater = (runtime: ProjectRuntime, p: ProjectConfig) => void;
+
+/**
  * 設定指紋。只涵蓋「改了就必須重建連線／runtime」的欄位——
  * 把整份設定 hash 進去的話，改一個無關的欄位（例如 visual 的截圖門檻）
  * 也會把 MCP 連線砍掉重連，正在跑的輪詢會無謂地中斷。
@@ -56,7 +66,11 @@ export function projectFingerprint(p: ProjectConfig): string {
 export class ProjectRegistry {
   private items = new Map<string, RegisteredProject>();
 
-  constructor(private factory: ProjectFactory, private log: Logger) {}
+  constructor(
+    private factory: ProjectFactory,
+    private log: Logger,
+    private applyConfig?: ProjectRuntimeUpdater,
+  ) {}
 
   // ── 讀取端（每次都現拿，不要留快照） ──
 
@@ -130,6 +144,8 @@ export class ProjectRegistry {
         // 會讓 log 每 15 秒噴一次「專案清單已更新」——真正的變更就淹沒在裡面了。
         if (JSON.stringify(existing.config) !== JSON.stringify(cfg)) {
           existing.config = cfg;
+          // **runtime 也要跟著換**：讀取端拿的是 runtime，只換 config 等於沒改
+          this.applyConfig?.(existing.runtime, cfg);
           updated.push(id);
         }
         continue;

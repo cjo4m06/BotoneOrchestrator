@@ -230,6 +230,15 @@ export class PlanAgent {
             // **五個 query() 都要有這一行。** 唯讀角色的指令白名單含 echo，
             // 沒有這行的角色一句 `echo $GH_TOKEN` 就會把真 token 印進判定文字與 ledger。
             env: buildAgentEnv(process.env, this.deps.envOverrides?.() ?? {}),
+            // **中止訊號要真的傳進 SDK。**
+            //
+            // signal 一路從 SIGTERM 傳到 runQuery 的參數，然後 body 一次都沒用到它——
+            // 唯一的檢查在每次嘗試**開始前**（第 179 行）。於是 daemon 收到 SIGTERM 時，
+            // 正在跑的那次規劃不會被中止：claude 子行程與它底下的工具子行程變成孤兒
+            // 繼續跑、繼續燒 token，而它的 cwd 是**使用者真正的主 clone**。
+            // 引入這段的 commit 訊息宣稱「signal 一路串到 SDK 的 abortController」，
+            // diff 卻停在參數——所以型別上要看得見它（PlanQueryFn 帶 options）。
+            ...(signal ? { abortController: abortControllerOf(signal) } : {}),
             permissionMode: 'acceptEdits', // 邊界由下面的 hook 守，這裡只為避免非互動環境卡在權限詢問
             ...(Object.keys(servers).length > 0 ? { mcpServers: servers as never } : {}),
             allowedTools: PLAN_TOOLS,

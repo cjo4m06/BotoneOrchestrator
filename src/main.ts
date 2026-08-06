@@ -41,7 +41,7 @@ import { PlanAgent, type InFlightGroup } from './core/plan-agent.js';
 import { MergeRiskJudge } from './core/merge-risk-judge.js';
 import { DriftJudge } from './pr/drift-judge.js';
 import { hasClaudeAuth } from './worker/reviewer.js';
-import { withFetchLock } from './git/fetch-lock.js';
+import { withFetchLock, FETCH_TIMEOUT_MS } from './git/fetch-lock.js';
 import { InboundRouter, type CompleteTaskFn } from './notify/notifier.js';
 import { createNotifier, slackHandlesOf, type HumanGateway } from './slack/gateway.js';
 import { AppHome } from './slack/app-home.js';
@@ -374,7 +374,9 @@ export interface GitOut {
   /** 失敗訊息（可省略；只用於 log，判定一律看 exitCode）。 */
   stderr?: string;
 }
-export type GitRun = (repoPath: string, args: string[]) => Promise<GitOut>;
+export type GitRun = (repoPath: string, args: string[], opts?: { timeoutMs?: number }) => Promise<GitOut>;
+
+
 
 /**
  * 這個 repo 有沒有指定的 remote。
@@ -424,9 +426,13 @@ export function inFlightGroupsOf(
   return out;
 }
 
-const defaultGitRun: GitRun = async (repoPath, args) => {
+const defaultGitRun: GitRun = async (repoPath, args, opts) => {
   try {
-    const r = await execa('git', ['-C', repoPath, ...args], { reject: false });
+    const r = await execa('git', ['-C', repoPath, ...args], {
+      reject: false,
+      // 逾時**必須傳下去**：execa 的預設是 0（停用），而半開連線不會自己結束
+      ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+    });
     return { exitCode: r.exitCode ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
   } catch {
     // git 不存在 / 目錄不存在都不該讓 daemon 起不來，交給後續的退回鏈
@@ -740,7 +746,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {
-      const f = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', remote, baseBranch]));
+      const f = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', remote, baseBranch], { timeoutMs: FETCH_TIMEOUT_MS }));
       if (f.exitCode !== 0) return undefined; // 取不到最新狀態就不亂擋
       const r = await git(repoPath, ['rev-parse', `${remote}/${baseBranch}`]);
       const sha = r.stdout.trim();
@@ -750,7 +756,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       // 沒有 remote 的本地 repo 不算錯誤（Merge Guard 會自己標「但書」）
       const remotes = await git(repoPath, ['remote']);
       if (remotes.exitCode !== 0 || !remotes.stdout.split('\n').map((s) => s.trim()).includes('origin')) return;
-      const r = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', 'origin', baseBranch]));
+      const r = await withFetchLock(repoPath, () => git(repoPath, ['fetch', '--quiet', 'origin', baseBranch], { timeoutMs: FETCH_TIMEOUT_MS }));
       if (r.exitCode !== 0) throw new Error(`git fetch origin ${baseBranch} 失敗：${(r.stderr || r.stdout).trim()}`);
     },
     // 合併工作區用完要放掉群組分支（見 releaseMergeWorktreeBranch）
@@ -1298,11 +1304,17 @@ export interface PipelineInput {
   agentEnv?: () => Record<string, string | undefined>;
   /** 花費上限檢查（現算）。 */
   budget?: () => BudgetVerdict;
+  /**
+   * 控制台設定的**現拿**入口（`() => store.settings()`）。
+   * 未給 → 用 config 的開機快照，行為與加這個欄位之前一致。
+   */
+  liveSettings?: () => OrchestratorConfig;
   /** 合併管線（createMergePipeline 的結果）。未給 ⇒ 不會有任何合併動作。守衛在這裡補。 */
   merge?: MergePipelineParts;
   /** 這個 profile 的資料根目錄；worktree 與瀏覽器暫存都建在它底下。 */
   dataRoot?: string;
-  allowLocalMerge: boolean;
+  /** 系統可不可以自己合併。**傳函式才會熱重載**（控制台關掉要立刻停）。 */
+  allowLocalMerge: boolean | (() => boolean);
   /** 共用的審查意見暫存區；未給則自建（見 buildPipeline 內的說明）。 */
   feedback?: ReviewFeedbackStore;
   worktreeBase?: string;
@@ -1346,6 +1358,8 @@ export function buildPipeline(input: PipelineInput): Pipeline {
   // 各角色的模型（別名，不帶版本號 → 永遠是最新版）。未設就用 SDK 預設。
   // `?? {}`：schema 的 prefault 保證正式路徑一定有，但呼叫端手動組 config 時可能沒有
   const models = config.orchestrator.agent.models ?? {};
+  /** 控制台可改的設定：**每次用時才取**。未注入 → 退回開機快照（既有呼叫端不受影響）。 */
+  const liveSettings = input.liveSettings ?? (() => config.orchestrator);
   if (!hasClaudeAuth()) {
     log.error(
       'Claude 認證不可用：reviewer 與分群／介面／飄移／風險判斷者**全部不會接線**，'
@@ -1421,15 +1435,19 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     // 下次加角色時漏掉會很明顯。
     recordCheck: (i) => createCheckRecorder({ ledger, log }).record(i),
     // 指令逾時：全域預設在這裡注入，每專案覆寫走 verifierConfigOf 的 timeoutMs
+    // **現拿**：makeVerifier 每次用時才呼叫，所以這裡讀 liveSettings 就等於熱重載。
+    // 先前吃的是開機快照——控制台把指令逾時從 600 改成 1800，daemon 仍用 600 判紅，
+    // agent 收到「指令逾時」後只會一直白改程式去追一個時間問題。
     makeVerifier: (ctx?: CheckContext) => new Verifier(log, {
-      ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),
+      ...verifierDepsOf(liveSettings(), log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),
       checkRecorder: createCheckRecorder({ ledger, log, outputRoot: checkOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT) }),
       ...(ctx ? { checkContext: ctx } : {}),
     }),
-    progressRounds: config.orchestrator.noProgress.rounds,
     notifier: gateway,
     // 合併會動到 base 分支，安全優先：必須明確開啟
-    allowLocalMerge: input.allowLocalMerge,
+    // **現拿**：這是唯一會產生不可逆外部副作用的開關。先前是開機快照——
+    // 使用者在控制台關掉自動合併想踩煞車，UI 說已儲存，daemon 照舊自動合併。
+    allowLocalMerge: () => (typeof input.allowLocalMerge === 'function' ? input.allowLocalMerge() : input.allowLocalMerge),
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
     ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
@@ -1785,7 +1803,13 @@ export async function main(): Promise<void> {
     return { config: p, client, source: pollSourceOf(store.settings(), p, client), runtime };
   };
 
-  const registry = new ProjectRegistry(buildProject, log);
+  // 設定變了但連線不必重建時，把新設定套進**既有 runtime**。
+  // 讀取端拿的是 runtime，只換 config 的話：控制台改了驗收指令或指令逾時，
+  // 畫面顯示成功、DB 也寫進去了，daemon 卻永遠用開機那份（實際狀態）。
+  // baseBranch 不在這裡重算——它要問 git，而它本來就在指紋裡（改了會整個重建）。
+  const registry = new ProjectRegistry(buildProject, log, (runtime, cfg) => {
+    runtime.verifierConfig = verifierConfigOf(cfg);
+  });
   await registry.sync(config.projects);
 
   if (registry.size() === 0) {
@@ -1918,7 +1942,11 @@ export async function main(): Promise<void> {
       spentSince: (since) => ledger.costSummary(since),
       now: Date.now(),
     }),
-    allowLocalMerge: actions.allowLocalMerge,
+    // 現拿：控制台關掉自動合併要立刻停（那是不可逆的外部副作用）。
+    // 環境變數覆寫仍然優先——它是「臨時強制關掉」的手段。
+    allowLocalMerge: () => externalActionFlags(store.settings(), process.env).allowLocalMerge,
+    // 控制台改指令逾時／其他設定，下一次用到就生效
+    liveSettings: () => store.settings(),
     ...(merge ? { merge } : {}),
   });
 
