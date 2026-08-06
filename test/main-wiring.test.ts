@@ -32,7 +32,6 @@ import {
   resolveFlag,
   reconcilerDepsOf,
   scheduleForceExit,
-  screenshotRootOf,
   verifierConfigOf,
   verifierDepsOf,
   waitForInFlight,
@@ -63,7 +62,6 @@ function proj(over: Partial<ProjectConfig> = {}): ProjectConfig {
     repoPath: '/tmp/web',
     mcp: { transport: 'stdio', command: 'node' },
     commands: {},
-    visual: { routes: [], when: 'auto', categories: ['design'], screenshotRoot: './data/screenshots' },
     ...over,
   };
 }
@@ -82,12 +80,6 @@ test('verifierConfigOf 會映射 commands.typecheck（否則 DoD 第一關在生
 
 test('未設 commands.typecheck 時該關卡為 undefined（整段跳過，而非假綠燈）', () => {
   assert.equal(verifierConfigOf(proj()).typecheck, undefined);
-});
-
-test('未設 devServer → visual 為 undefined（不啟瀏覽器）', () => {
-  assert.equal(verifierConfigOf(proj()).visual, undefined);
-  const withDev = verifierConfigOf(proj({ commands: { devServer: 'npm run dev' } }));
-  assert.equal(withDev.visual?.devServer, 'npm run dev');
 });
 
 // ── Poller 的 mine 過濾 ──
@@ -696,19 +688,6 @@ test('verifierDepsOf：全域 commandTimeoutSec 會變成 Verifier 的 commandTi
 
 // ── 截圖保留策略的根目錄（沒接 = 截圖永不清理，磁碟無限成長） ──
 
-test('screenshotRootOf：從專案設定取得截圖根目錄', () => {
-  assert.equal(screenshotRootOf([proj()]), './data/screenshots');
-  assert.equal(screenshotRootOf([]), undefined, '沒有專案就沒有東西要清');
-});
-
-test('screenshotRootOf：多個不同根目錄時取第一個並警告（其餘不會被清）', () => {
-  const rec = createRecordingLogger();
-  const a = proj({ visual: { ...proj().visual, screenshotRoot: './data/shots-a' } });
-  const b = proj({ visual: { ...proj().visual, screenshotRoot: './data/shots-b' } });
-  assert.equal(screenshotRootOf([a, b], rec.logger), './data/shots-a');
-  assert.ok(rec.messages('warn').some((m) => m.includes('截圖根目錄')));
-});
-
 // ── 多來源 MCP 聚合：查詢失敗必須可被對帳看見 ──
 
 function briefs(...ids: string[]): TaskBrief[] {
@@ -1312,45 +1291,55 @@ describe('各角色的模型設定要真的接到 agent 上', () => {
 });
 
 /**
- * **兩個 Merge Guard 呼叫點的選項要一起給。**
+ * **依賴不再由程式帶進工作區。**
  *
- * 實跑（2026-08-05，g_da31b3e8c2ac）：群組執行那一側的守衛 13:39 通過 →
- * 人 13:42 核准 → 核准後那次在 13:45 重跑，驗收樹**沒有 node_modules**：
+ * ── 這裡原本守的是什麼 ──
+ *
+ * 實跑（2026-08-05，g_da31b3e8c2ac）：群組執行那一側的守衛 13:39 通過 → 人 13:42 核准
+ * → 核准後那次在 13:45 重跑，驗收樹**沒有 node_modules**：
  *
  *   Cannot find package 'tsx' imported from /tmp/orch-merge-nhveOH/apps/web/
  *
- * 於是判 semantic_drift、憑證作廢、退回 changes_requested，並把 42 則
- * 「build 紅了」的意見回灌給 agent——而它改不動一個不存在的依賴問題。
- * **任何需要建置的專案都合併不了。**
+ * 於是判 semantic_drift、憑證作廢、退回 changes_requested，42 則「build 紅了」回灌給
+ * 改不動它的 agent。**任何需要建置的專案都合併不了。** 當時的修法是替兩個守衛呼叫點
+ * 都補上 prepareTree，把主 clone 的 node_modules 複製進拋棄式樹。
  *
- * 根因：第 10 片把守衛從「在 worktree 裡 rebase」改成「在 /tmp 的拋棄式樹上驗」，
- * 樹不再自帶依賴。群組執行那一側加了 prepareTree，`main.ts` 這個共用實例沒加——
- * `new MergeGuard(verifier, log)`，一個選項都沒給。
+ * ── 為什麼那個修法本身是錯的 ──
+ *
+ * 1. 它寫死 `node_modules`。對 Laravel（vendor/）、Python（.venv/）一律不成立，
+ *    而症狀就是上面那種「看起來像程式碼壞掉」的紅燈。
+ * 2. **就算清單猜對，複製來的內容也是錯的。** 主 clone 的依賴對應它自己那顆 lockfile；
+ *    驗收樹是別的 commit、agent 可能剛改過 package.json——複製過去就是不相符的版本，
+ *    而且看起來一切正常。這件事本身做不出正確結果。
+ *
+ * 現在：agent 自己的工作區自己準備，沒有 agent 的驗收樹則由**專案自己的指令**負責
+ *（`npm ci && npm run build`）——那才會裝到那棵樹自己那顆 lockfile 的版本。
+ *
+ * 所以這幾條改成守「不要再長回來」，以及「兩個沒有程式幫忙的地方都有被告知」。
  */
-describe('Merge Guard 的兩個呼叫點', () => {
-  it('核准後那次的守衛也要有 prepareTree（沒有的話驗收樹沒依賴，build 必紅）', () => {
-    const src = readFileSync('src/main.ts', 'utf8');
-    // 用 `?? new MergeGuard(` 當錨點：單純 indexOf('new MergeGuard(') 會先命中
-    // 上方註解裡引用的那一句，然後把真正的建構切在 slice 外面（這條測試自己踩過）。
-    const i = src.indexOf('?? new MergeGuard(');
-    assert.ok(i >= 0, 'main 裡找不到 MergeGuard 的建構');
-    assert.match(
-      src.slice(i, i + 500),
-      /prepareTree/,
-      '這是第二個呼叫點（核准之後那次）。少了它，驗收樹沒有 node_modules，'
-      + '任何要 build 的專案都會被判 semantic_drift 而永遠合併不了',
-    );
+describe('依賴由誰準備', () => {
+  it('程式不再複製依賴進工作區（清單猜不對，而且複製來的版本也不對）', () => {
+    // 只看程式碼——註解裡提到那兩個名字是在解釋「為什麼拆掉」，不算數
+    const codeOf = (f: string): string =>
+      readFileSync(f, 'utf8').split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    for (const f of ['src/main.ts', 'src/core/group-runner.ts', 'src/pr/merge-guard.ts']) {
+      assert.doesNotMatch(codeOf(f), /prepareNodeModules|prepareLocalFiles/, `${f} 又開始複製依賴了`);
+    }
   });
 
-  it('群組執行那一側也有（兩邊都要，漏一邊就是一半的專案會壞）', () => {
-    assert.match(readFileSync('src/core/group-runner.ts', 'utf8'), /guardOptions\.prepareTree\s*=/);
+  it('agent 被告知工作區是空的（否則它會以為依賴都在，直接跑 build）', () => {
+    const src = readFileSync('src/worker/agent-runtime.ts', 'utf8');
+    assert.match(src, /你的工作區是全新的 worktree/);
+    assert.match(src, /要跑建置或測試就自己先裝起來/);
   });
 
-  it('prepareTree 收得到 repoPath——共用實例建構時不知道會驗到哪個專案', () => {
-    assert.match(
-      readFileSync('src/pr/merge-guard.ts', 'utf8'),
-      /prepareTree\?:\s*\(treePath: string, repoPath: string\)/,
-      '只收 treePath 的話，全 daemon 共用的那個守衛實例就不知道要從哪裡帶 node_modules',
-    );
+  /**
+   * 合併守衛那棵樹**沒有 agent**——這是整條路上唯一沒有人能自己補救的地方，
+   * 所以使用者必須在填指令的當下就知道。看不到這句話，重演的就是 g_da31b3e8c2ac。
+   */
+  it('控制台講明「需要安裝的專案要寫進指令本身」', () => {
+    const ui = readFileSync('src/console/ui.html', 'utf8');
+    assert.match(ui, /全新的 worktree/);
+    assert.match(ui, /npm ci/, '要給得出具體寫法，不能只說「請自行處理」');
   });
 });

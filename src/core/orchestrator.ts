@@ -1348,21 +1348,6 @@ export class Orchestrator {
       base: proj.baseBranch,
       verifierConfig: proj.verifierConfig,
       taskTitles: tasksOfGroup.map((t) => t.title),
-      // **這是第二個 Merge Guard 呼叫點**（核准後的那次）。任務資訊同樣不能漏——
-      // 少了 baseRef，這一關的介面判斷者就沒有唯讀 git，分不出「這次弄的」與
-      // 「本來就有的」，會把既有瑕疵算到這次頭上而擋掉一個已經核准的合併。
-      // 先前只修了 group-runner 那個呼叫點，這個漏掉（實跑撞到）。
-      ...(head
-        ? {
-            task: {
-              id: head.id,
-              category: head.category,
-              title: head.title,
-              description: head.description,
-              baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,
-            },
-          }
-        : {}),
     });
     // **合併工作區用完要把分支放開。**
     //

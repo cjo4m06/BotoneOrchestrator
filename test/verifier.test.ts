@@ -4,13 +4,9 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { relative, isAbsolute } from 'node:path';
 import {
   Verifier,
-  decideVisualGate,
-  resolveVisualDirs,
-  taskHintOf,
   DEFAULT_COMMAND_TIMEOUT_MS,
   evaluateGateCommandRedline,
   type VerifierDeps,
-  type VisualGateConfig,
 } from '../src/worker/verifier.js';
 import type { CheckResult } from '../src/types.js';
 import { createSilentLogger, createTmpDir, createTmpGitRepo, type TmpDir, type TmpGitRepo } from './helpers/index.js';
@@ -417,36 +413,18 @@ describe('Verifier — 關卡指令的部署紅線', () => {
 });
 
 /**
- * 「視覺關卡整合」與「截圖目錄」整段退場（第 15 片）。
+ * 「視覺關卡」整段退場，**連設定殼子一起**（第 15 片拆量測堆疊，2026-08-06 拆設定）。
  *
- * 那套量測堆疊（起 dev server、逐斷點截圖、算像素差、跑版面稽核、再交給 UiJudge 判斷）
- * 已由**審查者自己開瀏覽器去看**取代：它拿唯讀的瀏覽器工具、自己導頁、自己判斷，
- * 而且放行時必須填 uiChecked，空白會被退回（見 test/reviewer.test.ts）。
+ * 量測那套（起 dev server、逐斷點截圖、算像素差、版面稽核、UiJudge）已由
+ * **審查者自己開瀏覽器去看**取代：放行時必須填 uiChecked，空白會被退回
+ *（見 test/reviewer.test.ts）。
  *
- * 保留下來的是 decideVisualGate 與 resolveVisualDirs——那兩個講的是
- * 「這個專案的畫面在哪裡、截圖該落在哪」，審查者需要它們。
+ * 當時留下 decideVisualGate / resolveVisualDirs / taskHintOf，理由是「審查者需要
+ * 這些設定」。**那條線從來沒接上**——decideVisualGate 在正式程式碼裡一次都沒被呼叫，
+ * reviewer.ts 裡 routes／devServer 一個字都沒有。而且那個設定本身問不出答案：
+ * 控制台寫著「只填這次改動會影響到的頁面」，但它是**專案層**設定，
+ * 不可能知道下一張卡要改什麼。所以整組刪掉。
  */
-
-describe('taskHintOf', () => {
-  it('組出完整的 hint，baseRef 一定有', () => {
-    const h = taskHintOf(
-      { id: 'T-1', category: 'feature', title: '加按鈕', description: '描述' },
-      { baseBranch: 'main' },
-    );
-    assert.deepEqual(h, {
-      id: 'T-1', category: 'feature', title: '加按鈕', description: '描述', baseRef: 'origin/main',
-    });
-  });
-
-  it('自訂 remote', () => {
-    assert.equal(taskHintOf({ id: 'T-1' }, { baseBranch: 'develop', remote: 'upstream' }).baseRef, 'upstream/develop');
-  });
-
-  it('缺少的可選欄位不會變成 undefined 混進去', () => {
-    const h = taskHintOf({ id: 'T-1' }, { baseBranch: 'main' });
-    assert.deepEqual(Object.keys(h).sort(), ['baseRef', 'id']);
-  });
-});
 
 /**
  * DoD 指令也要能被中止。daemon 收到 SIGTERM 時，一個跑了半小時的 `npm test`

@@ -12,12 +12,12 @@ import type { MergeRiskVerdict } from './merge-risk-judge.js';
 import { gitDiffHash } from '../git/status.js';
 import type { CheckContext } from '../worker/check-recorder.js';
 import type { AgentSummaryCapture } from '../worker/agent-runtime.js';
+import { scratchDirFor } from '../worker/agent-runtime.js';
 import type { CheckRunInput } from '../store/ledger.js';
 import { openMergeApprovalHandoff, openStuckGroupHandoff } from './handoff.js';
 import { resolveBaseFreshness } from '../git/base-freshness.js';
 import { syncTaskCard } from './card-status.js';
-import { gitHeadRef, taskHintOf } from '../worker/verifier.js';
-import { resolveVisualDirs } from '../worker/verifier.js';
+import { gitHeadRef } from '../worker/verifier.js';
 import type { AgentLike, McpTaskClient, Notifier, ReviewerLike, VerifierLike, TaskCardStatus } from '../contracts.js';
 import type { IterateInput, IterateResult } from '../worker/agent-runtime.js';
 import type { NoChangePolicy, TaskOutcome } from '../worker/worker.js';
@@ -59,11 +59,6 @@ export interface ProjectRuntime {
 
   /** 取最新 base 的 remote 名稱（Merge Guard 用）。未給 → 'origin'。 */
   remote?: string;
-  /**
-   * 要從主 clone 帶進 worktree 的本機設定檔（被 gitignore、所以 worktree 拿不到的那些）。
-   * 未給 → DEFAULT_LOCAL_FILES。給空陣列 → 不帶任何檔案（有敏感內容的專案這樣設）。
-   */
-  localFiles?: string[];
 }
 
 // ── 可注入的協作者（正式環境用預設實作；測試注入假件，不碰真實 repo） ──
@@ -209,9 +204,10 @@ export interface GroupRunnerDeps {
   /** 取本次變更的檔案清單與統計（政策判定用）。預設 policy/readDiffStat。 */
   readDiff?: (cwd: string, baseRef: string) => Promise<PolicyInput>;
   /** 取某任務的截圖路徑（PR 內文用）。預設掃 Verifier 的截圖目錄。 */
-  screenshotsFor?: (input: { taskId: string; cwd: string; config: VerifierConfig }) => string[];
+  screenshotsFor?: (input: { taskId: string; browserOutputRoot?: string }) => string[];
+  /** agent 暫存／截圖的根目錄（＝ AgentRuntime 的 browserOutputRoot）。未給 → PR 不附截圖。 */
+  browserOutputRoot?: string;
   /** node_modules 準備策略所用的環境（測試注入假件）。 */
-  nodeModulesEnv?: NodeModulesEnv;
   /**
    * 共用的審查意見暫存區。**可選**：未注入 → 每個群組都當成全新群組（既有行為）。
    * 注入時必須與 Orchestrator 用**同一個實例**，否則 orchestrator 存的意見這裡讀不到
@@ -301,139 +297,24 @@ export function shouldRequeueGroup(
   return tasks.some((t) => t.state !== 'done');
 }
 
-// ── worktree 的 node_modules ──
-
-/** node_modules 準備結果：cow=寫時複製、symlink=連回主 clone（有污染風險）。 */
-export type NodeModulesStrategy = 'none' | 'reused' | 'cow' | 'symlink';
-
-/** 準備 node_modules 需要的環境操作（測試注入假件，不碰真實檔案系統）。 */
-export interface NodeModulesEnv {
-  exists(path: string): boolean;
-  /** 寫時複製整個目錄（macOS APFS clonefile）。成功 true；不支援/失敗 false。 */
-  cloneDir(src: string, dst: string): Promise<boolean>;
-  symlink(src: string, dst: string): void;
-  removeDir(path: string): void;
-  platform: NodeJS.Platform;
-}
-
-export const defaultNodeModulesEnv: NodeModulesEnv = {
-  exists: (p) => existsSync(p),
-  async cloneDir(src, dst) {
-    // -c = clonefile（APFS 寫時複製）：不實際搬資料，幾乎不花時間也不佔空間。
-    // 非 APFS / 其他平台會直接失敗，由呼叫端退回 symlink。
-    const r = await execa('cp', ['-Rc', src, dst], { reject: false });
-    return r.exitCode === 0;
-  },
-  symlink: (src, dst) => symlinkSync(src, dst, 'dir'),
-  removeDir: (p) => rmSync(p, { recursive: true, force: true }),
-  platform: process.platform,
-};
-
-/**
- * 把依賴帶進 worktree（worktree 不含未追蹤的 node_modules）。
- *
- * 為什麼不直接 symlink：symlink 會讓 agent 在 worktree 執行 `npm install`
- * 直接寫進**使用者真實 clone** 的 node_modules（升版、刪套件都會生效），這是破壞使用者環境。
- * 為什麼不完整複製：node_modules 動輒數萬檔案，每個群複製一份太慢。
- * 折衷：macOS APFS 的 clonefile（`cp -Rc`）——寫時複製，建立成本接近 symlink，
- * 但 agent 之後的寫入只會落在副本上。clonefile 不可用時才退回 symlink，並**明確警告風險**。
- */
-/**
- * 本機設定檔的預設清單。
- *
- * 選這幾個是因為它們都是**開發環境設定**、而且慣例上被 gitignore——正因為被 ignore，
- * `git worktree add` 不會帶過去，於是 worktree 變成一個「跑不起來的專案」。
- */
-export const DEFAULT_LOCAL_FILES = ['.env', '.env.local', '.env.development', '.npmrc'];
-
-/**
- * 把主 clone 的本機設定檔帶進 worktree。
- *
- * 為什麼需要：一個 worktree 應該是**能動的開發環境**——人類開發者 clone 完之後有什麼，
- * 它就該有什麼。相依套件已經用 clonefile 帶進來了，但本機設定檔沒有。
- * 少了它，dev server 起得來、app 卻掛不起來（例：Firebase 少了 apiKey 會整個不掛載），
- * 於是截圖是空白頁、視覺驗證變成在驗證一個根本沒渲染的畫面。
- *
- * 這不只影響視覺驗證——寫程式的 agent 想自己跑起來看，一樣會撞到。
- *
- * 安全性：這些是**開發用設定**（例如 VITE_ 前綴的值本來就會被打包進瀏覽器），
- * 不是伺服器密鑰；而且 agent 本來就能用 Bash 讀主 clone 的同一份檔案。
- * 真正的防線在別處：GitHub token 從 agent 環境整個剝除、部署指令一律擋下、
- * 保護路徑不可刪改。真有敏感內容的專案，就在設定裡不列那個檔案。
- *
- * 檔案不存在就跳過（多數專案不會四個都有），複製而非 symlink——
- * symlink 會讓 agent 的寫入直接改到使用者的主 clone。
- */
-export async function prepareLocalFiles(
-  repoPath: string,
-  wtPath: string,
-  log: Logger,
-  files: string[] = DEFAULT_LOCAL_FILES,
-  io: { exists: (p: string) => boolean; copy: (a: string, b: string) => void } = {
-    exists: existsSync,
-    copy: (a, b) => copyFileSync(a, b),
-  },
-): Promise<string[]> {
-  const copied: string[] = [];
-  for (const rel of files) {
-    const src = join(repoPath, rel);
-    const dst = join(wtPath, rel);
-    if (!io.exists(src) || io.exists(dst)) continue;
-    try {
-      io.copy(src, dst);
-      copied.push(rel);
-    } catch (e) {
-      // 少一個設定檔只是那個專案的驗證會失敗並講明原因，不該讓整個群組跑不起來
-      log.warn({ rel, err: e instanceof Error ? e.message : String(e) }, '本機設定檔複製失敗（略過）');
-    }
-  }
-  if (copied.length > 0) log.info({ wtPath, files: copied }, '本機設定檔已帶入 worktree');
-  return copied;
-}
-
-export async function prepareNodeModules(
-  repoPath: string,
-  wtPath: string,
-  log: Logger,
-  env: NodeModulesEnv = defaultNodeModulesEnv,
-): Promise<NodeModulesStrategy> {
-  const src = join(repoPath, 'node_modules');
-  const dst = join(wtPath, 'node_modules');
-  if (!env.exists(src)) return 'none';
-  if (env.exists(dst)) return 'reused';
-
-  if (env.platform === 'darwin') {
-    let cloned = false;
-    try {
-      cloned = await env.cloneDir(src, dst);
-    } catch (e) {
-      log.warn({ err: String(e) }, 'node_modules 寫時複製擲錯');
-    }
-    if (cloned) {
-      log.info({ wtPath }, 'node_modules 已以寫時複製（clonefile）帶入 worktree');
-      return 'cow';
-    }
-    // 失敗可能留下半套目錄，清掉再退回 symlink，免得 build 讀到殘缺依賴
-    try {
-      env.removeDir(dst);
-    } catch (e) {
-      log.warn({ err: String(e), dst }, '清理半套 node_modules 失敗');
-    }
-  }
-
-  try {
-    env.symlink(src, dst);
-    log.warn(
-      { repoPath, wtPath },
-      '⚠ worktree 的 node_modules 是指向主 clone 的 symlink：agent 若在 worktree 執行 npm install/uninstall 會直接改到使用者的真實 clone',
-    );
-    return 'symlink';
-  } catch (e) {
-    log.warn({ err: String(e) }, 'node_modules 連結失敗（build 可能需先安裝依賴）');
-    return 'none';
-  }
-}
-
+// ── 依賴不再由程式帶進 worktree ──
+//
+// 這裡原本有一組 prepareNodeModules / prepareLocalFiles：把主 clone 的 node_modules
+// 用 clonefile 複製進 worktree，再帶上 .env 等幾個寫死的檔名。整組拆掉，兩個理由：
+//
+// 1. **它在猜一份不可能猜對的清單。** 寫死 `node_modules` 對 Node 專案成立，
+//    對 Laravel（vendor/）、Python（.venv/）、Go 一律不成立——而症狀是關卡在
+//    「找不到套件」上紅掉，agent 被派去修一個根本不是程式碼的問題。
+//
+// 2. **就算清單對了，複製出來的內容也是錯的。** 主 clone 的 node_modules 對應的是
+//    它自己那顆 lockfile；worktree 停在別的 base、或 agent 剛改過 package.json，
+//    複製過去的就是不相符的版本——而且看起來一切正常。這件事本身做不出正確結果。
+//
+// 現在：agent 自己的工作區由 agent 自己準備（它有 Bash，缺什麼自己裝）。
+// 合併守衛的拋棄式驗收樹沒有 agent，所以**安裝要寫進專案自己的驗收指令**
+//（例如 `npm ci && npm run build`）——那也才是對的：它裝的是那棵樹自己那顆
+// lockfile 對應的版本，而不是主 clone 當下剛好長什麼樣。
+//
 const defaultGit: GitRunner = async (cwd, args) => {
   const r = await execa('git', ['-C', cwd, ...args], { reject: false });
   return { exitCode: r.exitCode ?? 1, stdout: r.stdout, stderr: r.stderr };
@@ -444,14 +325,24 @@ const MAX_PR_SCREENSHOTS = 12;
 const IMAGE_RE = /\.(png|jpe?g|webp|gif)$/i;
 
 /**
- * 掃某任務的截圖目錄（Verifier 把截圖寫在 `<screenshotRoot>/<taskId>/`）。
+ * 掃某任務的截圖目錄。
+ *
+ * ── 這裡先前掃錯地方了 ──
+ *
+ * 舊版掃的是 `visual.screenshotRoot`（預設 `./data/screenshots`）——那是量測堆疊寫截圖
+ * 的地方，而那套東西第 15 片就整套退場了。正式機上 `data/screenshots` **根本不存在**，
+ * 所以這個函式永遠回空陣列，PR 從來沒附過任何截圖，而且完全沒有症狀。
+ *
+ * 現在掃的是 agent 自己的暫存目錄（scratchDirFor，＝瀏覽器 MCP 的 --output-dir，
+ * 也是提示詞叫它放截圖的地方）。正式機那裡有 114 個任務目錄。
  *
  * 為什麼用掃目錄而不是接 GateReport.screenshots：Worker 只回傳 status，
- * 關卡報告（含 screenshots）在它內部就被丟棄了；改 worker.ts 不在本模組職責內，
- * 而截圖路徑本來就是**可預測**的，掃目錄同樣拿得到，且進程重啟後依然有效。
+ * 關卡報告在它內部就被丟棄了；而截圖路徑本來就是**可預測**的，
+ * 掃目錄同樣拿得到，且進程重啟後依然有效。
  */
-export function defaultScreenshotsFor(input: { taskId: string; cwd: string; config: VerifierConfig }): string[] {
-  const { screenshotDir } = resolveVisualDirs({ cwd: input.cwd, config: input.config.visual ?? {}, key: input.taskId });
+export function defaultScreenshotsFor(input: { taskId: string; browserOutputRoot?: string }): string[] {
+  const screenshotDir = scratchDirFor(input.browserOutputRoot, input.taskId);
+  if (!screenshotDir) return [];
   try {
     if (!existsSync(screenshotDir)) return [];
     return readdirSync(screenshotDir)
@@ -732,10 +623,8 @@ export class GroupRunner {
       ledger.updateGroupState(group.id, 'failed');
       return;
     }
-    await prepareNodeModules(proj.repoPath, wt.path, log, this.deps.nodeModulesEnv);
     // 相依套件之外，本機設定檔也要帶——否則 worktree 是個「跑不起來的專案」，
     // dev server 起得來但 app 掛不起來，畫面驗證等於在驗證一張空白頁。
-    await prepareLocalFiles(proj.repoPath, wt.path, log, proj.localFiles);
 
     // 例外一律收斂到明確狀態（見 catch）；details 由 runGroup 邊跑邊填，通知才有載體
     const details: TaskDetail[] = [];
@@ -997,17 +886,11 @@ export class GroupRunner {
       const mergeCtx: CheckContext = {
         repo: group.repo, branch: group.branch, workspaceKind: 'merge_tree', requestedBy: 'merger',
       };
-      // 驗收樹要有 node_modules 與本機設定檔才跑得動關卡。
-      // 沒有的話紅的是**環境**不是程式碼——而 agent 會被派去修一個根本沒壞的東西。
       // 歸咎實驗的配額。**每一群獨立**——一群跑爆不該影響下一群。
       // 用完時 runExperiment 會在文字裡明講「配額已用完，請就現有證據判斷」，
       // 不會靜默降級成「沒查」（那會被下游當成「查過沒事」）。
       guardOptions.experimentBudget = { runsLeft: 3, msLeft: 10 * 60_000 };
       if (this.deps.recordCheck) guardOptions.recordCheck = this.deps.recordCheck;
-      guardOptions.prepareTree = async (treePath: string) => {  // 這裡只驗自己這一群，repoPath 已在閉包裡
-        await prepareNodeModules(proj.repoPath, treePath, log, this.deps.nodeModulesEnv);
-        await prepareLocalFiles(proj.repoPath, treePath, log, proj.localFiles);
-      };
       const guard = this.deps.makeMergeGuard?.(this.deps.makeVerifier(mergeCtx), guardOptions)
         ?? new MergeGuard(this.deps.makeVerifier(mergeCtx), log, guardOptions);
       const verdict = await guard.attempt({
@@ -1018,8 +901,6 @@ export class GroupRunner {
         verifierConfig: proj.verifierConfig,
         // 給語意飄移判斷當背景：它要知道本群「想做什麼」才判斷得出意圖有沒有打架
         taskTitles: details.map((d) => d.title),
-        // 重跑 DoD 時的任務資訊。用 taskHintOf 一次組好，不要自己拼欄位。
-        ...(details[0] ? { task: taskHintOf(details[0], proj) } : {}),
       });
       // ── 人已表態「知道這個紅、照樣落地」（定案③） ──
       //
@@ -1367,7 +1248,7 @@ export class GroupRunner {
       // **任務資訊要完整。** 只傳 id/category 的話，介面判斷者拿不到 baseRef → 沒有唯讀 git
       // → 分不出「這次弄的」與「本來就有的」；也拿不到標題／描述，判斷不了畫面有沒有達成目的。
       // 這是第三個漏傳的呼叫點（前兩個是 group-runner 的 Merge Guard 與 orchestrator 的合併路徑）。
-      const report = await verifier.check({ cwd: wtPath, config: proj.verifierConfig, task: taskHintOf(task, proj) });
+      const report = await verifier.check({ cwd: wtPath, config: proj.verifierConfig });
       if (!report.green) {
         feedback = report; // 具體失敗回灌下一輪
         continue;
@@ -1537,7 +1418,7 @@ export class GroupRunner {
     const all: string[] = [];
     for (const d of details) {
       try {
-        all.push(...read({ taskId: d.id, cwd: wtPath, config: proj.verifierConfig }));
+        all.push(...read({ taskId: d.id, ...(this.deps.browserOutputRoot ? { browserOutputRoot: this.deps.browserOutputRoot } : {}) }));
       } catch (e) {
         this.deps.log.warn({ taskId: d.id, err: e instanceof Error ? e.message : String(e) }, '讀取截圖失敗（PR 內文略過截圖）');
       }

@@ -11,61 +11,6 @@ import { EMPTY_TREE, changedSince } from '../git/status.js';
 /** 指令型關卡（跑得到 exit code 的那種）。 */
 export type VerifierCommand = 'typecheck' | 'lint' | 'build' | 'test';
 
-/** 視覺關卡的觸發時機（見 decideVisualGate 的規則說明）。 */
-export type VisualGateWhen = 'auto' | 'always' | 'never';
-
-/** 判定「這個任務要不要跑視覺」所需的最小任務資訊（呼叫端可不帶）。 */
-/**
- * 任務資訊。
- *
- * **每個欄位都有實際用途，漏傳會靜默降級：**
- * · baseRef 沒給 → 介面判斷者沒有唯讀 git → 分不出「這次弄的」與「本來就有的」
- *   → 把既有瑕疵算到這次頭上，擋掉不該擋的 PR
- * · title / description 沒給 → 判斷者不知道這個畫面「該達成什麼目的」
- *
- * 同一個疏漏犯過三次（group-runner 的 Merge Guard、orchestrator 的合併路徑、
- * 重做迴圈），每次症狀都一樣難查。所以這裡集中說明，並提供 taskHintOf() 一次組好，
- * 呼叫端不要再自己拼欄位。
- */
-export interface VisualTaskHint {
-  id?: string;
-  category?: TaskCategory;
-  /**
-   * 比較基準（例如 'origin/main'）。判斷者要靠它查「這次改了什麼」，
-   * 才分得出「這次弄壞的」與「本來就有的」。未給時判斷者只能保守地全部當成新引入。
-   */
-  baseRef?: string;
-  /** 給截圖判斷者的背景：判斷「畫面有沒有達成目的」需要知道目的是什麼。 */
-  title?: string;
-  description?: string;
-}
-
-/**
- * 視覺設定：**這個專案的畫面要看哪幾個頁面、哪些寬度**。
- *
- * 量測堆疊（截圖比對、版面稽核、UiJudge）已於第 15 片整套退場，畫面由審查者自己
- * 開瀏覽器判斷。但 routes 留著——那是專案在說「這個 repo 的畫面在哪裡」，
- * 審查者需要它才知道要導到哪一頁；`when`/`categories` 則是專案層唯一的關閉開關
- * （沒列 routes ＝ 這個專案不做視覺驗證）。
- */
-export interface VisualGateConfig {
-  /** 要看的路由（相對 dev server 根路徑）。空的 ＝ 這個專案不做視覺驗證。 */
-  routes?: string[];
-  /** 要看的視窗寬度。 */
-  breakpoints?: { name: string; width: number; height?: number }[];
-  /** 起 dev server 的指令與埠（審查者要靠它把畫面跑起來）。 */
-  devServer?: string;
-  devPort?: number;
-  /** 截圖根目錄（相對路徑以 daemon 的 process.cwd() 為基準）。預設 ./data/screenshots */
-  screenshotRoot?: string;
-  /** 基準截圖根目錄。 */
-  baselineRoot?: string;
-  /** 何時跑。預設 'auto' */
-  when?: VisualGateWhen;
-  /** when='auto' 時視為「視覺任務」的類別。 */
-  categories?: string[];
-}
-
 /**
  * 「diff 非空」關卡設定（DESIGN §5 的 DoD 明列此項）。
  *
@@ -87,29 +32,10 @@ export interface VerifierConfig {
   lint?: string;
   build?: string;
   test?: string;
-  /** 未設 → 完全不啟瀏覽器（見 decideVisualGate） */
-  visual?: VisualGateConfig;
   /** 未設 → 不跑「diff 非空」關卡（Merge Guard 等重測情境） */
   diff?: DiffGateConfig;
   /** 單一專案指令的執行逾時（毫秒）。未設／非正數 → 用 VerifierDeps.commandTimeoutMs 或內建預設。 */
   timeoutMs?: number;
-}
-
-/**
- * 從任務與專案設定組出完整的 VisualTaskHint。
- * 呼叫端一律用它，不要自己拼欄位——漏一個就是一次靜默降級（見 VisualTaskHint 說明）。
- */
-export function taskHintOf(
-  task: { id: string; category?: TaskCategory; title?: string; description?: string },
-  proj: { baseBranch: string; remote?: string },
-): VisualTaskHint {
-  return {
-    id: task.id,
-    ...(task.category ? { category: task.category } : {}),
-    ...(task.title ? { title: task.title } : {}),
-    ...(task.description ? { description: task.description } : {}),
-    baseRef: `${proj.remote ?? 'origin'}/${proj.baseBranch}`,
-  };
 }
 
 export interface VerifierDeps {
@@ -195,65 +121,6 @@ const ONLY_DIFF_DETAIL =
   '本專案未設定任何驗證指令（typecheck/lint/build/test），DoD 僅檢查「有變更」——' +
   '這是最低限度的把關，正確性完全依賴後續 reviewer 與人工 review。';
 
-export type VisualGateDecision = { run: true } | { run: false; reason: string };
-
-/**
- * 視覺關卡的觸發規則（需求 6-3：只有需要時才跑，其餘完全不啟瀏覽器）：
- *  1. 沒有 visual 設定、沒有 devServer、或沒列 routes → 不跑。
- *     routes 是專案層「這些頁面要保持不爆版」的明示 opt-in，沒列就代表這專案不做視覺驗證。
- *  2. when='never' → 不跑；when='always' → 一律跑。
- *  3. when='auto'（預設）：
- *     - 呼叫端有帶任務資訊 → 類別屬於 categories（預設 design）才跑，
- *       避免修 bug 的任務每一輪都白啟一次瀏覽器。
- *     - 沒帶任務資訊（例如 Merge Guard 合併前重測）→ 跑。
- *       那正是 DESIGN §9 的「關鍵路徑驗證」，且專案既然列了 routes 就是要求把關。
- */
-export function decideVisualGate(config: VisualGateConfig | undefined, task?: VisualTaskHint): VisualGateDecision {
-  if (!config) return { run: false, reason: '未設定視覺關卡' };
-  if (!config.devServer) return { run: false, reason: '專案未設定 commands.devServer' };
-  if (!config.routes || config.routes.length === 0) return { run: false, reason: '未指定視覺驗證路徑（visual.routes）' };
-  if (config.when === 'never') return { run: false, reason: '設定為 when=never' };
-  if (config.when === 'always') return { run: true };
-
-  // ── `auto` 的語意：專案設了 devServer ＋ routes 就跑 ──
-  //
-  // 先前是「卡片類別要字面等於 'design'」。那個判準有兩個問題：
-  // 1. **類別是任務板上一個人隨手填的字串**，跟這次改了什麼毫無關係。'dev' 是本系統
-  //    自己文件裡的一級類別——一張把 Vue 元件改到破版的 'dev' 卡，
-  //    typecheck/lint/build/test 全綠 → 綠燈 → 開 PR，而報告上完全看不出
-  //    「視覺從來沒驗過」。
-  // 2. 專案已經**明確 opt-in**（設了 commands.devServer 又列了 visual.routes）
-  //    卻還是不跑，那個設定等於白設。
-  //
-  // 要縮小範圍的話由使用者在 `visual.categories` 明列自己的詞彙——
-  // 那是「放寬預設、允許收緊」，而不是「預設就收緊、而且用我猜的詞」。
-  const categories = config.categories;
-  if (!categories?.length) return { run: true };
-  const category = task?.category;
-  if (category === undefined) return { run: true };
-  return categories.includes(category)
-    ? { run: true }
-    : { run: false, reason: `任務類別 ${category} 不在專案自訂的視覺類別 ${categories.join('/')} 內` };
-}
-
-/**
- * 決定截圖／基準目錄的實體位置。硬性條件：**不得落在 worktree（cwd）內**，
- * 否則 git diff 會多出一堆 png。設定值若不慎指進 worktree，會被改導到預設根目錄並警告。
- */
-export function resolveVisualDirs(input: {
-  cwd: string;
-  config: VisualGateConfig;
-  key: string;
-  log?: Logger;
-}): { screenshotDir: string; baselineDir?: string } {
-  const { cwd, config, key, log } = input;
-  const shotRoot = outsideWorktree(config.screenshotRoot ?? DEFAULT_SCREENSHOT_ROOT, cwd, log);
-  const dirs: { screenshotDir: string; baselineDir?: string } = { screenshotDir: join(shotRoot, safeKey(key)) };
-  // 基準要跨任務、跨輪次沿用，所以不再依任務分層——每個專案自己設一個 root 即可
-  if (config.baselineRoot) dirs.baselineDir = outsideWorktree(config.baselineRoot, cwd, log);
-  return dirs;
-}
-
 /**
  * DoD 關卡（DESIGN.md §5/§D14）：由調度器實跑專案自己的指令判定「完成」，
  * 而非相信 agent 自稱。並計算「結果簽章」供無進展偵測使用。
@@ -273,7 +140,7 @@ export function resolveVisualDirs(input: {
 export class Verifier {
   constructor(private log: Logger, private deps: VerifierDeps = {}) {}
 
-  async check(input: { cwd: string; config: VerifierConfig; task?: VisualTaskHint; signal?: AbortSignal }): Promise<GateReport> {
+  async check(input: { cwd: string; config: VerifierConfig; signal?: AbortSignal }): Promise<GateReport> {
     const checks: CheckResult[] = [];
     // 「有效關卡數」：真的驗到東西的關卡。說明性質的 check（視覺跳過、設定缺漏）不算數，
     // 否則「什麼都沒驗」會被當成綠燈（沿用原本「空驗證不算通過」的規則）。
@@ -393,8 +260,17 @@ export class Verifier {
    * 為什麼不是兩個都留：同一個畫面跑兩套判斷、付兩次 LLM 的錢，而且舊的那套可以把
    * 新放行書已經放行的東西判紅——兩個閘門互相打架，人分不出到底是誰擋的。
    *
-   * `visual` 設定裡的 routes 沒有跟著刪：那是專案在說「這個 repo 要看哪幾個頁面」，
-   * 審查者需要它。
+   * ── 設定殼子也一起拆了（2026-08-06）──
+   *
+   * 當時 `visual.routes` 被留下來，理由寫的是「那是專案在說這個 repo 要看哪幾個頁面，
+   * 審查者需要它」。**但那條線從來沒接上**：decideVisualGate 在正式程式碼裡一次都沒被
+   * 呼叫（只有測試 import 它），reviewer.ts 裡 routes／devServer 一個字都沒有。
+   *
+   * 更根本的是那個設定本身問不出答案。控制台上寫著「只填這次改動會影響到的頁面」，
+   * 但那是**專案層**設定——它不可能知道下一張卡要改什麼。程式在問一個它拿不到答案的
+   * 問題，而使用者填了會以為自己設定好了。
+   *
+   * 畫面現在由審查者自己找、自己導頁；它有瀏覽器、有 repo、看得到 diff。
    */
 
   private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<CheckResult> {

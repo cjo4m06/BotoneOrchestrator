@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { execa } from 'execa';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { visualGateConfigOf, type AppConfig, type OrchestratorConfig, type ProjectConfig } from './config/index.js';
+import { type AppConfig, type OrchestratorConfig, type ProjectConfig } from './config/index.js';
 import { DEFAULT_DATA_ROOT, loadBootstrap } from './config/bootstrap.js';
 import { ConfigStore } from './config/store.js';
 import { migrateYamlIfPresent } from './config/migrate.js';
@@ -25,7 +25,7 @@ import { evaluateBudget, type BudgetVerdict } from './core/budget.js';
 import { Planner } from './core/planner.js';
 import { Dispatcher } from './core/dispatcher.js';
 import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergeProject, type PrMergeLike, TICK_FAILED_EVENT } from './core/orchestrator.js';
-import { GroupRunner, prepareLocalFiles, prepareNodeModules, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
+import { GroupRunner, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
 import { Reconciler, createFsProbe, createGitProbe, type ReconcilerDeps, type ReconcilerMcp } from './core/reconciler.js';
 import { AgentRuntime, agentAuthEnv } from './worker/agent-runtime.js';
 import { Verifier } from './worker/verifier.js';
@@ -79,8 +79,6 @@ export function verifierConfigOf(p: ProjectConfig): VerifierConfig {
     build: p.commands.build,
     test: p.commands.test,
     lint: p.commands.lint,
-    // 沒設 devServer/routes 時 visualGateConfigOf 回 undefined → 視覺關卡整段跳過
-    visual: visualGateConfigOf(p),
     // 每專案的指令逾時覆寫；未設 → 交給 VerifierDeps.commandTimeoutMs（全域）或內建預設
     ...(p.commandTimeoutSec !== undefined && p.commandTimeoutSec > 0
       ? { timeoutMs: p.commandTimeoutSec * 1000 }
@@ -124,23 +122,6 @@ export function verifierDepsOf(
   };
 }
 
-/**
- * 截圖保留策略的根目錄（Reconciler 用）。
- * 沒接的話截圖永遠不會被清，長期常駐會把磁碟塞爆。
- * 多專案設了不同根目錄時只能清第一個（ReconcilerDeps 只收一個），這時要吵一聲。
- */
-export function screenshotRootOf(
-  projects: { visual: { screenshotRoot?: string } }[],
-  log?: Logger,
-): string | undefined {
-  const roots = [...new Set(projects.map((p) => p.visual.screenshotRoot?.trim()).filter((r): r is string => !!r))];
-  const first = roots[0];
-  if (!first) return undefined;
-  if (roots.length > 1) {
-    log?.warn({ roots, used: first }, '多個專案使用不同的截圖根目錄，保留策略只會清理第一個（其餘目錄會無限成長）');
-  }
-  return first;
-}
 
 /**
  * 這個專案輪詢時要不要只看「指派給我」的任務。
@@ -174,8 +155,6 @@ export async function projectRuntimeOf(
     baseBranch: await resolveBaseBranch(p, deps),
     verifierConfig: verifierConfigOf(p),
     mcp: deps.mcp,
-    // 要帶進 worktree 的本機設定檔；未設時由 prepareLocalFiles 用預設清單
-    ...(p.localFiles ? { localFiles: p.localFiles } : {}),
   };
 }
 
@@ -664,7 +643,6 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
 
   const byRepo = new Map<string, MergeProject>();
   /** 合併工作區路徑 → 專案 runtime（守衛的 prepareTree 要靠它拿 localFiles）。 */
-  const runtimeByWorkspace = new Map<string, ProjectRuntime>();
 
   /** 重建某個 repo 的合併工作區（含 node_modules 與本機設定檔）。 */
   const rebuildMergeWorkspace = async (repo: string, proj: MergeProject): Promise<void> => {
@@ -678,8 +656,6 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       log,
     });
     if (!path) return;
-    await prepareNodeModules(entry.runtime.repoPath, path, log).catch(() => undefined);
-    await prepareLocalFiles(entry.runtime.repoPath, path, log, entry.runtime.localFiles).catch(() => undefined);
     log.info({ repo, path }, '合併工作區已重建');
   };
 
@@ -693,21 +669,6 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     });
     if (!path) continue;
 
-    // **合併工作區也要有 node_modules**：Merge Guard 會在這裡重跑 build/test，
-    // 沒有依賴的話 `npm run build` 一定失敗（vite: command not found），
-    // 而失敗會被歸類成「語意飄移」擋下合併——實跑撞到：任何 PR 都合併不了，
-    // 而且錯誤訊息誤導成「程式碼有問題」。這正是 D18 說的「誤判比漏抓更糟」。
-    await prepareNodeModules(runtime.repoPath, path, log).catch((e) =>
-      log.warn({ path, err: e instanceof Error ? e.message : String(e) }, '合併工作區的 node_modules 準備失敗'),
-    );
-    // 合併工作區同樣要能真的跑起來：Merge Guard 會在這裡重跑 build/test，
-    // 有些專案少了本機設定檔連 build 都過不了。
-    await prepareLocalFiles(runtime.repoPath, path, log, runtime.localFiles).catch((e) =>
-      log.warn({ path, err: e instanceof Error ? e.message : String(e) }, '合併工作區的本機設定檔準備失敗'),
-    );
-
-    // 守衛拿到的是**合併工作區**的路徑，不是主 clone；反查要靠這張表。
-    runtimeByWorkspace.set(path, runtime);
     byRepo.set(runtime.repo, {
       // 合併路徑的工作目錄＝專用 worktree，不是 runtime.repoPath（使用者的主 clone）
       repoPath: path,
@@ -752,31 +713,15 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     },
     // **第二個 Merge Guard 呼叫點（核准之後的那次）。**
     //
-    // 它先前是 `new MergeGuard(verifier, log)`——**一個選項都沒給**，而群組執行那一側
-    // 給了 prepareTree（把 node_modules 與本機設定檔帶進拋棄式驗收樹）。
+    // 這裡先前要塞 prepareTree 把 node_modules 帶進拋棄式驗收樹，因為第 10 片把守衛
+    // 改成「在 /tmp 的樹上驗」之後樹不再自帶依賴——實跑（2026-08-05，g_da31b3e8c2ac）
+    // 少了它就 `Cannot find package 'tsx'` → 判 semantic_drift → 憑證作廢、42 則
+    // 「build 紅了」回灌給改不動它的 agent，**任何需要建置的專案都合併不了**。
     //
-    // 第 10 片把守衛從「在 worktree 裡 rebase」改成「在 /tmp 的拋棄式樹上驗」之後，
-    // 樹不再自帶依賴——於是這個呼叫點的 `npm run build` 一定會紅：
-    //
-    //   Cannot find package 'tsx' imported from /tmp/orch-merge-XXXX/apps/web/
-    //
-    // 實跑（2026-08-05，g_da31b3e8c2ac）：群組執行那次 13:39 通過 → 人 13:42 核准 →
-    // 這裡 13:45 重跑，樹沒有 node_modules → 判 semantic_drift → 憑證作廢、
-    // 退回 changes_requested、42 則「build 紅了」的意見回灌給 agent，
-    // 而 agent 改不動一個不存在的依賴問題。**任何需要建置的專案都合併不了。**
-    //
-    // 兩個呼叫點的選項要一起給，是這個 repo 反覆踩到的同一種病：
-    // 能力做好了、第二個建構點漏掉，而症狀是一個看起來像程式碼問題的紅燈。
-    guard:
-      input.guard
-      ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log, {
-        prepareTree: async (treePath, repoPath) => {
-          await prepareNodeModules(repoPath, treePath, log);
-          // 這個實例是全 daemon 共用的，建構時不知道會驗到哪個專案 →
-          // 用 repoPath 反查回專案，才拿得到它自己的 localFiles 清單。
-          await prepareLocalFiles(repoPath, treePath, log, runtimeByWorkspace.get(repoPath)?.localFiles);
-        },
-      }),
+    // 複製依賴那條路現在整個拆了（見 group-runner 的說明：清單猜不對，而且就算猜對，
+    // 複製來的版本也不對）。同一個坑改由**專案自己的驗收指令**負責——
+    // 要安裝就寫成 `npm ci && npm run build`，那棵樹才會裝到它自己那顆 lockfile 的版本。
+    guard: input.guard ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log),
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {
@@ -1875,7 +1820,9 @@ export async function main(): Promise<void> {
   await reconcileOnBoot({
     ledger, log, registry,
     clients: registry.clients() as PmmMcpClient[],
-    screenshotRoot: screenshotRootOf(config.projects, log),
+    // agent 的暫存／截圖目錄（＝ browserOutputRoot）。先前指的是 visual.screenshotRoot——
+    // 那個目錄根本沒有東西寫進去，於是 browser-tmp 從來沒被清過（正式機躺著 114 個任務目錄）。
+    screenshotRoot: browserOutputRootOf(boot.dataRoot),
     dataRoot: boot.dataRoot,
     mode,
   });

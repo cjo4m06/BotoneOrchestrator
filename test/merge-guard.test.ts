@@ -128,34 +128,6 @@ describe('MergeGuard — 合併守衛', () => {
   }
 
   /**
-   * Merge Guard 重跑 DoD 時**必須把任務資訊帶下去**。
-   *
-   * 實跑撞到：同一輪裡，任務關卡那次的介面判斷者有查 git（分得出新舊問題），
-   * Merge Guard 這次沒有——因為這裡呼叫 verifier 時完全沒傳 task，
-   * 判斷者拿不到 baseRef 就沒有唯讀 git 可用。而擋下 PR 的正是後者，
-   * 於是別人先前 commit 的畫面瑕疵被算到這次頭上。
-   */
-  it('重跑 DoD 時要把任務資訊（含 baseRef）帶給 verifier', async () => {
-    branchWith('feat/a', { 'feature.js': 'export const a = 1;\n' }, 'add feature');
-    repo.commit({ 'readme.md': 'hi\n' }, 'main moves on');
-
-    const seen: unknown[] = [];
-    const verifier = {
-      async check(input: { cwd: string; task?: unknown }) {
-        seen.push(input.task);
-        return { green: true, checks: [], signature: 'g' };
-      },
-    };
-    const guard = new MergeGuard(verifier as never, createSilentLogger());
-    await guard.attempt({
-      repoPath: repo.path, branch: 'feat/a', base: 'main', verifierConfig: { test: 'exit 0' },
-      task: { id: 'T-1', title: '加一顆按鈕', baseRef: 'origin/main' },
-    });
-
-    assert.deepEqual(seen[0], { id: 'T-1', title: '加一顆按鈕', baseRef: 'origin/main' });
-  });
-
-  /**
    * 第三層（判斷層）：前兩層都是事實——rebase 有沒有衝突、合併後測試紅不紅。
    * 它們抓不到「能編譯、測試也綠，但兩邊的意圖打架」。這批測試驗證那一層真的接上了，
    * 而且**只在事實層全綠之後**才跑（前面就擋下來時不該白花一次 agent 呼叫）。

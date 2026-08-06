@@ -2,7 +2,6 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import type { VisualGateConfig } from '../worker/verifier.js';
 
 // ── Schema（對映 config/*.example.yaml） ──
 // 註：這裡的每個欄位都必須有人讀。設定「存在但沒人讀」比沒有設定更糟——
@@ -14,37 +13,8 @@ const CommandsSchema = z
     build: z.string().optional(),
     test: z.string().optional(),
     lint: z.string().optional(),
-    devServer: z.string().optional(),
-    devPort: z.number().optional(),
   })
   .prefault({}); // zod v4：prefault 才會套用內層欄位預設（default 會短路）
-
-// 視覺驗證（DoD 的視覺關卡）。dev server 指令/埠沿用 commands.devServer/devPort，
-// 這裡只描述「要驗哪些頁面、用什麼門檻、截圖放哪」。
-const VisualBreakpointSchema = z.object({
-  name: z.string(),
-  width: z.number(),
-  height: z.number(),
-});
-const VisualSchema = z
-  .object({
-    // 空陣列 = 這個專案不做視覺驗證（完全不啟瀏覽器）
-    routes: z.array(z.string()).default([]),
-    when: z.enum(['auto', 'always', 'never']).default('auto'),
-    categories: z.array(z.string()).default(['design']),
-    breakpoints: z.array(VisualBreakpointSchema).optional(),
-    // 截圖/基準都必須放 worktree 外，否則會被算進 git diff 污染 PR
-    screenshotRoot: z.string().default('./data/screenshots'),
-    baselineRoot: z.string().optional(),
-    browserChannel: z.string().optional(),
-    serverReadyTimeoutMs: z.number().optional(),
-    navTimeoutMs: z.number().optional(),
-    settleMs: z.number().optional(),
-    // 量測用的旋鈕（maxDiffRatio / pixelTolerance / updateBaseline / maxElements /
-    // thresholds）隨截圖比對與版面稽核堆疊一起退場（第 15 片）。它們從來沒有出現在
-    // 控制台的表單上，只有量測程式在讀——那些程式已經不存在了。
-  })
-  .prefault({});
 
 /**
  * MCP 端點。支援 stdio（spawn 子行程）與 http（Streamable HTTP）。
@@ -91,19 +61,7 @@ export const ProjectSchema = z.object({
   baseBranch: z.string().optional(),
   /** 覆寫 orchestrator.poll.mine（有些 MCP 的「指派」語意不同時才需要）。 */
   pollMine: z.boolean().optional(),
-  /**
-   * 要從主 clone 帶進每個 worktree 的本機設定檔。
-   *
-   * 為什麼需要：`git worktree add` 只帶版控裡的檔案，而本機設定檔（`.env` 之類）
-   * 依慣例被 gitignore——於是 worktree 是個「跑不起來的專案」：dev server 起得來，
-   * app 卻掛不起來，畫面驗證變成在驗證一張空白頁，agent 想自己跑起來看也一樣撞牆。
-   *
-   * 未設 → 用預設清單（.env / .env.local / .env.development / .npmrc），不存在的自動略過。
-   * **設成空陣列 → 一個都不帶**：真的把伺服器密鑰放在開發用 .env 的專案這樣設，
-   * 代價是那個專案的視覺驗證會失敗並講明原因（比靜默用空白頁驗證誠實）。
-   */
-  localFiles: z.array(z.string()).optional(),
-  /**
+    /**
    * 覆寫 orchestrator.commandTimeoutSec：這個專案的 DoD 關卡指令最多能跑多久。
    * 大型 monorepo 的 build/test 常比預設久，逾時會讓關卡判紅並回灌「逾時」給 agent，
    * agent 只會白費力氣改程式（問題其實在時間不夠）。非正數視為未設。
@@ -118,7 +76,6 @@ export const ProjectSchema = z.object({
   quietPeriodMinutes: z.number().optional(),
   mcp: McpSchema,
   commands: CommandsSchema,
-  visual: VisualSchema,
 });
 
 /** 「無需改動」宣告的處置：ask=park 等人確認（安全預設）、auto_complete=直接結案。 */
@@ -282,26 +239,6 @@ export interface AppConfig {
   projects: ProjectConfig[];
 }
 
-/**
- * 專案設定 → Verifier 的視覺關卡設定。
- * 沒設 commands.devServer 就回 undefined（VerifierConfig.visual 留空 = 永不啟瀏覽器）。
- */
-export function visualGateConfigOf(p: ProjectConfig): VisualGateConfig | undefined {
-  if (!p.commands.devServer) return undefined;
-  const v = p.visual;
-  // 量測用的旋鈕（maxDiffRatio / pixelTolerance / updateBaseline / maxElements）
-  // 隨截圖比對堆疊一起退場（第 15 片）。留下的都是「審查者要導到哪裡、看多寬」。
-  return {
-    devServer: p.commands.devServer,
-    ...(p.commands.devPort === undefined ? {} : { devPort: p.commands.devPort }),
-    ...(v.routes ? { routes: v.routes } : {}),
-    ...(v.when ? { when: v.when } : {}),
-    ...(v.categories ? { categories: v.categories } : {}),
-    ...(v.breakpoints ? { breakpoints: v.breakpoints } : {}),
-    ...(v.screenshotRoot ? { screenshotRoot: v.screenshotRoot } : {}),
-    ...(v.baselineRoot ? { baselineRoot: v.baselineRoot } : {}),
-  };
-}
 
 /** 將 YAML 內的 ${ENV_VAR} 以環境變數展開（缺值則為空字串）。 */
 function interpolateEnv(raw: string): string {

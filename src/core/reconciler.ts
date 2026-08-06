@@ -100,7 +100,7 @@ export interface ReconcilerMcp {
 export interface RetentionPolicy {
   /** 終態群組（merged/failed）的 worktree 保留天數——期間內保留現場供人工診斷。 */
   terminalWorktreeDays: number;
-  /** 截圖保留天數；只清「ledger 查無此任務或任務已 done」的目錄。 */
+  /** agent 暫存／截圖保留天數；只清「ledger 查無此任務或任務已 done」的目錄。 */
   screenshotDays: number;
   /** events 稽核紀錄保留天數。 */
   eventDays: number;
@@ -141,7 +141,7 @@ export interface ReconcilerDeps {
   mcp?: ReconcilerMcp;
   /** 覆寫 worktree 路徑推導（預設與 WorktreeManager 相同規則）。 */
   worktreePathFor?: (group: Group) => string;
-  /** 截圖根目錄（config.visual.screenshotRoot）；未提供則不清截圖。 */
+  /** agent 的暫存／截圖根目錄（＝ browserOutputRoot）；未提供則不清。 */
   screenshotRoot?: string;
   /** 覆寫保留策略（只填想改的欄位）。 */
   retention?: Partial<RetentionPolicy>;
@@ -683,7 +683,7 @@ export class Reconciler {
     }
   }
 
-  /** 截圖目錄結構為 <screenshotRoot>/<taskId>/…（見 verifier.ts）。 */
+  /** 目錄結構為 <root>/<taskId>/…（見 agent-runtime 的 scratchDirFor）。 */
   private async pruneScreenshots(report: ReconcileReport, now: number): Promise<void> {
     const root = this.deps.screenshotRoot;
     if (!root) return;

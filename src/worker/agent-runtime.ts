@@ -1287,6 +1287,7 @@ export function buildAgentPrompt(input: IterateInput): string {
   );
 
   p.push(EXTERNAL_ACTION_RULE);
+  p.push(WORKSPACE_FACT);
   if (input.scratchDir) p.push(scratchRule(input.scratchDir));
 
   p.push(SUMMARY_FORMAT);
@@ -1303,6 +1304,19 @@ export function scratchRule(scratchDir: string): string {
 截圖、log、草稿一律放 \`${scratchDir}\`（已建好），不要放在工作目錄裡。
 **工作目錄裡的檔案都會被提交進這次的 PR。**`;
 }
+
+/**
+ * 工作區的環境現況。
+ *
+ * 這是**事實陳述**，不是準則：worktree 是 `git worktree add` 出來的，被 gitignore 的
+ * 東西一律不在裡面。先前由程式把主 clone 的 node_modules 複製進來，那條路已經拆了
+ *（見 group-runner：清單猜不對，而且就算猜對，複製來的版本也對不上這棵樹的 lockfile）。
+ *
+ * 不列舉是哪些目錄：那又會變成一份寫死的清單，而每種語言都不一樣。
+ */
+const WORKSPACE_FACT = `
+## 你的工作區是全新的 worktree
+被 gitignore 的東西（依賴、本機設定檔）**不在裡面**。要跑建置或測試就自己先裝起來。`;
 
 /**
  * 外部動作的禁令。

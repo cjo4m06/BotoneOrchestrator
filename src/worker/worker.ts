@@ -415,18 +415,10 @@ export class Worker {
       // 3c) DoD 關卡（實跑專案指令 + diff 非空）
       ledger.updateTaskState(task.id, 'verifying');
       input.onPhase?.(`第 ${round} 輪：跑驗收關卡`);
-      // 帶 task 提示：視覺關卡據此判斷要不要驗（category）與截圖歸檔位置
       const gate = await verifier.check({
         cwd,
         config: gateConfig,
-          ...(input.signal ? { signal: input.signal } : {}),
-        task: {
-          id: detail.id,
-          category: detail.category,
-          title: detail.title,
-          description: detail.description,
-          ...(input.baseRef ? { baseRef: input.baseRef } : {}),
-        },
+        ...(input.signal ? { signal: input.signal } : {}),
       });
 
       // 3d) DoD 綠燈才輪到獨立 reviewer 對規格審查（§5）。

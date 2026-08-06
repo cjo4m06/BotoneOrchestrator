@@ -18,11 +18,6 @@ export interface MergeGuardInput {
   verifierConfig: VerifierConfig;
   /** 本群在做什麼（任務標題）。給語意飄移判斷當背景。 */
   taskTitles?: string[];
-  /**
-   * 重跑 DoD 時要帶下去的任務資訊（含 baseRef）。
-   * 沒有它，這一關的介面判斷者就沒有 git 可查，分不出新舊問題。
-   */
-  task?: { id?: string; category?: string; title?: string; description?: string; baseRef?: string };
 }
 
 /** git 執行結果的最小形狀（供注入假件；預設實作用 execa）。 */
@@ -47,14 +42,6 @@ export interface MergeGuardOptions {
    * 驗收樹建好之後的準備工作（node_modules、本機設定檔）。
    * **一定要接**：沒有依賴就跑關卡，紅的是環境不是程式碼，而 agent 會去修一個沒壞的東西。
    */
-  /**
-   * 樹建好之後的準備工作（node_modules、本機設定檔）。**跑關卡前一定要有。**
-   *
-   * 第二個參數是**這一次驗的是哪個 repo 的路徑**——第二個呼叫點（核准後那次）
-   * 用的是整個 daemon 共用的一個守衛實例，建構時還不知道會驗到哪個專案。
-   * 沒有它，那個實例就只能不準備，於是驗收樹沒有 node_modules → build 直接紅。
-   */
-  prepareTree?: (treePath: string, repoPath: string) => Promise<void>;
   /** 取最新 base 的 remote 名稱。預設 'origin' */
   remote?: string;
   /** 是否在 attempt() 前 fetch 最新 base。預設 true；設 false 等於明示「接受基於本地狀態的驗證」 */
@@ -157,7 +144,6 @@ export class MergeGuard {
       // **一定要把注入的 git 傳下去。** 不傳的話守衛會用到兩條不同的 git 路徑：
       // 一條可被測試/呼叫端替換，一條寫死用 execa——那種不一致查起來特別花時間。
       git: (cwd, args) => this.git(cwd, args),
-      ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, repoPath) } : {}),
     });
     if (!built.ok) {
       if (built.reason === 'conflict') {
@@ -176,13 +162,7 @@ export class MergeGuard {
     const { tree } = built;
     try {
       // 3) 在「合併後狀態」重跑關卡。
-      // **任務資訊要帶下去**：少了它，介面判斷者拿不到 baseRef，就分不出
-      // 「這次弄的」與「本來就有的」（實跑撞到：把別人先前 commit 的瑕疵算到這次頭上）。
-      const gate = await this.verifier.check({
-        cwd: tree.path,
-        config: input.verifierConfig,
-        ...(input.task ? { task: input.task } : {}),
-      });
+      const gate = await this.verifier.check({ cwd: tree.path, config: input.verifierConfig });
       if (!gate.green) {
         // **紅了不代表是這一群造成的。**
         //
@@ -257,7 +237,6 @@ export class MergeGuard {
           budget,
           log: this.log,
           git: (cwd, args) => this.git(cwd, args),
-          ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, input.repoPath) } : {}),
           ...(input.repo ? { repo: input.repo } : {}),
           ...(this.opts.recordCheck ? { record: this.opts.recordCheck } : {}),
         }),

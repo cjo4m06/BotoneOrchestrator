@@ -4,20 +4,16 @@ import assert from 'node:assert/strict';
 import {
   GROUP_DEPS_BLOCKED_EVENT,
   GroupRunner,
-  prepareNodeModules,
   shouldRequeueGroup,
   type MergeApprovalAsk,
   type FeedbackStoreLike,
   type GitRunner,
   type GroupRunnerDeps,
   type MergeGuardLike,
-  type NodeModulesEnv,
   type PrManagerLike,
   type ProjectRuntime,
   type WorktreeLike,
   reworkProducedChanges,
-  prepareLocalFiles,
-  DEFAULT_LOCAL_FILES,
   stripAnsi,
 } from '../src/core/group-runner.js';
 import type { AgentLike, McpTaskClient, Notifier, VerifierLike } from '../src/contracts.js';
@@ -1356,91 +1352,20 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
 
 // ── worktree 的 node_modules（不可污染使用者真實 clone） ──
 
-describe('prepareNodeModules', () => {
-  interface Spy extends NodeModulesEnv {
-    cloned: [string, string][];
-    linked: [string, string][];
-    removed: string[];
-  }
-
-  function spyEnv(over: Partial<NodeModulesEnv> & { existing?: string[] } = {}): Spy {
-    const existing = new Set(over.existing ?? ['/repo/node_modules']);
-    const env: Spy = {
-      cloned: [],
-      linked: [],
-      removed: [],
-      platform: over.platform ?? 'darwin',
-      exists: over.exists ?? ((p) => existing.has(p)),
-      cloneDir:
-        over.cloneDir ??
-        (async (src, dst) => {
-          env.cloned.push([src, dst]);
-          return true;
-        }),
-      symlink:
-        over.symlink ??
-        ((src, dst) => {
-          env.linked.push([src, dst]);
-        }),
-      removeDir: over.removeDir ?? ((p) => void env.removed.push(p)),
-    };
-    return env;
-  }
-
-  const log = () => createRecordingLogger();
-
-  it('macOS：優先用寫時複製，agent 的 npm install 因此改不到使用者的 clone', async () => {
-    const env = spyEnv();
-    const r = await prepareNodeModules('/repo', '/wt', log().logger, env);
-
-    assert.equal(r, 'cow');
-    assert.deepEqual(env.cloned, [['/repo/node_modules', '/wt/node_modules']]);
-    assert.deepEqual(env.linked, [], '複製成功就不該再建 symlink');
-  });
-
-  it('寫時複製失敗 → 清掉半套目錄、退回 symlink 並警告污染風險', async () => {
-    const rec2 = log();
-    const env = spyEnv({ cloneDir: async () => false });
-    const r = await prepareNodeModules('/repo', '/wt', rec2.logger, env);
-
-    assert.equal(r, 'symlink');
-    assert.deepEqual(env.removed, ['/wt/node_modules']);
-    assert.deepEqual(env.linked, [['/repo/node_modules', '/wt/node_modules']]);
-    assert.ok(
-      rec2.messages('warn').some((m) => m.includes('npm install')),
-      'symlink 是有風險的降級路徑，必須明講',
-    );
-  });
-
-  it('非 macOS：直接 symlink（clonefile 不存在），並警告', async () => {
-    const rec2 = log();
-    const env = spyEnv({ platform: 'linux' });
-    const r = await prepareNodeModules('/repo', '/wt', rec2.logger, env);
-
-    assert.equal(r, 'symlink');
-    assert.deepEqual(env.cloned, []);
-    assert.ok(rec2.messages('warn').some((m) => m.includes('symlink')));
-  });
-
-  it('主 clone 沒有 node_modules → 什麼都不做', async () => {
-    const env = spyEnv({ existing: [] });
-    assert.equal(await prepareNodeModules('/repo', '/wt', log().logger, env), 'none');
-    assert.deepEqual(env.cloned, []);
-    assert.deepEqual(env.linked, []);
-  });
-
-  it('worktree 已有 node_modules → 沿用，不覆寫', async () => {
-    const env = spyEnv({ existing: ['/repo/node_modules', '/wt/node_modules'] });
-    assert.equal(await prepareNodeModules('/repo', '/wt', log().logger, env), 'reused');
-    assert.deepEqual(env.cloned, []);
-  });
-});
-
 /**
- * 實跑撞到的誤判：使用者寫「要有確認按鈕」，agent 確實加了 ConfirmDialog 並**自行 commit**，
- * 於是 commitAll 沒東西可 staged 回 false，系統卻據此回報「審查意見並未被實際處理」而 park，
- * PR 也沒更新。人的意見明明被執行了，卻被判成沒做事。
+ * prepareNodeModules / prepareLocalFiles 的測試整組退場（2026-08-06）。
+ *
+ * 那兩個函式在猜「這個專案需要哪些被 gitignore 的東西」——寫死 `node_modules`
+ * 對 Node 成立，對 Laravel（vendor/）、Python（.venv/）一律不成立。
+ * 而且就算清單猜對了，複製出來的內容仍然是錯的：主 clone 的依賴對應的是它自己那顆
+ * lockfile，worktree 停在別的 base、或 agent 剛改過 package.json，複製過去就不相符——
+ * 而且看起來一切正常。這件事本身做不出正確結果，所以整個拆掉。
+ *
+ * 現在：agent 自己的工作區自己準備（提示詞明講 worktree 是空的）；
+ * 合併守衛那棵沒有 agent 的驗收樹，安裝要寫進專案自己的驗收指令
+ *（`npm ci && npm run build`）——那才會裝到那棵樹自己那顆 lockfile 的版本。
  */
+
 describe('重做有沒有真的產生變更', () => {
   it('commitAll 有提交 → 算有做事', () => {
     assert.equal(reworkProducedChanges(true, 'a', 'a'), true);
@@ -1464,66 +1389,6 @@ describe('重做有沒有真的產生變更', () => {
 
 // ── worktree 要是一個「能動的開發環境」──
 
-/**
- * `git worktree add` 只帶版控裡的檔案，而本機設定檔（.env 之類）依慣例被 gitignore。
- * 少了它，worktree 是個跑不起來的專案：dev server 起得來、app 卻掛不起來，
- * 於是截圖是空白頁、視覺驗證變成在驗證一張沒渲染的畫面。
- * 這不只影響視覺——寫程式的 agent 想自己跑起來看，一樣撞牆。
- */
-describe('prepareLocalFiles', () => {
-  function io(present: string[], copied: string[] = [], failOn?: string) {
-    return {
-      exists: (p: string) => present.includes(p),
-      copy: (a: string, b: string) => {
-        if (failOn && a.includes(failOn)) throw new Error('EACCES');
-        copied.push(`${a} → ${b}`);
-        present.push(b);
-      },
-    };
-  }
-
-  it('把存在的設定檔帶進 worktree，不存在的跳過', async () => {
-    const present = ['/repo/.env', '/repo/.npmrc'];
-    const copied: string[] = [];
-    const done = await prepareLocalFiles('/repo', '/wt', createSilentLogger(), DEFAULT_LOCAL_FILES, io(present, copied));
-
-    assert.deepEqual(done, ['.env', '.npmrc']);
-    assert.deepEqual(copied, ['/repo/.env → /wt/.env', '/repo/.npmrc → /wt/.npmrc']);
-  });
-
-  it('worktree 已經有的不覆蓋（沿用既有 worktree 時 agent 可能改過）', async () => {
-    const present = ['/repo/.env', '/wt/.env'];
-    const copied: string[] = [];
-    const done = await prepareLocalFiles('/repo', '/wt', createSilentLogger(), ['.env'], io(present, copied));
-
-    assert.deepEqual(done, []);
-    assert.deepEqual(copied, []);
-  });
-
-  it('空清單 → 一個都不帶（把伺服器密鑰放在 .env 的專案這樣設）', async () => {
-    const copied: string[] = [];
-    const done = await prepareLocalFiles('/repo', '/wt', createSilentLogger(), [], io(['/repo/.env'], copied));
-
-    assert.deepEqual(done, []);
-    assert.deepEqual(copied, []);
-  });
-
-  it('複製失敗只留 warn，不讓整個群組跑不起來', async () => {
-    const rec = createRecordingLogger();
-    const present = ['/repo/.env', '/repo/.npmrc'];
-    const done = await prepareLocalFiles('/repo', '/wt', rec.logger, ['.env', '.npmrc'], io(present, [], '.env'));
-
-    assert.deepEqual(done, ['.npmrc'], '一個失敗不該影響其他');
-    assert.ok(rec.messages('warn').some((m) => /本機設定檔複製失敗/.test(m)));
-  });
-});
-
-/**
- * ANSI 色碼是終端標準，不是使用者專案的格式——清掉它不需要猜任何事。
- *
- * 這裡**刻意只做這一件事**：不挑行、不截斷。哪幾行有用只有讀的人（agent 或人）
- * 判斷得出來；程式用正則猜「哪行像失敗」換一個測試框架就會抓錯，而且沒有人會知道。
- */
 describe('stripAnsi：只清色碼，不動內容', () => {
   it('清掉色碼，其餘一字不動', () => {
     const raw = [
