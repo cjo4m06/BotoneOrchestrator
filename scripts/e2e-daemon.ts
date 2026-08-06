@@ -304,7 +304,7 @@ class ScriptedAgent implements AgentLike {
     'T-1': [
       (i) => {
         writeAlpha(i.cwd, false);
-        return { sessionId: 'sess-T1', resultText: '新增 alpha.js 的 alphaSum 與測試。', isError: false, toolCalls: {} };
+        return { sessionId: 'sess-T1', resultText: '', isError: false, toolCalls: {}, summary: { what: '新增 alpha.js 的 alphaSum 與測試。' } };
       },
     ],
     'T-2': [
@@ -323,7 +323,7 @@ class ScriptedAgent implements AgentLike {
       // 第二輪（人已回覆後）：實際修改
       (i) => {
         writeAlpha(i.cwd, true);
-        return { sessionId: 'sess-T2', resultText: 'alphaSum 補上空陣列回傳 0 的邊界處理。', isError: false, toolCalls: {} };
+        return { sessionId: 'sess-T2', resultText: '', isError: false, toolCalls: {}, summary: { what: 'alphaSum 補上空陣列回傳 0 的邊界處理。' } };
       },
     ],
     'T-3': [
@@ -345,7 +345,7 @@ class ScriptedAgent implements AgentLike {
           join(i.cwd, 'README.md'),
           '# e2e-daemon fixture\n\n這是端到端 harness 用的假專案。\n\n## 安裝\n\n```\nnpm install\n```\n\n## 測試\n\n```\nnpm test\n```\n',
         );
-        return { sessionId: 'sess-T3', resultText: 'README 補上安裝與測試說明。', isError: false, toolCalls: {} };
+        return { sessionId: 'sess-T3', resultText: '', isError: false, toolCalls: {}, summary: { what: 'README 補上安裝與測試說明。' } };
       },
     ],
     // 探針：**每一輪**都宣告無需改動（模擬一張確實不用做的卡）
@@ -372,7 +372,7 @@ class ScriptedAgent implements AgentLike {
           join(i.cwd, 'gamma.test.js'),
           "const test = require('node:test');\nconst assert = require('node:assert');\nconst { gammaAll } = require('./gamma');\n\ntest('gammaAll sums', () => {\n  assert.equal(gammaAll([1, 2, 3]), 6);\n});\n",
         );
-        return { sessionId: 'sess-T4', resultText: '新增 gamma.js 與測試。', isError: false, toolCalls: {} };
+        return { sessionId: 'sess-T4', resultText: '', isError: false, toolCalls: {}, summary: { what: '新增 gamma.js 與測試。' } };
       },
     ],
   };

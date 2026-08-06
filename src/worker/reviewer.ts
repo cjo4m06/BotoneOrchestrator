@@ -507,12 +507,6 @@ export function toReviewOutcome(verdict: ReviewVerdict): ReviewOutcome {
   };
 }
 
-/** diff 過長時保留頭尾（頭有檔案清單脈絡、尾常是新加的東西）。 */
-export function truncateDiff(diff: string, maxChars: number): string {
-  if (diff.length <= maxChars) return diff;
-  const half = Math.floor(maxChars / 2);
-  return `${diff.slice(0, half)}\n\n…（diff 過長，中間 ${diff.length - maxChars} 字元已省略）…\n\n${diff.slice(-half)}`;
-}
 
 
 /** 從文字中抓出第一個完整的 JSON 物件（優先 ```json 圍欄，其次括號配對）。 */

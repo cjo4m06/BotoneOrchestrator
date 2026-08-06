@@ -1,5 +1,5 @@
 import { execa } from 'execa';
-import { splitOutput, type CheckContext, type CheckRecorder } from './check-recorder.js';
+import type { CheckContext, CheckRecorder } from './check-recorder.js';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
@@ -457,7 +457,9 @@ export class Verifier {
       const detail =
         `逾時：指令超過 ${timeoutMs}ms 仍未結束，已被終止。` +
         `\n可能是測試/建置卡住（等待輸入、watch 模式、等不到的服務），或這個專案本來就需要更長時間` +
-        `（可調 projects.yaml 的驗證逾時設定）。\n被終止前的輸出：\n${splitOutput(output).inline}`;
+        '（可調 projects.yaml 的驗證逾時設定）。\n' +
+        // 逾時也一樣不貼輸出——它自己跑一次就看得到，而且能自己決定要不要縮小範圍。
+        '被終止前的輸出沒有貼在這裡（全文在 check_runs）。自己跑一次看它卡在哪。';
       return {
         result: { name, ok: false, detail, failingIds: [ID_TIMEOUT] },
         ...(res.exitCode === undefined ? {} : { exitCode: res.exitCode }),

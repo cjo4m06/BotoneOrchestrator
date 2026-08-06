@@ -11,6 +11,7 @@ import { readDiffStat, type PolicyInput } from '../policy/policy-engine.js';
 import type { MergeRiskVerdict } from './merge-risk-judge.js';
 import { gitDiffHash } from '../git/status.js';
 import type { CheckContext } from '../worker/check-recorder.js';
+import type { AgentSummaryCapture } from '../worker/agent-runtime.js';
 import type { CheckRunInput } from '../store/ledger.js';
 import { openMergeApprovalHandoff, openStuckGroupHandoff } from './handoff.js';
 import { resolveBaseFreshness } from '../git/base-freshness.js';
@@ -470,23 +471,45 @@ export function defaultScreenshotsFor(input: { taskId: string; cwd: string; conf
  * 前提下取得總結——比從 ledger 反查更直接，且對任何 AgentLike 實作都成立。
  */
 export class SummaryRecorder implements AgentLike {
-  private byTask = new Map<string, string>();
+  private byTask = new Map<string, AgentSummaryCapture>();
 
   constructor(private inner: AgentLike, private onCapture?: (taskId: string, text: string) => void) {}
 
   async iterate(input: IterateInput): Promise<IterateResult> {
     const r = await this.inner.iterate(input);
-    // 只留「成功那輪」的總結；失敗輪的文字多半是錯誤訊息，寫進 PR 只會誤導
-    if (!r.isError && r.resultText.trim()) {
-      this.byTask.set(input.task.id, r.resultText);
-      this.onCapture?.(input.task.id, r.resultText);
+    // **只收 agent 用 report_summary 交的結構。**
+    //
+    // 先前收的是它最後那段自由文字，再由 pr-body 用六條中文正則猜每個 markdown 標題
+    // 屬於哪一欄；猜不中就整段丟掉——寫英文標題就整份總結被丟光，
+    // 而 PR 上是一片空白不是一個警訊。現在它直接交欄位。
+    //
+    // 只留「成功那輪」的：失敗輪多半是半成品，寫進 PR 只會誤導。
+    if (!r.isError && r.summary) {
+      this.byTask.set(input.task.id, r.summary);
+      this.onCapture?.(input.task.id, renderSummary(r.summary));
     }
     return r;
   }
 
-  get(taskId: string): string | undefined {
+  get(taskId: string): AgentSummaryCapture | undefined {
     return this.byTask.get(taskId);
   }
+}
+
+/**
+ * 把結構化總結渲染成給**下一棒 agent** 看的文字。
+ *
+ * 這是搬資料不是解析：欄位是 agent 自己填的，這裡只決定排版。
+ * 不寫 JSON 是因為讀的人是另一個 agent——給它一段人話比給它一包 JSON 好讀。
+ */
+export function renderSummary(s: AgentSummaryCapture): string {
+  const rows: [string, string | undefined][] = [
+    ['做了什麼', s.what], ['怎麼做', s.how], ['架構', s.architecture],
+    ['畫面設計', s.ui], ['操作形式', s.ux], ['核心技術', s.keyTech],
+  ];
+  const parts = rows.filter(([, v]) => v?.trim()).map(([k, v]) => `## ${k}\n${v!.trim()}`);
+  if (s.assumptions?.length) parts.push(`## 假設\n${s.assumptions.map((a) => `- ${a}`).join('\n')}`);
+  return parts.join('\n\n');
 }
 
 /** 回灌意見在 GateReport 裡的關卡名稱（agent prompt 會列出這一項）。 */
@@ -500,15 +523,6 @@ export const REVIEW_FEEDBACK_CHECK = 'review_feedback';
  * 走這條既有管道，意見就能原封不動送到 agent 面前，不必改 Worker/AgentRuntime 的介面。
  * signature 固定不含時間等浮動值，才不會破壞無進展偵測（§D11）。
  */
-/** 從 git 的 rebase 輸出裡挑出真正衝突的檔案（`CONFLICT (...): Merge conflict in <file>`）。 */
-export function conflictedFiles(gitOutput: string): string[] {
-  const out = new Set<string>();
-  for (const line of gitOutput.split('\n')) {
-    const m = /Merge conflict in (.+?)\s*$/.exec(line) ?? /^CONFLICT \([^)]*\): (.+?)\s*$/.exec(line);
-    if (m?.[1]) out.add(m[1].trim());
-  }
-  return [...out];
-}
 
 /**
  * Merge Guard 的判決 → 一則交給 agent 的意見。
@@ -1471,7 +1485,7 @@ export class GroupRunner {
   ): string {
     const summaries: AgentSummary[] = details.flatMap((d) => {
       const text = recorder.get(d.id);
-      return text ? [{ taskId: d.id, title: d.title, text }] : [];
+      return text ? [{ taskId: d.id, title: d.title, summary: text }] : [];
     });
     const { narrative, assumptions } = narrativeFromSummaries(summaries);
     if (summaries.length === 0) {

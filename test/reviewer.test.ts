@@ -7,7 +7,6 @@ import {
   parseReviewResponse,
   reviewGateReport,
   toReviewOutcome,
-  truncateDiff,
   type ReviewQueryFn,
 } from '../src/worker/reviewer.js';
 import { evaluateStopHook } from '../src/worker/agent-runtime.js';
@@ -196,16 +195,8 @@ describe('reviewGateReport / toReviewOutcome', () => {
   });
 });
 
-describe('truncateDiff', () => {
-  it('短 diff 原樣返回', () => {
-    assert.equal(truncateDiff('abc', 100), 'abc');
-  });
-  it('長 diff 保留頭尾並標註省略', () => {
-    const out = truncateDiff('x'.repeat(1000), 100);
-    assert.ok(out.length < 400);
-    assert.match(out, /diff 過長/);
-  });
-});
+// truncateDiff 隨「程式不預先算 diff」一起退場——審查者自己用 git 工具查。
+
 
 describe('hasClaudeAuth', () => {
   it('依環境變數判斷', () => {

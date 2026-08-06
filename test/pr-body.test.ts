@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generatePrBody, narrativeFromSummaries, parseAgentSummary } from '../src/pr/pr-body.js';
+import { generatePrBody, narrativeFromSummaries } from '../src/pr/pr-body.js';
 import { makeTaskDetail } from './helpers/index.js';
 
 // DESIGN.md §14 規定的九段版型，順序不可變（審查者靠固定結構快速掃讀）。
@@ -172,124 +172,40 @@ test('空白字串的分群理由視同沒有', () => {
 
 // ── agent 總結 → 敘事 ──
 
-test('markdown 標題對映到敘事欄位，假設段落轉成條列', () => {
-  const { narrative, assumptions } = parseAgentSummary(
-    [
-      '## 做了什麼',
-      '新增深色模式。',
-      '## 怎麼做',
-      '以 CSS 變數切換主題。',
-      '## 架構',
-      '新增 ThemeProvider。',
-      '## 畫面設計',
-      '設定頁多一個開關。',
-      '## 操作形式',
-      '點擊即時生效。',
-      '## 核心關鍵技術',
-      'prefers-color-scheme。',
-      '## 假設與待確認',
-      '- 沿用既有色票',
-      '- 文案暫用英文',
-    ].join('\n'),
-  );
-
-  assert.deepEqual(narrative, {
-    what: '新增深色模式。',
-    how: '以 CSS 變數切換主題。',
-    architecture: '新增 ThemeProvider。',
-    ui: '設定頁多一個開關。',
-    ux: '點擊即時生效。',
-    keyTech: 'prefers-color-scheme。',
-  });
-  assert.deepEqual(assumptions, ['沿用既有色票', '文案暫用英文']);
-});
-
-test('「畫面設計」歸 UI 而非架構（標題含「設計」二字不可誤判）', () => {
-  const { narrative } = parseAgentSummary('## 畫面設計\n三個斷點都檢查過。');
-  assert.equal(narrative.ui, '三個斷點都檢查過。');
-  assert.equal(narrative.architecture, undefined);
-});
-
-test('沒有任何標題時整段當「做了什麼」（agent 常只寫一段話）', () => {
-  const { narrative, assumptions } = parseAgentSummary('修好了登入按鈕沒反應的問題。');
-  assert.equal(narrative.what, '修好了登入按鈕沒反應的問題。');
-  assert.deepEqual(assumptions, []);
-});
-
-test('粗體標籤只有對得上欄位時才視為標題，內文的粗體強調不切段', () => {
-  const { narrative } = parseAgentSummary(
-    ['**怎麼做**：改 auth.ts', '**注意** 這行只是強調，不是新段落', '仍屬同一段。'].join('\n'),
-  );
-  assert.equal(
-    narrative.how,
-    ['改 auth.ts', '**注意** 這行只是強調，不是新段落', '仍屬同一段。'].join('\n'),
-  );
-});
-
-test('未知標題的段落一律忽略，不硬塞進其他欄位', () => {
-  const { narrative } = parseAgentSummary('## 隨手記\n跟 PR 無關的碎念。\n## 怎麼做\n改設定檔。');
-  assert.equal(narrative.how, '改設定檔。');
-  assert.equal(narrative.what, undefined, '未知段落不可被當成 what');
-});
-
-test('沒有假設段時，退而擷取全文含「假設」字樣的條列', () => {
-  const { assumptions } = parseAgentSummary('## 怎麼做\n改了設定。\n- 假設預設語系為 zh-TW\n- 順手加了測試');
-  assert.deepEqual(assumptions, ['假設預設語系為 zh-TW']);
-});
-
-test('假設段寫「（無）」視同沒有假設', () => {
-  const { assumptions } = parseAgentSummary('## 假設\n（無）');
-  assert.deepEqual(assumptions, []);
-});
-
-test('假設段是整段文字時折成單一條目（避免破壞 PR 的條列格式）', () => {
-  const { assumptions } = parseAgentSummary('## 假設\n沿用既有錯誤碼，\n未新增型別。');
-  assert.deepEqual(assumptions, ['沿用既有錯誤碼， 未新增型別。']);
-});
-
-test('多任務總結：各段以任務標題分小節，假設加上任務 id 前綴', () => {
+/**
+ * **agent 直接交結構，程式不解析散文。**
+ *
+ * 先前有六條中文關鍵字正則去猜 markdown 標題屬於哪一欄，對不上就整段丟掉——
+ * agent 只要寫英文標題（## Implementation / ## Changes）就整份總結被丟光，
+ * 而 PR 上是一片空白不是一個警訊。資料一開始就是結構化的（提示詞規定了格式），
+ * 程式卻讓它渲染成散文再猜回來。現在它用 report_summary 交欄位。
+ */
+test('欄位原樣搬進 PR，不做任何解析', () => {
   const { narrative, assumptions } = narrativeFromSummaries([
-    { taskId: 'T-1', title: '登入表單', text: '## 做了什麼\n加上驗證。\n## 假設\n- 沿用既有錯誤碼' },
-    { taskId: 'T-2', title: '錯誤提示', text: '## 做了什麼\n補上提示。' },
+    {
+      taskId: 'T-1',
+      title: '深色模式',
+      summary: {
+        what: '加了切換開關',
+        ui: '三個斷點都檢查過',
+        assumptions: ['預設跟隨系統'],
+      },
+    },
   ]);
 
-  assert.equal(narrative.what, '### 登入表單\n\n加上驗證。\n\n### 錯誤提示\n\n補上提示。');
-  assert.deepEqual(assumptions, ['[T-1] 沿用既有錯誤碼']);
+  assert.equal(narrative.what, '加了切換開關');
+  assert.equal(narrative.ui, '三個斷點都檢查過');
+  assert.deepEqual(assumptions, ['預設跟隨系統']);
+  assert.equal(narrative.architecture, undefined, '沒填的欄位就是沒有，不要生一個出來');
 });
 
-test('單一任務總結不加小節標題；空總結被忽略', () => {
+test('英文內容一樣進得去（先前六條中文正則會整份丟掉）', () => {
   const { narrative } = narrativeFromSummaries([
-    { taskId: 'T-1', title: '登入表單', text: '## 做了什麼\n加上驗證。' },
-    { taskId: 'T-2', title: '空的', text: '   ' },
+    { taskId: 'T-1', title: 'Dark mode', summary: { what: 'Added a toggle', how: 'CSS variables' } },
   ]);
-  assert.equal(narrative.what, '加上驗證。');
+
+  assert.equal(narrative.what, 'Added a toggle');
+  assert.equal(narrative.how, 'CSS variables');
 });
 
-test('完全沒有總結時回空敘事（交由 generatePrBody 標待補）', () => {
-  const { narrative, assumptions } = narrativeFromSummaries([]);
-  assert.deepEqual(narrative, {});
-  assert.deepEqual(assumptions, []);
-  const body = generatePrBody({ tasks: [makeTaskDetail()], narrative, assumptions });
-  assert.equal(section(body, '怎麼做 (How)'), '（待補）');
-});
 
-test('重複的假設只留一條', () => {
-  const { assumptions } = narrativeFromSummaries([
-    { taskId: 'T-1', title: 'a', text: '## 假設\n- 同一條' },
-  ]);
-  assert.deepEqual(assumptions, ['同一條']);
-});
-
-test('完整輸入時九段全部有實質內容（無任何待補）', () => {
-  const body = generatePrBody({
-    tasks: [makeTaskDetail({ id: 'T-1', title: '深色模式', docRefs: ['spec/theme.md'] })],
-    narrative: { what: 'w', how: 'h', architecture: 'a', ui: 'u', ux: 'x', keyTech: 'k' },
-    screenshots: ['s.png'],
-    verification: [{ name: 'build', ok: true }],
-    diff: { files: ['a.ts'], additions: 1, deletions: 0 },
-    assumptions: ['預設開啟'],
-    rationale: '單一任務',
-  });
-  assert.equal(body.includes('（待補）'), false);
-  assert.equal(body.includes('（無）'), false);
-});

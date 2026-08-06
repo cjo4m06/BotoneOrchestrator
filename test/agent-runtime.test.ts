@@ -69,17 +69,15 @@ test('完成要求永遠壓在最後（避免被前面的內容淹沒）', () =>
   for (const sec of inputs) assert.ok(idx(sec) < idx('## 完成要求'), `${sec} 應在完成要求之前`);
   // 指示區塊（完成要求 + 最終總結格式）壓在所有「輸入」之後。
   // 總結格式本身是一份含多個標題的範本，所以不能用「之後沒有其他 ##」來斷言。
-  assert.ok(idx('## 完成要求') < idx('## 最終總結的格式'));
+  assert.ok(idx('## 完成要求') < idx('## 做完之後：呼叫 report_summary'));
 });
 
-test('prompt 要求 agent 產出 PR 需要的敘事段落（否則 PR 全是「待補」）', () => {
+test('prompt 叫 agent 用 report_summary 交結構，不是寫在對話裡', () => {
   const p = buildAgentPrompt(input());
-  // PR 內文的敘事是從 agent 總結解析出來的；prompt 不講，agent 就只會寫一兩句話，
-  // 需求「讓審查人員快速了解」等於沒兌現（實際看 PR 時發現大半段落都是「（待補）」）
-  for (const sec of ['做了什麼', '怎麼做', '架構', '畫面設計', '操作形式', '核心技術', '假設']) {
-    assert.match(p, new RegExp(`## ${sec}`), `總結格式應包含「${sec}」`);
-  }
-  assert.match(p, /不適用的段落整段省略/, '不可鼓勵硬湊段落');
+
+  assert.match(p, /呼叫 report_summary/);
+  assert.match(p, /寫在對話裡的東西程式讀不到/, '要講出為什麼——先前是用正則猜它的標題，猜不中就整段丟掉');
+  assert.match(p, /不要填「無」或「待補」/);
 });
 
 test('規格**不預抓**，只給出處並叫它自己去讀', () => {

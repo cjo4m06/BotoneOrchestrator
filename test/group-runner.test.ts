@@ -1,4 +1,5 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
+import type { AgentSummaryCapture } from '../src/worker/agent-runtime.js';
 import assert from 'node:assert/strict';
 import {
   GROUP_DEPS_BLOCKED_EVENT,
@@ -204,7 +205,7 @@ const greenVerifier = (): VerifierLike => ({
 });
 
 /** 依 taskId 回不同總結；未列出的任務回空字串（模擬 agent 沒給總結）。 */
-function fakeAgent(byTask: Record<string, string> = {}): AgentLike & { rounds: number; calls: IterateInput[] } {
+function fakeAgent(byTask: Record<string, AgentSummaryCapture> = {}): AgentLike & { rounds: number; calls: IterateInput[] } {
   // 型別標在變數上（不是最後才轉型）：這個假件少一個 IterateResult 的必填欄位時
   // 要當場紅，而不是被 `as` 蓋掉——那正是「假件與介面脫節、測試照樣綠」的路。
   const a: AgentLike & { rounds: number; calls: IterateInput[] } = {
@@ -213,7 +214,9 @@ function fakeAgent(byTask: Record<string, string> = {}): AgentLike & { rounds: n
     async iterate(input) {
       a.rounds += 1;
       a.calls.push(input);
-      return { sessionId: 's', resultText: byTask[input.task.id] ?? '', toolCalls: {}, isError: false };
+      // agent 現在用 report_summary 交結構（先前是把散文丟在 resultText 讓程式用正則猜）
+      const summary = byTask[input.task.id];
+      return { sessionId: 's', resultText: '', toolCalls: {}, isError: false, ...(summary ? { summary } : {}) };
     },
   };
   return a;
@@ -322,7 +325,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     over: Partial<GroupRunnerDeps> & {
       guard?: ReturnType<typeof fakeGuard>;
       diff?: PolicyInput;
-      summaries?: Record<string, string>;
+      summaries?: Record<string, AgentSummaryCapture>;
       gitOpts?: FakeGitOpts;
       /** 直接注入共用的假 git（測跨群互斥用）。 */
       sharedGit?: ReturnType<typeof fakeGit>;
@@ -724,19 +727,13 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     const group = seedGroup(['深色模式']);
     const h = build({
       summaries: {
-        'T-1': [
-          '## 做了什麼',
-          '新增深色模式切換。',
-          '## 怎麼做',
-          '以 CSS 變數切換主題。',
-          '## 架構',
-          '新增 ThemeProvider。',
-          '## 核心技術',
-          'prefers-color-scheme + localStorage。',
-          '## 假設',
-          '- 沿用既有色票，未新增 design token',
-          '- 偏好存 localStorage',
-        ].join('\n'),
+        'T-1': {
+          what: '新增深色模式切換。',
+          how: '以 CSS 變數切換主題。',
+          architecture: '新增 ThemeProvider。',
+          keyTech: 'prefers-color-scheme + localStorage。',
+          assumptions: ['沿用既有色票，未新增 design token', '偏好存 localStorage'],
+        },
       },
     });
 
@@ -771,16 +768,16 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     const group = seedGroup(['登入表單', '錯誤提示']);
     const h = build({
       summaries: {
-        'T-1': '## 做了什麼\n加上表單驗證。',
-        'T-2': '## 做了什麼\n補上錯誤提示。',
+        'T-1': { what: '加上表單驗證。' },
+        'T-2': { what: '補上錯誤提示。' },
       },
     });
 
     await h.runner.run(group);
 
     const body = h.pr.prs[0]?.body ?? '';
-    assert.match(body, /### 登入表單\n\n加上表單驗證。/);
-    assert.match(body, /### 錯誤提示\n\n補上錯誤提示。/);
+    assert.match(body, /### 登入表單\n加上表單驗證。/);
+    assert.match(body, /### 錯誤提示\n補上錯誤提示。/);
   });
 
   it('agent 沒給總結 → 敘事退回任務標題，其餘段落維持「（待補）」（不可空白）', async () => {
@@ -797,7 +794,7 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
 
   it('agent 總結會落 ledger events 供稽核', async () => {
     const group = seedGroup(['某任務']);
-    const h = build({ summaries: { 'T-1': '做完了：改了 a.ts' } });
+    const h = build({ summaries: { 'T-1': { what: '做完了：改了 a.ts' } } });
 
     await h.runner.run(group);
 

@@ -75,7 +75,7 @@ export const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   docs: DOCS_TOOLS,
   friction: ['mcp__friction__report_friction'],
   // 寫程式的 agent 的三個出口掛在同一個 `ask` server 底下
-  ask: ['mcp__ask__ask_human', 'mcp__ask__report_no_change', 'mcp__ask__report_friction'],
+  ask: ['mcp__ask__ask_human', 'mcp__ask__report_no_change', 'mcp__ask__report_friction', 'mcp__ask__report_summary'],
   browser_full: [],
   browser_readonly: [],
   git_readonly: GIT_READONLY_TOOLS,

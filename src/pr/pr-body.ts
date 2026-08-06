@@ -38,6 +38,9 @@ export interface PrBodyInput {
 
 const TBD = '（待補）';
 
+/** 敘事欄位（順序即 PR 上的呈現順序）。 */
+const NARRATIVE_FIELDS = ['what', 'how', 'architecture', 'ui', 'ux', 'keyTech'] as const;
+
 /**
  * 產生 PR 內文（DESIGN.md §14 / 需求 5）：讓審查者快速掌握
  * 做了什麼／怎麼做／架構／畫面／操作／核心技術／驗證／假設／涵蓋任務。
@@ -129,152 +132,57 @@ export function generatePrBody(input: PrBodyInput): string {
 
 // ── agent 總結 → PR 敘事 ──
 
-/** 一個任務的 agent 最終總結（GroupRunner 側錄 IterateResult.resultText 得來）。 */
+/** 一個任務的結構化總結（agent 用 report_summary 交的）。 */
 export interface AgentSummary {
   taskId: string;
   title: string;
-  text: string;
-}
-
-/** 敘事欄位順序（同時決定多任務合併時的段落順序）。 */
-const NARRATIVE_FIELDS = ['what', 'how', 'architecture', 'ui', 'ux', 'keyTech'] as const;
-
-/**
- * 標題關鍵字 → 敘事欄位。順序即優先序：'畫面設計' 必須先被 ui 收走，
- * 否則會被之後的規則誤判（所以 architecture 只認「架構」，不認「設計」）。
- */
-const FIELD_PATTERNS: { field: (typeof NARRATIVE_FIELDS)[number]; re: RegExp }[] = [
-  { field: 'ui', re: /(畫面|介面|版面|^ui$|\bui\b)/i },
-  { field: 'ux', re: /(操作|互動|使用流程|^ux$|\bux\b)/i },
-  { field: 'keyTech', re: /(核心技術|關鍵技術|技術重點|技術選型|key\s*tech)/i },
-  { field: 'architecture', re: /(架構|architecture)/i },
-  { field: 'how', re: /(怎麼做|做法|實作|實做|變更內容|how)/i },
-  { field: 'what', re: /(做了什麼|完成內容|變更摘要|摘要|總結|what|summary)/i },
-];
-
-/** 假設段的標題關鍵字（PR「假設與待確認」欄位）。 */
-const ASSUMPTION_RE = /(假設|預設值|待確認|待釐清|assumption)/i;
-
-/** 「其實沒有假設」的常見寫法，不該變成一條假設。 */
-const EMPTY_RE = /^[（(]?\s*(無|沒有|none|n\/?a)\s*[）)]?[。.]?$/i;
-
-/**
- * 解析單一 agent 總結：把 markdown 段落對映到 PR 敘事欄位與假設清單。
- * agent 的總結格式不受控（自由文字），所以採「寬鬆比對 + 保守放棄」：
- * 對不上的段落一律忽略，寧可讓 PR 標「（待補）」，也不要塞錯段落誤導審查者。
- */
-export function parseAgentSummary(text: string): { narrative: PrNarrative; assumptions: string[] } {
-  const narrative: PrNarrative = {};
-  const assumptions: string[] = [];
-  let preamble = '';
-
-  for (const s of splitSections(text)) {
-    const body = s.lines.join('\n').trim();
-    if (!body) continue;
-    if (!s.heading) {
-      // 無標題前言：當「做了什麼」的後備（很多 agent 只寫一段話就交差）
-      if (!preamble) preamble = body;
-      continue;
-    }
-    if (ASSUMPTION_RE.test(s.heading)) {
-      assumptions.push(...toItems(body));
-      continue;
-    }
-    const hit = FIELD_PATTERNS.find((p) => p.re.test(s.heading));
-    if (!hit) continue;
-    if (!narrative[hit.field]) narrative[hit.field] = body; // 同欄位重複出現時取第一段
-  }
-
-  if (!narrative.what && preamble) narrative.what = preamble;
-  // 沒有假設段時，退而掃全文條列中含「假設」字樣的行（agent 常把假設寫在結尾清單裡）
-  if (assumptions.length === 0) {
-    assumptions.push(...bulletsOf(text).filter((b) => ASSUMPTION_RE.test(b)));
-  }
-  return { narrative, assumptions: dedupe(assumptions) };
+  summary: {
+    what?: string;
+    how?: string;
+    architecture?: string;
+    ui?: string;
+    ux?: string;
+    keyTech?: string;
+    assumptions?: string[];
+  };
 }
 
 /**
- * 合併同一群多個任務的 agent 總結成一份 PR 敘事。
- * 多任務時每段以 `### 任務標題` 分小節，避免不同任務的敘述糊在一起；
- * 全部沒有內容的欄位不填（由 generatePrBody 標「（待補）」）。
+ * 把多個任務的總結合成 PR 的敘事段。
+ *
+ * ── 這裡刻意不做什麼 ──
+ *
+ * 先前有六條中文關鍵字正則（`/(畫面|介面|版面|^ui$)/i` 之類）去猜 agent 散文裡的
+ * markdown 標題屬於哪一欄，對不上就整段丟掉。agent 只要寫英文標題
+ *（## Implementation / ## Changes）六條就全部落空、整份總結被丟光——
+ * 而 PR 上是**一片空白不是一個警訊**（有文字所以 hasNarrative 為真，連「（待補）」都不印）。
+ * 反過來也會錯配：講 UI 的總結只要標題裡有「架構」兩個字就被 architecture 收走。
+ *
+ * 荒謬的是資料一開始就是結構化的——提示詞規定了格式，程式卻讓 agent 渲染成散文、
+ * 再用正則猜回來。現在它用 report_summary 直接交欄位，這裡只負責合併與搬運。
+ *
+ * 多個任務時各欄以「### 任務標題」分小節串接，不做摘要也不改寫。
  */
 export function narrativeFromSummaries(
   summaries: AgentSummary[],
 ): { narrative: PrNarrative; assumptions: string[] } {
-  const parsed = summaries
-    .filter((s) => s.text.trim())
-    .map((s) => ({ src: s, out: parseAgentSummary(s.text) }));
-  const multi = parsed.length > 1;
-
   const narrative: PrNarrative = {};
-  for (const field of NARRATIVE_FIELDS) {
-    const parts = parsed.flatMap(({ src, out }) => {
-      const v = out.narrative[field];
-      return v ? [{ title: src.title, value: v }] : [];
-    });
-    if (parts.length === 0) continue;
-    narrative[field] = multi
-      ? parts.map((p) => `### ${p.title}\n\n${p.value}`).join('\n\n')
-      : parts[0]!.value;
-  }
+  const assumptions: string[] = [];
+  const fields = ['what', 'how', 'architecture', 'ui', 'ux', 'keyTech'] as const;
 
-  const assumptions = dedupe(
-    parsed.flatMap(({ src, out }) => out.assumptions.map((a) => (multi ? `[${src.taskId}] ${a}` : a))),
-  );
+  for (const f of fields) {
+    const parts = summaries
+      .map((s) => ({ title: s.title, text: s.summary[f]?.trim() }))
+      .filter((x): x is { title: string; text: string } => Boolean(x.text));
+    if (parts.length === 0) continue;
+    narrative[f] = parts.length === 1
+      ? parts[0]!.text
+      : parts.map((x) => `### ${x.title}\n${x.text}`).join('\n\n');
+  }
+  for (const s of summaries) {
+    for (const a of s.summary.assumptions ?? []) {
+      if (a.trim()) assumptions.push(summaries.length > 1 ? `[${s.title}] ${a.trim()}` : a.trim());
+    }
+  }
   return { narrative, assumptions };
 }
-
-interface RawSection {
-  heading: string;
-  lines: string[];
-}
-
-/**
- * 依標題切段。markdown `#` 標題一律開新段（未知標題也要切，否則後文會污染前一段）；
- * `**粗體標籤**：` 只有在對得上已知欄位時才視為標題，避免內文的粗體強調把段落切碎。
- */
-function splitSections(text: string): RawSection[] {
-  const sections: RawSection[] = [{ heading: '', lines: [] }];
-  for (const raw of text.split('\n')) {
-    const md = /^\s{0,3}#{1,6}\s+(.+?)\s*$/.exec(raw);
-    if (md) {
-      sections.push({ heading: cleanHeading(md[1]!), lines: [] });
-      continue;
-    }
-    const bold = /^\s*(?:[-*+]\s+)?\*\*(.+?)\*\*\s*(?:[:：]\s*(.*))?$/.exec(raw);
-    const boldTitle = bold ? cleanHeading(bold[1]!) : '';
-    if (bold && isKnownHeading(boldTitle)) {
-      const rest = bold[2]?.trim() ?? '';
-      sections.push({ heading: boldTitle, lines: rest ? [rest] : [] });
-      continue;
-    }
-    sections[sections.length - 1]!.lines.push(raw);
-  }
-  return sections;
-}
-
-const isKnownHeading = (h: string): boolean =>
-  ASSUMPTION_RE.test(h) || FIELD_PATTERNS.some((p) => p.re.test(h));
-
-const cleanHeading = (s: string): string => s.replace(/[*#`]/g, '').replace(/[:：]\s*$/, '').trim();
-
-/** 段落 → 條列項目；沒有條列符號時整段視為一項（換行折成空白，才能塞進 `- ` 清單）。 */
-function toItems(body: string): string[] {
-  const bullets = bulletsOf(body);
-  if (bullets.length > 0) return bullets;
-  const flat = body.split('\n').map((l) => l.trim()).filter(Boolean).join(' ');
-  return flat && !EMPTY_RE.test(flat) ? [flat] : [];
-}
-
-function bulletsOf(text: string): string[] {
-  const out: string[] = [];
-  for (const line of text.split('\n')) {
-    const m = /^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$/.exec(line);
-    if (!m) continue;
-    const item = m[1]!.replace(/^\[[ xX]\]\s*/, '').trim();
-    if (item && !EMPTY_RE.test(item)) out.push(item);
-  }
-  return out;
-}
-
-const dedupe = (xs: string[]): string[] => [...new Set(xs)];

@@ -129,12 +129,16 @@ export interface IterateResult {
   /** agent 宣告本任務無需改動（處置由 Worker 依政策決定，見 NoChangeCategory）。 */
   reportedNoChange?: NoChangeCapture;
   isError: boolean;
+  /** agent 交的結構化總結（沒呼叫 report_summary 就沒有）。 */
+  summary?: AgentSummaryCapture;
 }
 
 /** 本輪從自訂工具收集到的訊號（工具處理器寫入，iterate 結束時讀出）。 */
 export interface CapturedSignals {
   clar?: ClarificationCapture;
   noChange?: NoChangeCapture;
+  /** agent 交的結構化總結（見 createSummaryHandler：程式不再用正則猜它的散文）。 */
+  summary?: AgentSummaryCapture;
 }
 
 /**
@@ -537,6 +541,7 @@ export class AgentRuntime {
       resultText,
       askedClarification: captured.clar,
       reportedNoChange: captured.noChange,
+      ...(captured.summary ? { summary: captured.summary } : {}),
       isError,
       toolCalls: Object.fromEntries(toolsUsed),
       ...(outcome.errorKind ? { errorKind: outcome.errorKind } : {}),
@@ -586,6 +591,22 @@ export class AgentRuntime {
       name: 'ask',
       version: '1.0.0',
       tools: [
+        tool(
+          'report_summary',
+          '**做完之後呼叫這個交出你的總結**（會被放進 PR 給人審查）。\n' +
+            '不適用的欄位整個省略——不要填「無」或「待補」。\n' +
+            '這是結構化的：程式只把欄位搬進 PR 版型，不會去讀你的散文猜哪一段在講什麼。',
+          {
+            what: z.string().optional().describe('做了什麼：一到三句說明這次的成果'),
+            how: z.string().optional().describe('怎麼做：實作方式與關鍵決策，為什麼這樣而不是別的做法'),
+            architecture: z.string().optional().describe('架構：模組、資料流或介面的變動。小修改沒有結構性變動就省略'),
+            ui: z.string().optional().describe('畫面設計：只有動到畫面才寫'),
+            ux: z.string().optional().describe('操作形式：使用者實際怎麼操作、走完流程看到什麼'),
+            keyTech: z.string().optional().describe('核心技術：用到的關鍵 API、演算法或框架特性'),
+            assumptions: z.array(z.string()).optional().describe('你自行採用的可逆預設，一條一項，附依據'),
+          },
+          createSummaryHandler(captured, this.log, taskId),
+        ),
         tool(
           'report_no_change',
           '當你確認這個任務「不需要任何程式碼改動」時呼叫（例如功能已存在、任務描述與現況不符、' +
@@ -726,6 +747,44 @@ export function createStopHook(args: StopHookArgs) {
     return { continue: true, systemMessage: decision.reason };
   };
 }
+
+/**
+ * `report_summary` 的處理函式：把 agent 交的結構原樣收下。
+ *
+ * ── 為什麼要有這個工具 ──
+ *
+ * PR 內文的敘事段先前是**用六條中文正則去猜** agent 散文裡的 markdown 標題屬於哪一欄
+ *（`/(畫面|介面|版面|^ui$)/i` 之類）。對不上就整段丟掉——而 agent 只要寫英文標題
+ *（## Implementation / ## Changes）六條就全部落空，整份總結被丟光，
+ * 而 PR 上是**一片空白不是一個警訊**（因為「有文字」所以連「（待補）」都不印）。
+ *
+ * 荒謬的地方在於：提示詞本來就規定了格式，等於程式先要求結構、再讓它渲染成散文、
+ * 然後用正則猜回來。直接讓它交結構就好——reviewer / drift_judge / risk_judge
+ * 早就都是輸出 JSON 了。
+ */
+export function createSummaryHandler(captured: CapturedSignals, log: Logger, taskId: string) {
+  return async (args: unknown) => {
+    const parsed = SummarySchema.safeParse(args);
+    if (!parsed.success) {
+      return { content: [{ type: 'text' as const, text: '總結格式不正確，請照工具參數填。' }] };
+    }
+    captured.summary = parsed.data;
+    log.info({ taskId, fields: Object.keys(parsed.data) }, '📝 收到 agent 的結構化總結');
+    return { content: [{ type: 'text' as const, text: '總結已收下，會放進 PR。' }] };
+  };
+}
+
+const SummarySchema = z.object({
+  what: z.string().optional(),
+  how: z.string().optional(),
+  architecture: z.string().optional(),
+  ui: z.string().optional(),
+  ux: z.string().optional(),
+  keyTech: z.string().optional(),
+  assumptions: z.array(z.string()).optional(),
+});
+
+export type AgentSummaryCapture = z.infer<typeof SummarySchema>;
 
 /** ask_human 工具處理函式：把提問捕捉到 captured（供 Worker park），並回覆 agent 續做指示。 */
 export function createAskHumanHandler(captured: CapturedSignals, log: Logger, taskId: string) {
@@ -1170,29 +1229,11 @@ const EXTERNAL_ACTION_RULE = `
  * 也會讓「（待補）」失去它原本的意義（真的沒寫 vs 不適用）。
  */
 const SUMMARY_FORMAT = `
-## 最終總結的格式（會被放進 PR 給人審查，請務必照做）
-完成後，請以下列標題輸出總結。**不適用的段落整段省略**（不要寫「無」或「待補」）：
+## 做完之後：呼叫 report_summary 交總結
+那份總結會被放進 PR 給人審查。**用工具交，不要只寫在對話裡**——
+寫在對話裡的東西程式讀不到（先前是用正則猜你的標題屬於哪一欄，猜不中就整段丟掉）。
+不適用的欄位整個省略，不要填「無」或「待補」。`;
 
-## 做了什麼
-一到三句說明這次的成果。
-
-## 怎麼做
-實作方式與關鍵決策；為什麼這樣做而不是別的做法。
-
-## 架構
-模組、資料流或介面的變動。純粹的小修改沒有結構性變動時，省略本段。
-
-## 畫面設計
-只有動到畫面時才寫：版面、狀態、響應式行為、與既有設計語彙的關係。
-
-## 操作形式
-使用者實際怎麼操作、走完流程會看到什麼。沒有使用者可見行為時省略。
-
-## 核心技術
-用到的關鍵技術、API 或模式（例如某個瀏覽器 API、演算法、框架特性）。
-
-## 假設
-你自行採用的可逆預設，每行一條，附上依據。沒有就省略整段。`;
 
 export interface StopDecisionInput {
   /** 工作區相對 HEAD 是否有任何變更。 */
