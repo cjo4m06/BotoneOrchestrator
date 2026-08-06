@@ -75,9 +75,19 @@ describe('摩擦回報', () => {
   it('工具說明要把分界線講死：擋住了就去 ask_human，不是留在這裡', () => {
     assert.match(FRICTION_TOOL_DESCRIPTION, /沒有擋住我交付/);
     assert.match(FRICTION_TOOL_DESCRIPTION, /不要用這個，用 ask_human/, '沒有這句就會重演：agent 講了三次卻沒人被通知');
-    assert.match(FRICTION_TOOL_DESCRIPTION, /我還交得出去嗎/, '判準要給得出來，不能只說「看情況」');
+    assert.match(FRICTION_TOOL_DESCRIPTION, /會不會改變我這張卡該做出來的東西/, '判準要給得出來，不能只說「看情況」');
     assert.match(FRICTION_TOOL_DESCRIPTION, /第二次/, '要讓 agent 知道重複回報會被自動升級');
     assert.match(FRICTION_TOOL_DESCRIPTION, /一定要附證據/);
+  });
+
+  /**
+   * 這條鎖的是**換掉的那根軸**。舊判準「我還交得出去嗎」把整類壞掉的規格推來 friction：
+   * 規格壞掉時你永遠交得出某個 diff，只是不知道對不對，於是判準永遠說「繼續做」。
+   * 正式庫 #956／#893 就是這樣照著錯的前提出貨的。
+   */
+  it('不可以再用「交不交得出去」當判準——那正是漏掉壞規格的那根軸', () => {
+    assert.doesNotMatch(FRICTION_TOOL_DESCRIPTION, /我還交得出去嗎/);
+    assert.match(FRICTION_TOOL_DESCRIPTION, /即使你交得出 diff/, '要明講「交得出來也可能要停」');
   });
 });
 
