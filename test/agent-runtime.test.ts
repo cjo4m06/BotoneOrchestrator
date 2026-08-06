@@ -50,24 +50,26 @@ test('最小輸入：任務標題/類別/repo/描述與完成要求都在，且�
   assert.match(p, /## 完成要求/);
 });
 
-test('完成要求永遠壓在最後（避免被前面的規格內容淹沒）', () => {
+test('完成要求永遠壓在最後（避免被前面的內容淹沒）', () => {
   const p = buildAgentPrompt(
     input({
-      docs: [{ ref: 'spec/a.md#§1', content: '規格內容' }],
+      task: makeTaskDetail({ id: 'T-1', docRefs: ['spec/a.md#§1'] }),
       answer: { question: 'Q', answer: 'A' },
-      feedback: makeGateReport({ green: false, checks: [{ name: 'test', ok: false, detail: '紅' }] }),
+      feedback: makeGateReport({
+        green: false,
+        checks: [{ name: 'test', ok: false, detail: 'x', command: 'npm test', exitCode: 1 }],
+      }),
     }),
   );
   const idx = (s: string) => p.indexOf(s);
-  assert.ok(idx('## 任務描述') < idx('## 規格文件'));
-  assert.ok(idx('## 規格文件') < idx('## 澄清答覆'));
-  assert.ok(idx('## 澄清答覆') < idx('## 上一輪把關沒過'));
-  assert.ok(idx('## 上一輪把關沒過') < idx('## 完成要求'));
-  // 指示區塊（完成要求 + 最終總結格式）必須壓在所有「輸入」之後，才不會被規格內容淹沒。
+  const inputs = ['## 任務描述', '## 規格文件', '## 澄清答覆', '## 上一輪把關沒過'];
+  for (let i = 1; i < inputs.length; i += 1) {
+    assert.ok(idx(inputs[i - 1]!) < idx(inputs[i]!), `${inputs[i - 1]} 應在 ${inputs[i]} 之前`);
+  }
+  for (const sec of inputs) assert.ok(idx(sec) < idx('## 完成要求'), `${sec} 應在完成要求之前`);
+  // 指示區塊（完成要求 + 最終總結格式）壓在所有「輸入」之後。
   // 總結格式本身是一份含多個標題的範本，所以不能用「之後沒有其他 ##」來斷言。
   assert.ok(idx('## 完成要求') < idx('## 最終總結的格式'));
-  const inputs = ['## 任務描述', '## 規格文件', '## 澄清答覆', '## 上一輪驗證未通過'];
-  for (const sec of inputs) assert.ok(idx(sec) < idx('## 完成要求'), `${sec} 應在完成要求之前`);
 });
 
 test('prompt 要求 agent 產出 PR 需要的敘事段落（否則 PR 全是「待補」）', () => {
@@ -80,18 +82,15 @@ test('prompt 要求 agent 產出 PR 需要的敘事段落（否則 PR 全是「�
   assert.match(p, /不適用的段落整段省略/, '不可鼓勵硬湊段落');
 });
 
-test('docs：每份規格以 ### ref 起頭並帶入完整內容', () => {
+test('規格**不預抓**，只給出處並叫它自己去讀', () => {
   const p = buildAgentPrompt(
-    input({
-      docs: [
-        { ref: 'spec/theme.md#色票', content: '主色 #111\n次色 #eee' },
-        { ref: 'prd/theme.md', content: '使用者可切換主題' },
-      ],
-    }),
+    input({ task: makeTaskDetail({ id: 'T-1', docRefs: ['spec/a.md#§1', 'issues/b.md'] }) }),
   );
-  assert.match(p, /## 規格文件（docRefs，務必逐段遵循）/);
-  assert.match(p, /### spec\/theme\.md#色票\n主色 #111\n次色 #eee/);
-  assert.match(p, /### prd\/theme\.md\n使用者可切換主題/);
+
+  assert.match(p, /· spec\/a\.md#§1/);
+  assert.match(p, /· issues\/b\.md/);
+  assert.match(p, /mcp__docs__read_doc/, '要告訴它用什麼工具讀');
+  assert.match(p, /不要憑空猜規格內容/);
 });
 
 test('澄清答覆會把問題與答覆一起注入（agent 需要脈絡才知道在回什麼）', () => {

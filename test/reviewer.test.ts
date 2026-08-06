@@ -13,6 +13,7 @@ import {
 import { evaluateStopHook } from '../src/worker/agent-runtime.js';
 import type { LoadedDoc } from '../src/worker/agent-runtime.js';
 import type { ReviewerLike } from '../src/contracts.js';
+import { makeTaskDetail } from './helpers/index.js';
 import type { Logger } from '../src/observability/logger.js';
 import type { TaskDetail } from '../src/types.js';
 
@@ -43,14 +44,18 @@ function fakeQuery(resultText: string, subtype = 'success'): ReviewQueryFn {
 }
 
 describe('buildReviewPrompt', () => {
-  it('包含任務、規格逐段與 diff', () => {
-    const p = buildReviewPrompt(task, docs, DIFF);
-    assert.match(p, /T-1/);
-    assert.match(p, /登入表單驗證/);
-    assert.match(p, /spec\/login\.md#驗證/);
-    assert.match(p, /密碼至少 8 碼/);
-    assert.match(p, /```diff/);
-    assert.match(p, /const ok = true/);
+  it('包含任務與規格逐段，但**不含 diff 內容**——只給比較基準', () => {
+    const p = buildReviewPrompt(
+      makeTaskDetail({ id: 'T-1', title: '深色模式' }),
+      [{ ref: 'spec/a.md#§1', content: '要有切換開關' }],
+      'abc123def',
+    );
+
+    assert.match(p, /深色模式/);
+    assert.match(p, /要有切換開關/, '規格是程式從任務板讀的，照樣給');
+    assert.match(p, /比較基準：`abc123def`/);
+    assert.match(p, /git_changed_files/, '要告訴它怎麼自己查');
+    assert.doesNotMatch(p, /```diff/, '程式先算好再砍一半的 diff 已經不給了');
   });
 
   it('要求輸出 JSON 判定格式', () => {
@@ -227,21 +232,6 @@ describe('Reviewer.check', () => {
     assert.equal(out.verdict.status, 'skipped');
   });
 
-  it('diff 為空 → 直接判 fail（不必問 agent）', async () => {
-    let called = false;
-    const r = new Reviewer({
-      log,
-      hasAuth: () => true,
-      collectDiff: async () => '   ',
-      queryFn: (args) => {
-        called = true;
-        return fakeQuery('')(args);
-      },
-    });
-    const out = await r.check(task, docs, '/wt', { baseRef: BASE });
-    assert.equal(out.ok, false);
-    assert.equal(called, false);
-  });
 
   it('合格 → ok=true', async () => {
     const r = new Reviewer({ ...base, queryFn: fakeQuery('```json\n{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"notes":["符合"],"violations":[]}\n```') });
@@ -262,19 +252,6 @@ describe('Reviewer.check', () => {
     assert.match(g.checks[0]!.detail, /密碼至少 8 碼/);
   });
 
-  it('prompt 有真的帶進 diff 與規格', async () => {
-    let seen = '';
-    const r = new Reviewer({
-      ...base,
-      queryFn: (args) => {
-        seen = args.prompt;
-        return fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}')(args);
-      },
-    });
-    await r.check(task, docs, '/wt', { baseRef: BASE });
-    assert.match(seen, /密碼至少 8 碼/);
-    assert.match(seen, /const ok = true/);
-  });
 
   it('SDK 拋錯 → skipped（不阻斷流水線）', async () => {
     const r = new Reviewer({
@@ -301,35 +278,7 @@ describe('Reviewer.check', () => {
     assert.equal(out.ok, true);
   });
 
-  it('取 diff 失敗 → skipped', async () => {
-    const r = new Reviewer({
-      log,
-      hasAuth: () => true,
-      collectDiff: async () => {
-        throw new Error('not a repo');
-      },
-      queryFn: fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}'),
-    });
-    assert.equal((await r.check(task, docs, '/wt', { baseRef: BASE })).verdict.status, 'skipped');
-  });
 
-  it('opts.diff 可覆寫 collectDiff', async () => {
-    let seen = '';
-    const r = new Reviewer({
-      log,
-      hasAuth: () => true,
-      collectDiff: async () => {
-        throw new Error('不該被呼叫');
-      },
-      queryFn: (args) => {
-        seen = args.prompt;
-        return fakeQuery('{"status":"pass","uiChecked":{"looked":false,"detail":"沒看：這次只改 server 端邏輯"},"violations":[]}')(args);
-      },
-    });
-    const out = await r.check(task, docs, '/wt', { baseRef: BASE, diff: 'INLINE_DIFF_MARKER' });
-    assert.equal(out.ok, true);
-    assert.match(seen, /INLINE_DIFF_MARKER/);
-  });
 });
 
 describe('Reviewer 與 Worker 的契約', () => {

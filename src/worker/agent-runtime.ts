@@ -1056,9 +1056,25 @@ export function buildAgentPrompt(input: IterateInput): string {
   p.push(`類別：${input.task.category}｜repo：${input.task.repo}`);
   p.push(`\n## 任務描述\n${input.task.description}`);
 
-  if (input.docs.length > 0) {
-    p.push(`\n## 規格文件（docRefs，務必逐段遵循）`);
-    for (const d of input.docs) p.push(`\n### ${d.ref}\n${d.content}`);
+  // **規格不預抓，只給出處。**
+  //
+  // 先前這裡把每一份 docRef 的全文貼進 prompt。三個壞處：
+  // · 程式照 docRef 字串比對，對不上就整份讀不到（實跑：docType 單複數不一致，
+  //   每個帶 issue 規格的任務都是**沒看過規格就做的**），而 prompt 上完全看不出來；
+  // · 規格在任務進行中被更新 → 手上是開工那一刻的快照，而且不知道自己拿的是舊的；
+  // · 整份貼進去佔掉 context，而它多半只需要其中幾段。
+  //
+  // 它手上有 mcp__docs__list_docs / search_docs / read_doc，要讀幾份、讀哪一段
+  // 由它決定——四個判斷者早就是這樣做的，只有這裡沒改。
+  if (input.task.docRefs.length > 0) {
+    p.push(`\n## 規格文件——**自己去讀**，務必逐段遵循`);
+    p.push('這張卡標註的出處：');
+    for (const ref of input.task.docRefs) p.push(`· ${ref}`);
+    p.push(
+      '',
+      '用 `mcp__docs__read_doc` 讀它們；出處對不上或找不到就用 `search_docs` 搜，',
+      '**不要憑空猜規格內容**。搜不到就用 ask_human 說出來，不要當作沒有規格就開始寫。',
+    );
   }
 
   // 規劃階段的線索。**措辭是關鍵**：它是讀完整個 repo 後的判斷（實測 13 分鐘），

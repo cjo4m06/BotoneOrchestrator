@@ -183,30 +183,26 @@ export class Reviewer {
     }
 
     const collect = this.deps.collectDiff ?? collectGitDiff;
-    let diff = opts.diff;
-    if (diff === undefined) {
-      if (opts.baseRef === undefined) {
-        // 取不到基準就不要審。退回 'HEAD' 是錯的——agent 自行 commit 後那是空的，
-        // 會把做完的成果判成「沒有實作」再回灌給它（實跑害了兩輪）。
-        return toReviewOutcome({ status: 'skipped', reason: '取不到比較基準（cwd 不是 git 工作區），無法審查' });
-      }
-      try {
-        diff = await collect(cwd, opts.baseRef);
-      } catch (e) {
-        return toReviewOutcome({ status: 'skipped', reason: `無法取得 diff：${msg(e)}` });
-      }
+    if (opts.baseRef === undefined) {
+      // 取不到基準就不要審。退回 'HEAD' 是錯的——agent 自行 commit 後那是空的，
+      // 會把做完的成果判成「沒有實作」再回灌給它（實跑害了兩輪）。
+      return toReviewOutcome({ status: 'skipped', reason: '取不到比較基準（cwd 不是 git 工作區），無法審查' });
     }
-    if (!diff.trim()) {
-      return toReviewOutcome({
-        status: 'fail',
-        violations: [{ requirement: '實作需產生實際變更', problem: 'diff 為空，看不到任何實作' }],
-      });
-    }
+
+    // **程式不預先算 diff。**
+    //
+    // 先前這裡先跑一次完整 diff、再砍成「前 30KB ＋ 後 30KB」貼進 prompt。
+    // 兩個壞處：改動一大就有整批檔案完全沒被審（審查者只知道「省略了 N 字元」，
+    // 不知道省略的是哪幾個檔），以及那份快照是一次性的——它想換個角度再看
+    //（只看某個檔、看 git_log 的脈絡）時，程式給的那份仍然壓在 prompt 最前面當錨。
+    //
+    // 它手上本來就有 git_changed_files / git_diff / git_log 與 Bash，
+    // 而且與這裡用的是同一枚 baseRef。要看幾次、看多細，由它決定。
 
     const prompt = buildReviewPrompt(
       task,
       docs,
-      truncateDiff(diff, opts.maxDiffChars ?? DEFAULT_MAX_DIFF_CHARS),
+      opts.baseRef,
       opts.decisions ?? [],
     );
     let text: string;
@@ -318,11 +314,12 @@ export function hasClaudeAuth(env: NodeJS.ProcessEnv = process.env): boolean {
   return Boolean(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN);
 }
 
-/** 組裝 reviewer prompt：規格逐段列出 + diff + 嚴格的 JSON 輸出格式。 */
+/** 組裝 reviewer prompt：規格逐段列出 ＋ 比較基準 ＋ 嚴格的 JSON 輸出格式（**不含 diff 內容**）。 */
 export function buildReviewPrompt(
   task: TaskDetail,
   docs: LoadedDoc[],
-  diff: string,
+  /** 比較基準。**不給 diff 內容**——審查者用唯讀 git 自己查（見 check 裡的說明）。 */
+  baseRef: string,
   decisions: { question: string; answer: string }[] = [],
 ): string {
   const p: string[] = [];
@@ -342,12 +339,20 @@ export function buildReviewPrompt(
     for (const d of decisions) p.push(`\n**問**：${d.question}\n**答**：${d.answer}`);
   }
 
-  p.push(`\n## 實作 diff\n\`\`\`diff\n${diff}\n\`\`\``);
+  p.push(
+    '\n## 這次改了什麼——**自己查**',
+    '',
+    `比較基準：\`${baseRef}\``,
+    '',
+    '用 `git_changed_files` 先看動了哪些檔案縮範圍，再對要看的檔案用 `git_diff`。',
+    '要看幾次、看多細由你決定；需要脈絡就 `git_log`、`git_blame`，要讀現況就 Read/Grep。',
+    '**不要一次把整份 diff 讀進來**——先縮範圍。',
+  );
 
   p.push(
     `\n## 你要做的事\n` +
       `1. 把上述規格拆成一條條可檢核的要求。\n` +
-      `2. 對每條要求，用 diff（必要時用 Read/Grep 讀工作區現況）判斷有沒有被滿足。\n` +
+      `2. 對每條要求，自己查 diff 與工作區現況，判斷有沒有被滿足。\n` +
       `3. 只列「規格有要求但實作沒做到或做錯」的項目；規格沒提到的偏好不算違規。\n`,
   );
   p.push(
