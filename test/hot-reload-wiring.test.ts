@@ -79,3 +79,22 @@ test('沒有「按了什麼都不會發生」的設定欄位', () => {
   assert.doesNotMatch(code('src/core/group-runner.ts'), /progressRounds/);
   assert.doesNotMatch(code('src/main.ts'), /progressRounds/);
 });
+
+test('五個角色的模型別名都是現拿的（控制台換模型不必重啟）', () => {
+  const roles = [
+    'src/worker/agent-runtime.ts', 'src/worker/reviewer.ts', 'src/core/plan-agent.ts',
+    'src/pr/drift-judge.ts', 'src/core/merge-risk-judge.ts',
+  ];
+  for (const f of roles) {
+    const src = code(f);
+    assert.match(src, /model\?: Hot<string>;/, `${f} 的 model 還是寫死字串 ⇒ 收的是開機快照`);
+    // 使用點必須解析，直接當值用的話傳函式進來會變成把函式當模型名送出去
+    assert.match(src, /hotValue\(this\.deps\.model\)/, `${f} 沒有解析 Hot`);
+  }
+  // 正式接線：五個角色都傳函式
+  const main = code('src/main.ts');
+  for (const r of ['coder', 'reviewer', 'planner', 'driftJudge', 'riskJudge']) {
+    assert.match(main, new RegExp(`model: modelOf\\('${r}'\\)`), `main.ts 的 ${r} 還在傳快照`);
+  }
+  assert.match(main, /liveSettings\(\)\.agent\.models/, 'modelOf 要從現拿的設定讀');
+});

@@ -1,4 +1,5 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { hotValue, type Hot } from '../config/hot.js';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
 import { serversFor, toolsFor } from '../worker/capabilities.js';
@@ -109,7 +110,11 @@ export interface DriftJudgeDeps {
   toolAudit?: ToolCallSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
-  model?: string;
+  /**
+   * 這個角色用哪個模型（別名）。**傳函式才會熱重載**——控制台改完，下一次執行就換。
+   * 傳字串就是開機當下那個值（既有呼叫端不受影響）。
+   */
+  model?: Hot<string>;
   queryFn?: DriftQueryFn;
   hasAuth?: () => boolean;
 }
@@ -176,7 +181,7 @@ export class DriftJudge {
         query({
           prompt: args.prompt,
           options: {
-            ...(this.deps.model ? { model: this.deps.model } : {}),
+            ...(hotValue(this.deps.model) ? { model: hotValue(this.deps.model)! } : {}),
             cwd: args.cwd,
             // 子行程環境：拿掉 GH_TOKEN／NODE_ENV／ORCH_*，並套上現拿的認證覆寫。
             // **五個 query() 都要有這一行。** 唯讀角色的指令白名單含 echo，

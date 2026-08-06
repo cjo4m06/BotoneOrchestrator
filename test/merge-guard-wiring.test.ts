@@ -46,6 +46,7 @@ const baseWiring = () => {
     ctx: { repo: 'acme/web', branch: 'orch/x', workspaceKind: 'merge_tree' as const, requestedBy: 'merger' as const },
     makeVerifier: () => ({ check: async () => ({ green: true, checks: [] }) }) as unknown as VerifierLike,
     sourceRepoPath: '/main/clone',
+    verifyTreeRoot: '/data/verify-trees',
     onBaseFreshness: () => {},
   };
 };
@@ -164,5 +165,48 @@ test('prepareLocalConfig 帶進去的檔案會自動排除，不會被 git 當�
   } finally {
     await (await import('execa')).execa('git', ['-C', main, 'worktree', 'remove', '--force', wt], { reject: false });
     for (const d of [main, wt]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('拋棄式驗收樹建在 dataRoot 底下，不是系統暫存目錄', () => {
+  // /tmp 底下的樹沒有任何對帳掃得到——daemon 驗到一半掛掉就留在那裡沒人清
+  const c = capture();
+  createMergeGuard({ ...baseWiring(), verifyTreeRoot: '/data/verify-trees', makeGuard: c.seam });
+  assert.equal(c.options?.treeRoot, '/data/verify-trees');
+  // 兩個呼叫點都要給（型別上是必填，這裡再確認正式碼真的算得出來）
+  assert.match(codeOf('src/main.ts'), /verifyTreeRoot: verifyTreeRootOf\(/);
+  assert.match(codeOf('src/core/group-runner.ts'), /verifyTreeRoot: join\(dirname\(this\.deps\.worktreeBase\), 'verify-trees'\)/);
+  // 開機要清掉上次留下的
+  assert.match(codeOf('src/main.ts'), /export function clearVerifyTrees/);
+});
+
+test('驗收樹的根目錄還不存在時要自己建起來（否則整條合併鏈路倒在建樹）', async () => {
+  const { execa } = await import('execa');
+  const { createMergeTree } = await import('../src/pr/merge-verify.js');
+  const repo = mkdtempSync(join(tmpdir(), 'orch-mv-'));
+  const rootParent = mkdtempSync(join(tmpdir(), 'orch-root-'));
+  const root = join(rootParent, 'verify-trees');   // **刻意不存在**（dataRoot 底下第一次就是這樣）
+  try {
+    await execa('git', ['-C', repo, 'init', '-q']);
+    await execa('git', ['-C', repo, 'config', 'user.email', 't@t'], { reject: false });
+    await execa('git', ['-C', repo, 'config', 'user.name', 't'], { reject: false });
+    writeFileSync(join(repo, 'a.txt'), 'a\n');
+    await execa('git', ['-C', repo, 'add', '-A']);
+    await execa('git', ['-C', repo, 'commit', '-qm', 'init']);
+    const base = (await execa('git', ['-C', repo, 'rev-parse', 'HEAD'])).stdout.trim();
+    await execa('git', ['-C', repo, 'checkout', '-qb', 'feat']);
+    writeFileSync(join(repo, 'b.txt'), 'b\n');
+    await execa('git', ['-C', repo, 'add', '-A']);
+    await execa('git', ['-C', repo, 'commit', '-qm', 'feat']);
+
+    const built = await createMergeTree({
+      repoPath: repo, branch: 'feat', baseRef: base, log: createSilentLogger(), root,
+    });
+    assert.equal(built.ok, true,
+      `根目錄不存在時 mkdtempSync 會失敗 ⇒ 判 precondition_failed ⇒ 整群 failed。實際：${JSON.stringify(built)}`);
+    if (built.ok) await built.tree.dispose();
+  } finally {
+    await (await import('execa')).execa('git', ['-C', repo, 'worktree', 'prune'], { reject: false });
+    for (const d of [repo, rootParent]) rmSync(d, { recursive: true, force: true });
   }
 });

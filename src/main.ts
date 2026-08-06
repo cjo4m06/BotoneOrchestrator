@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { createCheckRecorder, type CheckContext } from './worker/check-recorder.js';
@@ -106,6 +106,36 @@ export const browserOutputRootOf = (dataRoot: string): string => join(dataRoot, 
 /** 關卡全文太長時的落地目錄。跟截圖一樣掛在 dataRoot 底下，絕不寫進 worktree。 */
 export function checkOutputRootOf(dataRoot: string): string {
   return join(dataRoot, 'check-outputs');
+}
+
+/**
+ * 拋棄式驗收樹的根目錄。
+ *
+ * 先前這種樹建在系統暫存目錄（merge-verify 的預設），是三種工作區裡**唯一不在 dataRoot
+ * 底下的**。平常跑完會自己刪，但 daemon 在驗到一半掛掉時會留下——而開機對帳只掃
+ * dataRoot 底下，掃不到 /tmp。掛在這裡之後，開機清一次就乾淨（見 clearVerifyTrees）。
+ */
+export function verifyTreeRootOf(dataRoot: string): string {
+  return join(dataRoot, 'verify-trees');
+}
+
+/**
+ * 開機時清掉上一輪留下的驗收樹。
+ *
+ * 可以無條件刪：這些樹**按定義就是拋棄式的**，而且開機時不可能有 daemon 在用它們
+ *（單一實例鎖擋著）。不做的話，每次崩潰都留一棵下來，沒有任何東西會清。
+ */
+export function clearVerifyTrees(dataRoot: string, log: Logger): void {
+  const root = verifyTreeRootOf(dataRoot);
+  try {
+    if (!existsSync(root)) return;
+    const left = readdirSync(root);
+    if (left.length === 0) return;
+    rmSync(root, { recursive: true, force: true });
+    log.info({ root, count: left.length }, '清掉上次留下的拋棄式驗收樹');
+  } catch (e) {
+    log.warn({ root, err: e instanceof Error ? e.message : String(e) }, '清驗收樹失敗（忽略）');
+  }
 }
 
 export function verifierDepsOf(
@@ -1357,9 +1387,19 @@ export function buildPipeline(input: PipelineInput): Pipeline {
   applyClaudeAuth(config.orchestrator.agent, process.env);
   // 各角色的模型（別名，不帶版本號 → 永遠是最新版）。未設就用 SDK 預設。
   // `?? {}`：schema 的 prefault 保證正式路徑一定有，但呼叫端手動組 config 時可能沒有
-  const models = config.orchestrator.agent.models ?? {};
   /** 控制台可改的設定：**每次用時才取**。未注入 → 退回開機快照（既有呼叫端不受影響）。 */
   const liveSettings = input.liveSettings ?? (() => config.orchestrator);
+  /**
+   * 各角色的模型別名，**現拿**。
+   *
+   * 先前這裡是 `config.orchestrator.agent.models ?? {}` 的開機快照，而五個角色都以
+   * 建構參數收字串——控制台換了模型，畫面說已儲存、DB 也寫進去了，daemon 卻要重啟才換，
+   * 而同一顆存檔鈕的提示寫著「不必重啟」。現在傳函式，下一次執行就生效。
+   */
+  const modelOf = (role: 'coder' | 'reviewer' | 'planner' | 'driftJudge' | 'riskJudge') =>
+    () => liveSettings().agent.models?.[role];
+  /** 有沒有設過（決定要不要放 model 欄位）。**只看開機值**——沒設過就交給 SDK 預設。 */
+  const models = config.orchestrator.agent.models ?? {};
   if (!hasClaudeAuth()) {
     log.error(
       'Claude 認證不可用：reviewer 與分群／介面／飄移／風險判斷者**全部不會接線**，'
@@ -1407,7 +1447,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     worktreeBase: input.worktreeBase ?? worktreeBaseOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
     resolveProject: (repo) => registry.runtimeOf(repo),
     agent: new AgentRuntime(log, {
-      ...(models.coder ? { model: models.coder } : {}),
+      ...(models.coder ? { model: modelOf('coder') } : {}),
       // 現拿：控制台換 Claude token／端點，下一輪 agent 執行就套用（不必重啟）
       ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}),
       // 給 agent 一個瀏覽器：做 UI 卻看不到畫面，等於閉著眼睛做。
@@ -1450,7 +1490,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     allowLocalMerge: () => (typeof input.allowLocalMerge === 'function' ? input.allowLocalMerge() : input.allowLocalMerge),
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.riskJudge ? { model: modelOf('riskJudge') } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
     // **審查者要有自己的瀏覽器暫存區。** 先前它的工具清單一直列著唯讀瀏覽器，
     // 但 server 從來沒被掛上——「自己開瀏覽器看畫面」在清單上成立、實際叫不動，
@@ -1459,7 +1499,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       log, usage: ledger, toolAudit: ledger, docs: docsSourceOf,
       ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}),
       browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
-      ...(models.reviewer ? { model: models.reviewer } : {}),
+      ...(models.reviewer ? { model: modelOf('reviewer') } : {}),
     }),
     // agent 宣告「無需改動」時的處置（預設全 ask：交人確認，不自動結案）
     noChangePolicy: config.orchestrator.noChange,
@@ -1467,7 +1507,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
+    driftJudge: new DriftJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.driftJudge ? { model: modelOf('driftJudge') } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1507,7 +1547,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 沒有 Claude 認證時**不接**，而 Planner 沒有 planAgent 就會明確擲錯，
         // Orchestrator 據此開一張交接單。先前這裡會退回一套關鍵字相似度的啟發式——
         // 那是「換一塊任務板就安靜地分錯群，而症狀要到合併衝突才看得到」。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, frictionSink: ledger, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.planner ? { model: models.planner } : {}) }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, frictionSink: ledger, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.planner ? { model: modelOf('planner') } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。
@@ -1553,6 +1593,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
             }),
             // 本機設定檔的來源：主 clone。合併工作區那份是開機快照，不能拿來當來源
             sourceRepoPath: input.merge?.resolveProject(ctx.repo)?.sourceRepoPath ?? '',
+            verifyTreeRoot: verifyTreeRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
             remote: input.merge?.resolveProject(ctx.repo)?.remote,
             driftJudge: groupRunnerDeps.driftJudge,
             recordCheck: groupRunnerDeps.recordCheck,
@@ -1883,6 +1924,10 @@ export async function main(): Promise<void> {
   // 崩潰對帳：必須在主控迴圈開始前跑完，否則上次殘留的 in_progress 任務永遠沒人撿。
   // 上次沒收乾淨（鎖檔帶 unclean 標記）時自動轉保守：那些 worktree 可能還有被 orphan 的
   // agent 子行程在寫，此時做破壞性清理正是「把正在跑的東西清掉」。
+  // 拋棄式驗收樹：開機無條件清。它們按定義就是用完即丟，而且此刻不可能有人在用
+  // （單一實例鎖擋著）。先前它們建在 /tmp，dataRoot 底下的對帳完全掃不到。
+  clearVerifyTrees(boot.dataRoot, log);
+
   const mode = bootReconcileMode({
     ...(lock.previousUnclean ? { unclean: lock.previousUnclean } : {}),
     setting: config.orchestrator.reconcileAfterUncleanShutdown,

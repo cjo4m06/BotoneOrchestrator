@@ -1,4 +1,5 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { hotValue, type Hot } from '../config/hot.js';
 import { toolsFor, serversFor } from './capabilities.js';
 import { sanitizedChildEnv } from './child-env.js';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
@@ -386,7 +387,11 @@ export function agentAuthEnv(cfg: {
 
 export interface AgentRuntimeDeps {
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
-  model?: string;
+  /**
+   * 這個角色用哪個模型（別名）。**傳函式才會熱重載**——控制台改完，下一次執行就換。
+   * 傳字串就是開機當下那個值（既有呼叫端不受影響）。
+   */
+  model?: Hot<string>;
   /**
    * 依 repo 解析任務板的文件來源（MCP 是每個專案各自的）。
    * 給了才會把 list_docs／search_docs／read_doc 掛給 agent，
@@ -540,7 +545,7 @@ export class AgentRuntime {
         // 中止：SDK 會停止查詢並收掉它自己的子行程樹
         ...(abortController ? { abortController } : {}),
         // 模型別名（opus / sonnet / haiku）。未設 → SDK 預設。
-        ...(this.deps.model ? { model: this.deps.model } : {}),
+        ...(hotValue(this.deps.model) ? { model: hotValue(this.deps.model)! } : {}),
         cwd: input.cwd,
         resume: input.resumeSessionId,
         permissionMode: 'acceptEdits',

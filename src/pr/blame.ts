@@ -69,6 +69,8 @@ export interface RunExperimentInput {
   log: Logger;
   git?: GitRun;
   prepare?: (treePath: string) => Promise<void>;
+  /** 拋棄式樹的根目錄（與守衛同一個；未給 → 系統暫存目錄）。 */
+  treeRoot?: string;
   now?: () => number;
   /** 記帳出口：每一次實驗都要進 check_runs（那是事後查證的唯一依據）。 */
   record?: (input: CheckRunInput) => void;
@@ -105,6 +107,7 @@ export async function runExperiment(input: RunExperimentInput): Promise<Experime
     baseRef: spec.ref,
     log,
     ...(input.git ? { git: input.git } : {}),
+    ...(input.treeRoot ? { root: input.treeRoot } : {}),
     ...(input.prepare ? { prepare: input.prepare } : {}),
   });
   if (!built.ok) {

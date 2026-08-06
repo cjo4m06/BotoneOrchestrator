@@ -49,6 +49,12 @@ export interface MergeGuardWiring {
    */
   sourceRepoPath: string;
 
+  /**
+   * 拋棄式驗收樹要建在哪。**必填**——預設值是系統暫存目錄，那是三種工作區裡
+   * 唯一不在 dataRoot 底下的，daemon 驗到一半掛掉留下的樹沒有任何對帳掃得到。
+   */
+  verifyTreeRoot: string;
+
   /** 取最新 base 的 remote 名稱。未給 → 守衛自己退回 'origin'。 */
   remote?: string | undefined;
 
@@ -84,6 +90,7 @@ export function createMergeGuard(w: MergeGuardWiring): MergeGuardLike {
     prepareTree: async (treePath: string) => {
       await prepareLocalConfig(w.sourceRepoPath, treePath, w.log);
     },
+    treeRoot: w.verifyTreeRoot,
     onBaseFreshness: w.onBaseFreshness,
     ...(w.remote ? { remote: w.remote } : {}),
     ...(w.driftJudge ? { driftJudge: w.driftJudge } : {}),

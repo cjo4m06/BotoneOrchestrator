@@ -51,6 +51,14 @@ export interface MergeGuardOptions {
    * 那要寫進專案自己的驗收指令。
    */
   prepareTree?: (treePath: string, repoPath: string) => Promise<void>;
+  /**
+   * 拋棄式驗收樹建在哪。未給 → 系統暫存目錄（`tmpdir()`）。
+   *
+   * 為什麼要能指定：那是三種工作區裡唯一不在 dataRoot 底下的。樹平常跑完會自己刪，
+   * 但 daemon 在驗到一半掛掉時會留下——而開機對帳只掃 dataRoot 底下，掃不到 /tmp。
+   * 指到 dataRoot 底下之後，「誰負責清」這件事才是完整的。
+   */
+  treeRoot?: string;
   /** 取最新 base 的 remote 名稱。預設 'origin' */
   remote?: string;
   /** 是否在 attempt() 前 fetch 最新 base。預設 true；設 false 等於明示「接受基於本地狀態的驗證」 */
@@ -153,6 +161,7 @@ export class MergeGuard {
       // **一定要把注入的 git 傳下去。** 不傳的話守衛會用到兩條不同的 git 路徑：
       // 一條可被測試/呼叫端替換，一條寫死用 execa——那種不一致查起來特別花時間。
       git: (cwd, args) => this.git(cwd, args),
+      ...(this.opts.treeRoot ? { root: this.opts.treeRoot } : {}),
       ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, repoPath) } : {}),
     });
     if (!built.ok) {
@@ -247,6 +256,7 @@ export class MergeGuard {
           budget,
           log: this.log,
           git: (cwd, args) => this.git(cwd, args),
+          ...(this.opts.treeRoot ? { treeRoot: this.opts.treeRoot } : {}),
           ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, input.repoPath) } : {}),
           ...(input.repo ? { repo: input.repo } : {}),
           ...(this.opts.recordCheck ? { record: this.opts.recordCheck } : {}),

@@ -1,5 +1,5 @@
 import { execa } from 'execa';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Logger } from '../observability/logger.js';
@@ -84,6 +84,10 @@ export async function createMergeTree(input: MergeTreeInput): Promise<MergeTreeR
   const git = input.git ?? defaultGit;
   const { repoPath, branch, baseRef, log } = input;
   const root = input.root ?? tmpdir();
+  // **root 不一定存在。** 預設的 tmpdir() 一定在，但指到 dataRoot 底下時第一次是空的，
+  // 而 mkdtempSync 不會自己建父目錄——少了這行，整條合併鏈路會在
+  // 「驗收樹建不起來」上倒掉（判 precondition_failed ⇒ 群組 failed）。
+  mkdirSync(root, { recursive: true });
   const treePath = mkdtempSync(join(root, 'orch-merge-'));
 
   const cleanup = async (): Promise<void> => {

@@ -3,7 +3,7 @@ import { prepareLocalConfig } from './local-config.js';
 import { createMergeGuard } from '../pr/merge-guard-factory.js';
 export { prepareLocalConfig } from './local-config.js';
 import { copyFileSync, existsSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { WorktreeManager } from '../git/worktree.js';
 import { Worker } from '../worker/worker.js';
 import { MergeGuard, type BaseFreshness, type DriftJudgeLike, type MergeGuardInput, type MergeGuardOptions } from '../pr/merge-guard.js';
@@ -892,6 +892,8 @@ export class GroupRunner {
         ctx: mergeCtx,
         makeVerifier: (ctx) => this.deps.makeVerifier(ctx),
         sourceRepoPath: proj.repoPath,
+        // 與 worktreeBase 同一層（＝ dataRoot 底下），開機對帳才掃得到留下來的樹
+        verifyTreeRoot: join(dirname(this.deps.worktreeBase), 'verify-trees'),
         remote: proj.remote,
         driftJudge: this.deps.driftJudge,
         recordCheck: this.deps.recordCheck,
