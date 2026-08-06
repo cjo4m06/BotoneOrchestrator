@@ -1,5 +1,6 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { toolsFor, serversFor } from './capabilities.js';
+import { sanitizedChildEnv } from './child-env.js';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
@@ -336,65 +337,31 @@ const MAX_STOP_BLOCKS = 2;
 const AGENT_GH_CONFIG_DIR = join(tmpdir(), 'orch-agent-gh-empty');
 
 /**
- * daemon 自己的執行模式，**不可以漏給 agent**。
- *
- * launchd 是用 `NODE_ENV=production` 起這個 daemon 的（那是給 logger 用的，
- * 見 observability/logger.ts）。而 buildAgentEnv 原本整份複製 process.env，
- * 於是 agent 的 Bash 也帶著 `NODE_ENV=production` ——**npm 把它當成 `--omit=dev`**。
- *
- * 實際後果（2026-08-06，WorkerControl）：那個專案的 package.json 沒有 dependencies，
- * vite / laravel-vite-plugin / sass-embedded 全在 devDependencies。`npm ci` 一個都沒裝，
- * `npm run build` 回 `vite: command not found`（exit 127），build 關卡紅。
- * 兩個群組的 agent 都正確診斷出根因、都用 `npm ci --include=dev` 證明了改完就綠、
- * 都想寫一行 `.npmrc` 修掉——而 `.npmrc` 在 PROTECTED_PATHS.secrets 裡被擋，
- * 於是兩群一起卡在 ask_human。症狀看起來像「專案設定寫錯」，其實是調度器漏出去的變數。
- *
- * ORCH_* 同理：那是 daemon 的資料庫路徑與 profile，agent 不該看見，
- * 更不該在改到本 repo 時把 `ORCH_PROFILE=prod` 一起繼承過去。
- * （注意 profileOf 的預設本來就是 prod，所以光是拿掉還不足以保護「agent 改調度器自己」
- *   那個情境——那要另外處理，不要以為這一行就夠了。）
- */
-const DAEMON_ONLY_ENV = /^(NODE_ENV|ORCH_.*)$/;
-
-/**
- * agent 子行程的環境：在繼承 process.env 的基礎上**移除 GitHub 認證與 daemon 自身設定**。
+ * agent／判斷者子行程的環境：在 `sanitizedChildEnv` 之上**再移除 GitHub 認證**。
  *
  * SDK 的 options.env 若有設就會完全取代子行程環境，所以必須先展開 process.env
  * （PATH/HOME/ANTHROPIC_AUTH_TOKEN 等都還要留著，agent 自己得靠它們運作）。
  *
  * 這是深度防禦的最底層：就算紅線比對被繞過（先寫腳本再執行），
  * gh 也是未登入狀態、git push 也拿不到憑證，外部副作用依然發生不了。
+ *
+ * **五個 query() 都要用它，不只 coder。** 唯讀角色的指令白名單裡有 `echo`，
+ * 所以「沒有這道處理的角色」會在 `echo $GH_TOKEN` 時印出真 token，
+ * 然後那串東西會進 transcript、進判定文字、進 ledger。
  */
 export function buildAgentEnv(
   base: NodeJS.ProcessEnv = process.env,
   overrides: Record<string, string | undefined> = {},
 ): Record<string, string> {
   mkdirSync(AGENT_GH_CONFIG_DIR, { recursive: true });
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(base)) {
-    if (v === undefined) continue;
-    // gh 的 token 認證：一律不傳給 agent
-    if (k === 'GH_TOKEN' || k === 'GITHUB_TOKEN' || k === 'GH_ENTERPRISE_TOKEN' || k === 'GITHUB_ENTERPRISE_TOKEN') continue;
-    // daemon 自己的執行模式：見 DAEMON_ONLY_ENV
-    if (DAEMON_ONLY_ENV.test(k)) continue;
-    env[k] = v;
-  }
+  const env = sanitizedChildEnv(base);
+  // gh 的 token 認證：一律不傳給 agent
+  for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
   // gh 的檔案/keyring 認證：指到空目錄 ⇒ gh 變成「未登入」
   env.GH_CONFIG_DIR = AGENT_GH_CONFIG_DIR;
   // git 認證：不要跳互動提示（非互動環境會卡住），也不要用 askpass 去要密碼
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_ASKPASS = '/bin/false';
-
-  // 調度器自己的資料庫：agent 一律走測試那套。
-  //
-  // 只是「不繼承 daemon 的 ORCH_PROFILE」不夠——profileOf 沒讀到這個變數時**預設回 prod**
-  // （見 config/bootstrap.ts：忘了設就該落在不會弄壞測試那邊，那個預設對 daemon 是對的）。
-  // 所以拿掉等於沒拿掉。要擋住得明確設成 test。
-  //
-  // 擋的是哪個情境：把 BotoneOrchestrator 這個 repo 自己丟進任務板時，
-  // agent 在 worktree 裡跑 `npm test` 會直接讀寫正式的 ledger.db——真的任務、真的群組。
-  // 那是 CLAUDE.md 第一條紅線。對其他專案來說這個變數沒有意義，設了也不影響。
-  env.ORCH_PROFILE = 'test';
 
   // 來自設定（資料庫）的覆寫，**每次執行都重新取**：換 Claude token 或端點不必重啟 daemon。
   // 空字串視為未設，才不會用一個空 token 覆蓋掉行程環境裡本來可用的那個。

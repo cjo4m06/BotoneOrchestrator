@@ -1,7 +1,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from './docs-server.js';
 import { createGitInspectServer } from './git-inspect.js';
-import { browserServerConfig, scratchDirFor, scratchRule } from './agent-runtime.js';
+import { browserServerConfig, buildAgentEnv, scratchDirFor, scratchRule } from './agent-runtime.js';
 import { serversFor, toolsFor } from './capabilities.js';
 import { execa } from 'execa';
 import { createHash } from 'node:crypto';
@@ -124,6 +124,17 @@ export interface ReviewOptions {
 export type ReviewQueryFn = (args: { prompt: string; cwd: string; resume?: string }) => AsyncIterable<Record<string, unknown>>;
 
 export interface ReviewerDeps {
+  /**
+   * 子行程的認證環境覆寫，**每輪執行時才呼叫**（見 buildAgentEnv）。
+   *
+   * 未注入時仍然會套 buildAgentEnv 的硬化（拿掉 GH_TOKEN、NODE_ENV、ORCH_*），
+   * 只是控制台換 Claude token／端點時這個角色不會跟著換——那正是先前的狀態：
+   * 熱重載只接了 coder，換 token 後 coder 用新的跑得好好的，
+   * 這幾個角色 401 之後各自降級成 skipped「不阻斷流程」，於是沒人審、沒人判飄移，
+   * 而閘門照樣綠燈、PR 照開照合，只留兩行 warn。
+   */
+  envOverrides?: () => Record<string, string | undefined>;
+
   /**
    * 任務板的文件來源。**未注入 → 這個角色查不到規格**（只能用提示詞裡程式先讀好的那份）。
    *
@@ -278,6 +289,10 @@ export class Reviewer {
           options: {
             ...(this.deps.model ? { model: this.deps.model } : {}),
             cwd: args.cwd,
+            // 子行程環境：拿掉 GH_TOKEN／NODE_ENV／ORCH_*，並套上現拿的認證覆寫。
+            // **五個 query() 都要有這一行。** 唯讀角色的指令白名單含 echo，
+            // 沒有這行的角色一句 `echo $GH_TOKEN` 就會把真 token 印進判定文字與 ledger。
+            env: buildAgentEnv(process.env, this.deps.envOverrides?.() ?? {}),
             ...(args.resume ? { resume: args.resume } : {}),
             permissionMode: 'acceptEdits', // 工具已限制為唯讀，此處只為避免非互動環境卡在權限詢問
             ...(Object.keys(servers).length > 0 ? { mcpServers: servers as never } : {}),

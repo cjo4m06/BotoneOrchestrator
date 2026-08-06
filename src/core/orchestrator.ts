@@ -103,6 +103,12 @@ export interface DispatcherLike {
 /** Merge Guard 的最小介面（DESIGN §9a-b）。 */
 export interface MergeGuardLike {
   attempt(input: {
+    /**
+     * 所屬 repo。判斷者要靠它去任務板查規格（程式不預抓）。
+     * 先前這個最小介面沒有這一欄，於是合併那條路的 attempt() 傳不了 repo——
+     * 判斷者拿不到規格來源，只能靠 diff 猜意圖。
+     */
+    repo?: string;
     repoPath: string;
     branch: string;
     base: string;
@@ -135,6 +141,14 @@ export interface PrMergeLike {
 export interface MergeProject {
   /** 執行守衛與讀 diff 的工作目錄。**注意會 checkout 群組分支**，建議指向專用 worktree。 */
   repoPath: string;
+  /**
+   * 使用者的主 clone。**本機設定檔（.env 之類）只能從這裡帶**。
+   *
+   * 為什麼不能用上面的 repoPath：那是合併工作區，它的根目錄檔只在 daemon 開機時
+   * 複製過一次，而 prepareLocalConfig 對已存在的檔直接跳過——所以拿它當來源的話，
+   * `.env` 改了永遠傳不進驗收樹，而且兩條守衛路徑會驗到不同的設定，沒有任何日誌會講。
+   */
+  sourceRepoPath: string;
   baseBranch: string;
   verifierConfig: VerifierConfig;
   /** 取最新 base 的 remote 名稱。未給 → 'origin'。 */
@@ -147,7 +161,12 @@ export interface MergeProject {
  */
 export interface MergePipelineDeps {
   resolveProject(repo: string): MergeProject | undefined;
-  guard: MergeGuardLike;
+  /**
+   * 依「這次要驗的是哪個群」造守衛。**不是單一實例**：守衛需要 CheckContext
+   * （repo/branch），而那是每群不同的；先前這裡是一顆共用實例，於是那條路的
+   * Verifier 沒有 ctx，整輪關卡一列 check_run 都不寫。
+   */
+  guardFor(ctx: { repo: string; branch: string }): MergeGuardLike;
   pr: PrMergeLike;
   /**
    * 合併前把最新 base 抓下來。**強烈建議提供**：不抓最新 base 的話，守衛驗的是
@@ -1342,7 +1361,8 @@ export class Orchestrator {
 
     const tasksOfGroup = group.taskIds.map((id) => ledger.getTask(id)).filter((t): t is Task => t !== undefined);
     const head = tasksOfGroup[0];
-    const verdict = await m.guard.attempt({
+    const verdict = await m.guardFor({ repo: group.repo, branch: group.branch }).attempt({
+      repo: group.repo,
       repoPath: proj.repoPath,
       branch: group.branch,
       base: proj.baseBranch,

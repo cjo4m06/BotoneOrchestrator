@@ -59,6 +59,7 @@ import { Dispatcher } from '../src/core/dispatcher.js';
 import { GroupRunner, type PrManagerLike, type ProjectRuntime } from '../src/core/group-runner.js';
 import { Orchestrator } from '../src/core/orchestrator.js';
 import { Verifier } from '../src/worker/verifier.js';
+import { MergeGuard } from '../src/pr/merge-guard.js';
 import { PrManager } from '../src/pr/pr-manager.js';
 import { ReviewFeedbackStore } from '../src/pr/review-watcher.js';
 import { InboundRouter, summarizeEvent } from '../src/notify/notifier.js';
@@ -625,7 +626,7 @@ async function main(): Promise<void> {
       feedback,
       gateway,
       notifier: gateway,
-      ...(mergePipeline ? { merge: mergePipeline } : {}),
+      ...(mergePipeline ? { merge: { ...mergePipeline, guardFor: () => new MergeGuard(new Verifier(log), log) } } : {}),
       // 靜置期關閉：harness 是現場建任務馬上跑，預設 15 分鐘會讓整個測試乾等。
       // 靜置期本身由 quiet-period / orchestrator 的單元測試覆蓋。
       quietMinutesOf: () => 0,

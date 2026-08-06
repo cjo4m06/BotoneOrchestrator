@@ -566,8 +566,7 @@ interface FakeMerge {
   mergeResult: { ok: boolean; detail: string };
 }
 
-const PROJECT: MergeProject = {
-  repoPath: '/tmp/fake-repo',
+const PROJECT: MergeProject = { repoPath: '/tmp/fake-repo', sourceRepoPath: '/tmp/fake-repo',
   baseBranch: 'main',
   verifierConfig: { build: 'npm run build', test: 'npm test' },
 };
@@ -590,12 +589,12 @@ function fakeMerge(over: Partial<Pick<FakeMerge, 'verdict' | 'mergeResult'>> = {
   };
   f.deps = {
     resolveProject: (repo) => (repo === 'acme/web' ? PROJECT : undefined),
-    guard: {
+    guardFor: () => ({
       async attempt(input) {
         f.guardCalls.push({ repoPath: input.repoPath, branch: input.branch, base: input.base });
         return f.verdict;
       },
-    },
+    }),
     pr: {
       async merge(input) {
         f.merges.push({ repo: input.repo, prNumber: input.prNumber, approvedBy: input.approvedBy });
@@ -2261,8 +2260,8 @@ describe('Orchestrator — 合併前確認 base 沒被外部動過', () => {
         quietMinutesOf: () => 0,
         reviewWatcher: fakeWatcher([[{ type: 'approved', group: 'g1', approvedBy: 'bob' }]]),
         merge: {
-          resolveProject: () => ({ repoPath: '/r', baseBranch: 'main', verifierConfig: {} }),
-          guard: { attempt: async () => ({ ok: true as const, baseSha: guardSha }) },
+          resolveProject: () => ({ repoPath: '/r', sourceRepoPath: '/r', baseBranch: 'main', verifierConfig: {} }),
+          guardFor: () => ({ attempt: async () => ({ ok: true as const, baseSha: guardSha }) }),
           pr: { merge: async (i: unknown) => { merges.push(i); return { ok: true as const }; } },
           currentBaseSha,
         },

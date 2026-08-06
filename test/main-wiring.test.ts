@@ -979,13 +979,13 @@ function mergeSpy(): MergeSpy {
     merged,
     guarded,
     merge: {
-      resolveProject: () => ({ repoPath: '/tmp/merge-worktrees/web', baseBranch: 'main', verifierConfig: {} }),
-      guard: {
-        attempt: async (input) => {
+      resolveProject: () => ({ repoPath: '/tmp/merge-worktrees/web', sourceRepoPath: '/tmp/merge-worktrees/web', baseBranch: 'main', verifierConfig: {} }),
+      guardFor: () => ({
+        attempt: async (input: { branch: string }) => {
           guarded.push(input.branch);
-          return { ok: true };
+          return { ok: true as const };
         },
-      },
+      }),
       pr: {
         merge: async (input) => {
           merged.push(input);

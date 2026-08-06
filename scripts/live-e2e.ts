@@ -545,8 +545,8 @@ async function runFlow(repo: TempRepo): Promise<number> {
       // 靜置期本身由 quiet-period / orchestrator 的單元測試覆蓋。
       quietMinutesOf: () => 0,
       merge: {
-        resolveProject: (r) => (r === repo.full ? { repoPath: repo.localPath, baseBranch: BASE_BRANCH, verifierConfig } : undefined),
-        guard: new MergeGuard(new Verifier(log), log),
+        resolveProject: (r) => (r === repo.full ? { repoPath: repo.localPath, sourceRepoPath: repo.localPath, baseBranch: BASE_BRANCH, verifierConfig } : undefined),
+        guardFor: () => new MergeGuard(new Verifier(log), log),
         pr: prManager,
         fetchBase: async (repoPath, base) => void (await git(repoPath, ['fetch', 'origin', base])),
       },

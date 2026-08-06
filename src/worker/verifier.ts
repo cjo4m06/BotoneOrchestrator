@@ -6,6 +6,7 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CheckResult, GateReport, TaskCategory } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { decomposeShellCommand, evaluateCommandRedline } from './agent-runtime.js';
+import { sanitizedChildEnv } from './child-env.js';
 import { EMPTY_TREE, changedSince } from '../git/status.js';
 
 /** 指令型關卡（跑得到 exit code 的那種）。 */
@@ -380,11 +381,23 @@ export class Verifier {
 
 }
 
-/** 實跑關卡指令（獨立成函式，讓呼叫端拿得到 execa 依選項推導出的結果型別）。 */
+/**
+ * 實跑關卡指令（獨立成函式，讓呼叫端拿得到 execa 依選項推導出的結果型別）。
+ *
+ * **`env` ＋ `extendEnv: false` 兩個都要，缺一等於沒改。**
+ * execa 預設 `extendEnv: true`，會把 `process.env` 疊在你給的 env **之上**，
+ * 於是 daemon 的 `NODE_ENV=production` 原封不動疊回來（實測：子行程照樣印得出 production）。
+ *
+ * 這裡本來完全沒給 env，直接繼承 launchd 給 daemon 的環境。2026-08-06 修 NODE_ENV 外洩時
+ * 只改了 agent 那條路（buildAgentEnv），這條漏了——症狀是 agent 在同一棵樹裡手動跑
+ * `npm ci && npm run build` 全綠、關卡照樣紅 127，而兩邊差的就是這個變數。
+ */
 function runShell(cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal) {
   return execa(cmd, {
     cwd,
     shell: true,
+    env: sanitizedChildEnv(),
+    extendEnv: false,
     reject: false,
     all: true,
     timeout: timeoutMs,

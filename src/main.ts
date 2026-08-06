@@ -26,6 +26,8 @@ import { Planner } from './core/planner.js';
 import { Dispatcher } from './core/dispatcher.js';
 import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergeProject, type PrMergeLike, TICK_FAILED_EVENT } from './core/orchestrator.js';
 import { GroupRunner, prepareLocalConfig, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
+import { createMergeGuard } from './pr/merge-guard-factory.js';
+import type { BaseFreshness } from './git/base-freshness.js';
 import { Reconciler, createFsProbe, createGitProbe, type ReconcilerDeps, type ReconcilerMcp } from './core/reconciler.js';
 import { AgentRuntime, agentAuthEnv } from './worker/agent-runtime.js';
 import { Verifier } from './worker/verifier.js';
@@ -634,7 +636,17 @@ export async function releaseMergeWorktreeBranch(
   }
 }
 
-export async function createMergePipeline(input: CreateMergePipelineInput): Promise<MergePipelineDeps | undefined> {
+/**
+ * 合併管線的**非守衛部分**（工作區、PR、fetch base…）。
+ * 守衛由 buildPipeline 用 createMergeGuard 補上——見那裡的說明：
+ * 守衛需要每群不同的 CheckContext，不能是一顆共用實例。
+ */
+export type MergePipelineParts = Omit<MergePipelineDeps, 'guardFor'> & {
+  /** 測試接縫：注入假守衛。正式路徑不給，由 buildPipeline 用 createMergeGuard 補。 */
+  guardFor?: MergePipelineDeps['guardFor'];
+};
+
+export async function createMergePipeline(input: CreateMergePipelineInput): Promise<MergePipelineParts | undefined> {
   const { log } = input;
 
   const ensure = input.ensureWorkspace ?? ensureMergeWorkspace;
@@ -677,6 +689,9 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     byRepo.set(runtime.repo, {
       // 合併路徑的工作目錄＝專用 worktree，不是 runtime.repoPath（使用者的主 clone）
       repoPath: path,
+      // 但**本機設定檔的來源必須是主 clone**：合併工作區那份是開機時複製的快照，
+      // 拿它當來源等於永遠驗開機當下那個 .env（見 MergeProject.sourceRepoPath）
+      sourceRepoPath: runtime.repoPath,
       // 合併目標必須跟開 PR 的 repo 一致，否則會去合併正式專案上的同號 PR
       baseBranch: runtime.baseBranch,
       verifierConfig: runtime.verifierConfig,
@@ -716,20 +731,12 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       }
       return proj;
     },
-    // **第二個 Merge Guard 呼叫點（核准之後的那次）。**
+    // **守衛不在這裡建。**
     //
-    // 這裡先前要塞 prepareTree 把 node_modules 帶進拋棄式驗收樹，因為第 10 片把守衛
-    // 改成「在 /tmp 的樹上驗」之後樹不再自帶依賴——實跑（2026-08-05，g_da31b3e8c2ac）
-    // 少了它就 `Cannot find package 'tsx'` → 判 semantic_drift → 憑證作廢、42 則
-    // 「build 紅了」回灌給改不動它的 agent，**任何需要建置的專案都合併不了**。
-    //
-    // 複製依賴那條路現在整個拆了（見 group-runner 的說明：清單猜不對，而且就算猜對，
-    // 複製來的版本也不對）。同一個坑改由**專案自己的驗收指令**負責——
-    // 要安裝就寫成 `npm ci && npm run build`，那棵樹才會裝到它自己那顆 lockfile 的版本。
-    guard: input.guard ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log, {
-      // 依賴不帶（複製來的版本對不上這棵樹），但本機設定檔要帶——它沒有版控對照物
-      prepareTree: (treePath, repoPath) => prepareLocalConfig(repoPath, treePath, log).then(() => undefined),
-    }),
+    // 核准之後那次守衛先前就是在這裡 new 出來的，而且只接了 prepareTree 一項——
+    // 開 PR 前那次接了六項，兩者的判決文字卻一模一樣，沒有人看得出差別。
+    // 現在改由 buildPipeline 用 createMergeGuard（唯一建構點）組，
+    // 兩條路吃同一份選項，缺一項就不會編譯過。
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {
@@ -1291,8 +1298,8 @@ export interface PipelineInput {
   agentEnv?: () => Record<string, string | undefined>;
   /** 花費上限檢查（現算）。 */
   budget?: () => BudgetVerdict;
-  /** 合併管線（createMergePipeline 的結果）。未給 ⇒ 不會有任何合併動作。 */
-  merge?: MergePipelineDeps;
+  /** 合併管線（createMergePipeline 的結果）。未給 ⇒ 不會有任何合併動作。守衛在這裡補。 */
+  merge?: MergePipelineParts;
   /** 這個 profile 的資料根目錄；worktree 與瀏覽器暫存都建在它底下。 */
   dataRoot?: string;
   allowLocalMerge: boolean;
@@ -1425,13 +1432,14 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     allowLocalMerge: input.allowLocalMerge,
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
     // **審查者要有自己的瀏覽器暫存區。** 先前它的工具清單一直列著唯讀瀏覽器，
     // 但 server 從來沒被掛上——「自己開瀏覽器看畫面」在清單上成立、實際叫不動，
     // 而放行書填「沒看」完全合法，閘門照樣綠燈。key 用 review-<taskId>，多群同審不互相覆蓋。
     reviewer: new Reviewer({
       log, usage: ledger, toolAudit: ledger, docs: docsSourceOf,
+      ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}),
       browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
       ...(models.reviewer ? { model: models.reviewer } : {}),
     }),
@@ -1441,7 +1449,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
+    driftJudge: new DriftJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1481,7 +1489,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 沒有 Claude 認證時**不接**，而 Planner 沒有 planAgent 就會明確擲錯，
         // Orchestrator 據此開一張交接單。先前這裡會退回一套關鍵字相似度的啟發式——
         // 那是「換一塊任務板就安靜地分錯群，而症狀要到合併衝突才看得到」。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, frictionSink: ledger, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, frictionSink: ledger, ...(input.agentEnv ? { envOverrides: input.agentEnv } : {}), ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。
@@ -1508,7 +1516,39 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       ...(input.beforeTick ? { beforeTick: input.beforeTick } : {}),
       ...(input.budget ? { budget: input.budget } : {}),
       pendingReminderMs: config.orchestrator.pendingReminderMinutes * 60_000,
-      ...(input.merge ? { merge: input.merge } : {}),
+      // **守衛在這裡補上——兩個呼叫點共用 createMergeGuard。**
+      //
+      // 核准後那次守衛先前是在 createMergePipeline 裡 new 出來的，六項選項只接了一項：
+      // 語意飄移層整層不跑、關卡一列 check_run 都不寫、紅燈時不跑歸咎實驗
+      //（＝「base 上本來就紅」的證據不見了，人按過的核准被作廢、沒有對照的紅燈當 feedback 退回）。
+      // 現在它跟 group-runner 那次吃同一份選項，缺一項不會編譯過。
+      ...(input.merge ? {
+        merge: {
+          ...input.merge,
+          guardFor: input.merge.guardFor ?? ((ctx: { repo: string; branch: string }) => createMergeGuard({
+            log,
+            ctx: { repo: ctx.repo, branch: ctx.branch, workspaceKind: 'merge_tree', requestedBy: 'merger' },
+            makeVerifier: (c: CheckContext) => new Verifier(log, {
+              ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),
+              checkRecorder: createCheckRecorder({ ledger, log, outputRoot: checkOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT) }),
+              checkContext: c,
+            }),
+            // 本機設定檔的來源：主 clone。合併工作區那份是開機快照，不能拿來當來源
+            sourceRepoPath: input.merge?.resolveProject(ctx.repo)?.sourceRepoPath ?? '',
+            remote: input.merge?.resolveProject(ctx.repo)?.remote,
+            driftJudge: groupRunnerDeps.driftJudge,
+            recordCheck: groupRunnerDeps.recordCheck,
+            onBaseFreshness: (f: BaseFreshness) => {
+              if (!f.caveat) return;
+              // 這條路沒有群組通知的載體（那是 group-runner 的事），但至少要進帳，
+              // 不能像先前那樣只留一行 daemon log
+              ledger.logEvent('system', ctx.repo, 'merge_guard_caveat', `${ctx.branch}｜${f.caveat}`);
+              log.warn({ repo: ctx.repo, branch: ctx.branch, ref: f.ref, caveat: f.caveat },
+                '合併守衛（核准後那次）的 base 新鮮度有但書');
+            },
+          })),
+        },
+      } : {}),
     },
     input.pollIntervalSec ?? config.orchestrator.pollIntervalSec,
   );
