@@ -42,6 +42,15 @@ export interface MergeGuardOptions {
    * 驗收樹建好之後的準備工作（node_modules、本機設定檔）。
    * **一定要接**：沒有依賴就跑關卡，紅的是環境不是程式碼，而 agent 會去修一個沒壞的東西。
    */
+  /**
+   * 驗收樹建好之後、跑關卡之前的準備。
+   *
+   * 用途只有一個：把主 clone 的本機設定檔（.env 之類）帶進來——它沒有版控對照物，
+   * 不帶就是沒有，而 Laravel 少了 .env 連 DB 都連不上。**依賴不走這裡**
+   * （複製來的版本對不上這棵樹的 lockfile，見 group-runner 的說明），
+   * 那要寫進專案自己的驗收指令。
+   */
+  prepareTree?: (treePath: string, repoPath: string) => Promise<void>;
   /** 取最新 base 的 remote 名稱。預設 'origin' */
   remote?: string;
   /** 是否在 attempt() 前 fetch 最新 base。預設 true；設 false 等於明示「接受基於本地狀態的驗證」 */
@@ -144,6 +153,7 @@ export class MergeGuard {
       // **一定要把注入的 git 傳下去。** 不傳的話守衛會用到兩條不同的 git 路徑：
       // 一條可被測試/呼叫端替換，一條寫死用 execa——那種不一致查起來特別花時間。
       git: (cwd, args) => this.git(cwd, args),
+      ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, repoPath) } : {}),
     });
     if (!built.ok) {
       if (built.reason === 'conflict') {
@@ -237,6 +247,7 @@ export class MergeGuard {
           budget,
           log: this.log,
           git: (cwd, args) => this.git(cwd, args),
+          ...(this.opts.prepareTree ? { prepare: (tree: string) => this.opts.prepareTree!(tree, input.repoPath) } : {}),
           ...(input.repo ? { repo: input.repo } : {}),
           ...(this.opts.recordCheck ? { record: this.opts.recordCheck } : {}),
         }),

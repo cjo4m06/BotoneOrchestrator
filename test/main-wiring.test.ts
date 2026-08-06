@@ -1318,6 +1318,21 @@ describe('各角色的模型設定要真的接到 agent 上', () => {
  * 所以這幾條改成守「不要再長回來」，以及「兩個沒有程式幫忙的地方都有被告知」。
  */
 describe('依賴由誰準備', () => {
+  /**
+   * `.env` 與依賴是**不同的東西**，第一版把它們一起拆掉是拆過頭了。
+   *
+   * 依賴有 lockfile，複製過去可能對不上這棵樹的版本；`.env` 沒有版控對照物——
+   * 主 clone 那份就是唯一一份，不帶不會得到「舊版本」，只會得到**沒有**。
+   * 實測 WorkerControl：少了 .env，Laravel 退回 config/database.php 的預設值，
+   * 測試直接 `Access denied for user 'forge'`。
+   */
+  it('本機設定檔還是要帶（三個沒有 agent 的地方都要）', () => {
+    for (const f of ['src/main.ts', 'src/core/group-runner.ts']) {
+      assert.match(readFileSync(f, 'utf8'), /prepareLocalConfig\(/, `${f} 沒有帶本機設定檔`);
+    }
+    assert.match(readFileSync('src/pr/merge-guard.ts', 'utf8'), /prepareTree/, '驗收樹沒有 agent，設定檔只能由它帶');
+  });
+
   it('程式不再複製依賴進工作區（清單猜不對，而且複製來的版本也不對）', () => {
     // 只看程式碼——註解裡提到那兩個名字是在解釋「為什麼拆掉」，不算數
     const codeOf = (f: string): string =>

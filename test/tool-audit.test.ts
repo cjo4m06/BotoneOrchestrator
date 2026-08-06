@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { createPreToolUseGuard } from '../src/worker/agent-runtime.js';
 import { createToolAuditor, serializeToolInput, NO_TOOL_AUDIT, type ToolCallRecord } from '../src/worker/tool-audit.js';
 import { readFileSync } from 'node:fs';
+import { prepareLocalConfig } from '../src/core/group-runner.js';
 import { createSilentLogger, createTmpLedger, type TmpLedger } from './helpers/index.js';
 
 /**
@@ -231,5 +232,55 @@ describe('Ledger — 工具紀錄的寫入與查詢', () => {
     assert.equal(tmp.ledger.pruneToolCalls(500), 1);
     assert.equal(tmp.ledger.listToolCalls().length, 1);
     assert.equal(tmp.ledger.pruneToolCalls(Number.NaN), 0, 'cutoff 壞掉時寧可不清，也不要清光');
+  });
+});
+
+/**
+ * prepareLocalConfig：**判準是 git，不是一份檔名清單。**
+ *
+ * 「根目錄下、主 clone 有而工作區沒有的檔案」等價於「git 管不到的根目錄檔案」——
+ * 被追蹤的檔案 `git worktree add` 一定會簽出。所以不必列舉 .env / .npmrc /
+ * composer 的 auth.json / Python 的 .env.test……每種生態都不一樣，列了就會漏。
+ */
+describe('prepareLocalConfig — 帶設定檔，不帶依賴', () => {
+  const silent = createSilentLogger;
+
+  const io = (repoEntries: [string, boolean][], wtHas: string[]) => {
+    const copied: [string, string][] = [];
+    return {
+      copied,
+      list: () => repoEntries.map(([name, isFile]) => ({ name, isFile })),
+      exists: (p: string) => wtHas.some((n) => p.endsWith(`/${n}`)),
+      copy: (a: string, b: string) => { copied.push([a, b]); },
+    };
+  };
+
+  it('帶走工作區沒有的根目錄檔案（.env、.npmrc、auth.json…不必列舉）', async () => {
+    const x = io([['.env', true], ['.npmrc', true], ['auth.json', true]], []);
+    const got = await prepareLocalConfig('/repo', '/wt', silent(), x);
+    assert.deepEqual(got.sort(), ['.env', '.npmrc', 'auth.json']);
+  });
+
+  /** 目錄＝依賴與建置產物。複製它們正是被拆掉的那件事。 */
+  it('目錄一律不碰', async () => {
+    const x = io([['node_modules', false], ['vendor', false], ['.venv', false], ['.env', true]], []);
+    assert.deepEqual(await prepareLocalConfig('/repo', '/wt', silent(), x), ['.env']);
+  });
+
+  it('工作區已經有的不覆蓋（那是 git 簽出來的，有版控）', async () => {
+    const x = io([['package.json', true], ['.env', true]], ['package.json']);
+    assert.deepEqual(await prepareLocalConfig('/repo', '/wt', silent(), x), ['.env']);
+  });
+
+  /** 帶不過去只是少一個檔案，不該讓整個群組跑不起來。 */
+  it('單檔複製失敗不擲錯，其餘照帶', async () => {
+    const x = io([['.env', true], ['.npmrc', true]], []);
+    const boom = { ...x, copy: (a: string, b: string) => { if (a.endsWith('.env')) throw new Error('EACCES'); x.copy(a, b); } };
+    assert.deepEqual(await prepareLocalConfig('/repo', '/wt', silent(), boom), ['.npmrc']);
+  });
+
+  it('讀不到主 clone 根目錄也不擲錯', async () => {
+    const boom = { list: () => { throw new Error('ENOENT'); }, exists: () => false, copy: () => {} };
+    assert.deepEqual(await prepareLocalConfig('/repo', '/wt', silent(), boom), []);
   });
 });

@@ -25,7 +25,7 @@ import { evaluateBudget, type BudgetVerdict } from './core/budget.js';
 import { Planner } from './core/planner.js';
 import { Dispatcher } from './core/dispatcher.js';
 import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergeProject, type PrMergeLike, TICK_FAILED_EVENT } from './core/orchestrator.js';
-import { GroupRunner, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
+import { GroupRunner, prepareLocalConfig, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
 import { Reconciler, createFsProbe, createGitProbe, type ReconcilerDeps, type ReconcilerMcp } from './core/reconciler.js';
 import { AgentRuntime, agentAuthEnv } from './worker/agent-runtime.js';
 import { Verifier } from './worker/verifier.js';
@@ -656,6 +656,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       log,
     });
     if (!path) return;
+    await prepareLocalConfig(entry.runtime.repoPath, path, log).catch(() => undefined);
     log.info({ repo, path }, '合併工作區已重建');
   };
 
@@ -668,6 +669,10 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       log,
     });
     if (!path) continue;
+    // 依賴由專案自己的驗收指令負責；本機設定檔沒有版控對照物，只能從主 clone 帶
+    await prepareLocalConfig(runtime.repoPath, path, log).catch((e) =>
+      log.warn({ path, err: e instanceof Error ? e.message : String(e) }, '合併工作區的本機設定檔準備失敗'),
+    );
 
     byRepo.set(runtime.repo, {
       // 合併路徑的工作目錄＝專用 worktree，不是 runtime.repoPath（使用者的主 clone）
@@ -721,7 +726,10 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     // 複製依賴那條路現在整個拆了（見 group-runner 的說明：清單猜不對，而且就算猜對，
     // 複製來的版本也不對）。同一個坑改由**專案自己的驗收指令**負責——
     // 要安裝就寫成 `npm ci && npm run build`，那棵樹才會裝到它自己那顆 lockfile 的版本。
-    guard: input.guard ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log),
+    guard: input.guard ?? new MergeGuard(input.makeVerifier?.() ?? new Verifier(log), log, {
+      // 依賴不帶（複製來的版本對不上這棵樹），但本機設定檔要帶——它沒有版控對照物
+      prepareTree: (treePath, repoPath) => prepareLocalConfig(repoPath, treePath, log).then(() => undefined),
+    }),
     pr: input.pr ?? new PrManager(log),
     // 合併前確認 base 沒被外部動過（人在 GitHub 上自己按合併、或別的工具）
     currentBaseSha: async (repoPath, baseBranch, remote) => {
