@@ -371,7 +371,17 @@ export class Worker {
         ledger.setBlock(task.id, 'needs_clarification', r.askedClarification.question);
         // 問題也寫成事件：人回覆後 clearBlock 會抹掉 block_detail，
         // 少了這筆，續跑時就只剩答案、沒有問題，agent 讀到的會是沒頭沒尾的一句話。
-        ledger.logEvent('task', task.id, 'clarification_asked', r.askedClarification.question);
+        //
+        // **整包寫進去，不要只留問題文字。** agent 已經把 rationale 與 options 結構化
+        // 交出來了，先前這裡只取 question、其餘當場蒸發——然後 pending.ts 再用
+        // `/建議[：:]/` 從問題正文裡把「建議預設」猜回來。猜錯的那一次會直接被
+        // 當成**人的答覆**送給 agent，而稽核紀錄上看起來完全像是人自己打的。
+        // threadTs 一起寫：那是「哪一則答覆回答哪一則提問」的關聯鍵
+        //（見 settledDecisions——先前靠陣列位置配對，一則沒被回答就整串位移）。
+        ledger.logEvent(
+          'task', task.id, 'clarification_asked',
+          JSON.stringify({ ...r.askedClarification, ...(threadTs ? { threadTs } : {}) }),
+        );
         this.say(threadTs, { type: 'problem', detail: `需澄清：${r.askedClarification.question}` }, detail);
         return { status: 'parked', clarification: r.askedClarification };
       }

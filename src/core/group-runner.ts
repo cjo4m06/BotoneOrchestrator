@@ -525,16 +525,23 @@ export function mergeGuardFeedback(
   const parts: string[] = [];
 
   if (verdict.reason === 'code_conflict') {
-    const files = conflictedFiles(detail);
+    // **不從 git 印給人看的訊息裡撈檔名。**
+    //
+    // 先前用 `/Merge conflict in (.+?)$/` 掃輸出，然後用肯定句對 agent 說
+    //「衝突檔案：a、b、c」。那個正則認得的是某一版 git 的英文措辭——
+    // 換個 locale、換個合併策略（rename/rename、add/add）格式就不一樣，
+    // 撈到一半的清單卻照樣用肯定句講出來，比不講更糟。
+    //
+    // agent 自己 `git status` 就有機器格式的衝突清單，而且是完整的。
     parts.push(
-      '你的分支要合併回目標分支，但**目標分支在你動工之後已經有新的變更**，rebase 產生了衝突。',
-      files.length > 0 ? `衝突檔案：${files.join('、')}` : '衝突檔案：見下方 git 輸出。',
+      '你的分支要合併回目標分支，但**目標分支在你動工之後已經有新的變更**，合併產生了衝突。',
       '',
       '請這樣處理：',
-      '1. 先看目標分支上那些新變更做了什麼（例如 `git log`、`git diff` 對照最新的 base）。',
-      '2. 在**最新的 base 之上**重做你這份改動，讓兩邊的意圖都保留下來。',
-      '3. **不可以**為了消掉衝突就把對方的變更刪掉或改回去——那會安靜地弄壞別人剛完成的功能。',
-      '4. 如果兩邊的需求真的互斥、無法同時成立，用 ask_human 說明衝突點，不要自己選一邊。',
+      '1. `git status` 看哪些檔案衝突了（那是機器格式，比任何摘要準）。',
+      '2. 先看目標分支上那些新變更做了什麼（`git log`、`git diff` 對照最新的 base）。',
+      '3. 在**最新的 base 之上**重做你這份改動，讓兩邊的意圖都保留下來。',
+      '4. **不可以**為了消掉衝突就把對方的變更刪掉或改回去——那會安靜地弄壞別人剛完成的功能。',
+      '5. 如果兩邊的需求真的互斥、無法同時成立，用 ask_human 說明衝突點，不要自己選一邊。',
     );
   } else if (verdict.reason === 'semantic_drift') {
     // **不要用 reason 這個代碼去推論原因。** semantic_drift 現在有兩種來源：

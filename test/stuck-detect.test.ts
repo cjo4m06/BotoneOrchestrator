@@ -66,58 +66,56 @@ describe('repeatedFriction：同一類障礙回報第二次', () => {
   });
 });
 
-describe('repeatedRejection：同一份規格被退回第二次', () => {
-  // 實跑 zZb5MGTMdQRZ 的三次退回：#1 與 #3 點名同一份規格
-  const R1 = '第 1 次退回：\n1. [spec/design-system-buttons.md#觸控目標尺寸] 規格要求熱區 44×44';
-  const R2 = '第 2 次退回：\n1. [issues/2026-07-31-mobile-menu-touch-target-below-44px.md] 相鄰熱區重疊';
-  const R3 = '第 3 次退回：\n1. [spec/design-system-buttons.md#觸控目標尺寸] 又不符了';
+/**
+ * **只數次數，不讀內容。**
+ *
+ * 先前這裡用 `/\[(.*\.md.*)\]/` 從退回理由裡撈規格檔名，比對「同一份規格被退回兩次」。
+ * 那是程式在讀審查者寫的散文然後猜「它在講哪一份規格」——換個寫法（不加方括號、
+ * 英文檔名、根本沒提檔名）就撈不到，而撈不到就靜靜地不觸發。
+ *
+ * 「是不是同一件事」要讀懂內容才判斷得出來，那是人的事。程式數得準的是次數。
+ */
+describe('repeatedRejection：連續退回三次就交人', () => {
+  const rej = (n: number) => ev('review_rejected', `第 ${n} 次退回：某個理由`);
 
-  it('同一個 docRef 出現在兩次退回 → 停下來（那通常代表幾條要求互斥）', () => {
-    const r = repeatedRejection([ev('review_rejected', R1), ev('review_rejected', R2), ev('review_rejected', R3)]);
+  it('連續三次 → 停下來，並把每一輪的原話都附上', () => {
+    const r = repeatedRejection([rej(1), rej(2), rej(3)]);
 
-    assert.equal(r?.kind, 'spec');
-    assert.match(r?.body ?? '', /spec\/design-system-buttons\.md#觸控目標尺寸/);
-    assert.match(r?.body ?? '', /第 1 與第 3 輪/, '要講出是哪兩輪，人才查得下去');
-    assert.match(r?.body ?? '', /無法同時成立/, '要點出「這通常是互斥」，否則人會以為只是 agent 做不好');
+    assert.equal(r?.kind, 'review');
+    assert.equal(r?.count, 3);
+    assert.match(r?.body ?? '', /第 1 次退回/);
+    assert.match(r?.body ?? '', /第 3 次退回/);
+    assert.match(r?.body ?? '', /無法同時成立/, '要點出「這可能是互斥」，否則人以為只是 agent 做不好');
   });
 
-  it('三次退回但每次都是不同規格 → 不停（那是 agent 一項一項在修）', () => {
+  it('兩次 → 不停（第二次還在合理的迭代範圍）', () => {
+    assert.equal(repeatedRejection([rej(1), rej(2)]), undefined);
+  });
+
+  it('不看內容——沒有檔名、英文、隨便寫都一樣數得到', () => {
     const r = repeatedRejection([
-      ev('review_rejected', '[spec/a.md#x] 不符'),
-      ev('review_rejected', '[spec/b.md#y] 不符'),
-      ev('review_rejected', '[spec/c.md#z] 不符'),
+      ev('review_rejected', 'nope'),
+      ev('review_rejected', 'still not right'),
+      ev('review_rejected', '就是不行'),
     ]);
-    assert.equal(r, undefined);
-  });
-
-  it('只退回一次 → 不停（第一次退回是正常的迴圈，不是卡住）', () => {
-    assert.equal(repeatedRejection([ev('review_rejected', R1)]), undefined);
-  });
-
-  it('退回內容沒有 docRef → 不停，也不崩', () => {
-    assert.equal(repeatedRejection([ev('review_rejected', '就是不行'), ev('review_rejected', '還是不行')]), undefined);
-  });
-
-  it('各輪退回的全文都要帶給人（人要自己判斷是不是真的互斥）', () => {
-    const r = repeatedRejection([ev('review_rejected', R1), ev('review_rejected', R3)]);
-    assert.match(r?.body ?? '', /規格要求熱區 44×44/);
-    assert.match(r?.body ?? '', /又不符了/);
+    assert.equal(r?.count, 3, '先前的正則要求方括號裡有 .md，這三筆一個都撈不到');
   });
 });
 
 describe('detectStuck：兩道保險合一', () => {
-  it('規格重複退回優先報（它代表已經燒掉兩輪以上）', () => {
+  it('連續退回優先報（它代表已經燒掉三輪）', () => {
     const r = detectStuck([
       friction('system_limitation', 'a'),
       friction('system_limitation', 'b'),
-      ev('review_rejected', '[spec/a.md#x] 不符'),
-      ev('review_rejected', '[spec/a.md#x] 還是不符'),
+      ev('review_rejected', '不符 1'),
+      ev('review_rejected', '不符 2'),
+      ev('review_rejected', '不符 3'),
     ]);
-    assert.equal(r?.kind, 'spec');
+    assert.equal(r?.kind, 'review');
   });
 
   it('什麼都沒重複 → undefined（不可以動不動就停整個群組）', () => {
-    assert.equal(detectStuck([friction('system_limitation', 'a'), ev('review_rejected', '[spec/a.md#x] 不符')]), undefined);
+    assert.equal(detectStuck([friction('system_limitation', 'a'), ev('review_rejected', '不符')]), undefined);
   });
 
   it('空事件表 → undefined', () => {

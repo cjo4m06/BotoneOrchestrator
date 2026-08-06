@@ -104,48 +104,23 @@ function inbandError(json: unknown): { error: string; code?: string } | undefine
  * 真實 MCP 長這樣：`還有 1 個前置任務未完成：「建立 /sandbox 路由骨架」(進行中)`。
  * 比對刻意寬鬆到能容忍措辭變化（中英、code 欄位），但**不含**任何泛用失敗字眼。
  */
-const DEPS_WAIT_HINTS: RegExp[] = [
-  /前置(任務|工作|項目|條件)/,
-  /依賴|相依|上游任務/,
-  /dep(s|end)/i, // DEPS_NOT_DONE / dependency / depends on
-  /prerequisite|upstream/i,
-  /blocked\s*by|waiting\s*(for|on)/i,
-  /(還有|尚有)\s*\d*\s*[個項].{0,12}未完成/, // 「還有 2 個上游卡未完成」這類措辭變化
-];
-
 /**
- * 「等再久也不會好」的措辭 —— 一律 permanent，讓流程停下來讓人看到。
+ * `start_task` 失敗要怎麼處置。
  *
- * 特別注意：`(進行中)` **不可**放進這裡——依賴訊息本身就會用它描述前置任務的狀態
- * （`…未完成：「X」(進行中)`），誤收會把真正的依賴訊號吃掉。所以只認「已…進行中」。
+ * ── 為什麼不再猜 ──
+ *
+ * 先前這裡有兩組中英關鍵字正則（DEPS_WAIT_HINTS / NOT_WAITABLE_HINTS），
+ * 拿 `${err.code} ${err.error}` 串成一段文字去比對，判它是「可以等的前置未完成」
+ * 還是「永久失敗」。註解自己寫著「比對刻意寬鬆到能容忍措辭變化」——
+ * 那就是承認它在猜：任務板換一版措辭、換一種語言、換一個錯誤碼，
+ * 整組就失效，而失效的方式是**靜默地全部判成 permanent**（預設值），
+ * 於是本來只要等一下的任務被直接交人。
+ *
+ * 現在一律回 permanent 交給呼叫端處置——那是誠實的：程式看到一個它讀不懂的錯誤字串，
+ * 它唯一知道的事實就是「認領失敗了」。要判斷「這個錯誤代表什麼」得讀得懂任務板的語意，
+ * 那是 agent 或人的事，而交人的路徑本來就在（交接單會帶著原始錯誤全文）。
  */
-const NOT_WAITABLE_HINTS: RegExp[] = [
-  /已(經)?(被)?[^，。；]{0,8}?(認領|領取|接手)/, // 「任務已被 alice 認領」
-  /已(在)?(開始|進行中)/, // 「任務已開始／已在進行中」（崩潰恢復後重新認領會撞到）
-  /已(經)?(完成|結束|關閉)/, // 「任務已完成」——MCP 無反 done 工具，等不到它變回 todo
-  /指派|分派|assign/i, // 指派給他人／未指派給你：不會因為等待而改變
-  /不存在|找不到|無此|not\s*found|unknown\s*task/i,
-  /權限|無權|forbidden|unauthor/i,
-  /參數|格式|invalid|validation|bad\s*request/i,
-  /already\s*(claimed|started|in[_\s-]?progress|done|completed|finished|assigned)/i,
-];
-
-/**
- * start_task 的帶內 `{ ok:false }` 該歸 signal 還是 permanent（缺陷 1）。
- *
- * 為什麼不能像以前那樣「一律 signal」：signal 的語意是「照做（標 blocked:deps）並稍後重試」，
- * 於是「已被認領／已完成／指派給他人／參數錯」全都變成無聲重試。
- * 最糟的是崩潰恢復：MCP 上任務還是 in_progress（上次已認領）→ 重新 start_task 失敗 →
- * signal → blocked:deps → 群回 ready → 下一輪再來 → **永久空轉**，Slack 一則通知都沒有。
- *
- * 取捨方向（§D18）：**寧可錯歸 permanent**。permanent 會停下來讓人看到，
- * signal 會無聲重試；誤殺一次有人來看，漏抓一次就是永遠空轉。
- * 所以規則是「否定優先、白名單其次、預設 permanent」。
- */
-export function classifyStartTaskFailure(err: { error: string; code?: string }): 'signal' | 'permanent' {
-  const text = `${err.code ?? ''} ${err.error}`;
-  if (NOT_WAITABLE_HINTS.some((re) => re.test(text))) return 'permanent';
-  if (DEPS_WAIT_HINTS.some((re) => re.test(text))) return 'signal';
+function classifyStartTaskFailure(_err: { code?: string; error: string }): 'permanent' {
   return 'permanent';
 }
 
@@ -422,12 +397,14 @@ export class PmmMcpClient implements McpTaskClient {
       const j = await this.raw('handler__start_task', { taskId: id });
       const err = inbandError(j);
       if (err) {
-        // 只有**明確可辨識**的「依賴未滿足」才是 signal（＝照做：標 blocked 等下一輪）；
-        // 其餘（已認領／已完成／指派他人／參數錯）一律 permanent，讓它停下來被人看到。
+        // **不猜這個錯誤代表什麼。** 一律 permanent → 停下來交人，錯誤全文一起帶上去。
+        // 先前用兩組中英關鍵字正則猜「這是可以等的前置未完成嗎」，換一版措辭就失效，
+        // 而失效的方式是靜默地全部落到預設值。要判斷「這個錯誤代表什麼」得讀得懂
+        // 任務板的語意——那是人或 agent 的事，而交人的路徑本來就在。
         const kind = classifyStartTaskFailure(err);
-        this.log[kind === 'signal' ? 'info' : 'warn'](
-          { taskId: id, code: err.code, kind, detail: err.error },
-          kind === 'signal' ? 'start_task 受阻於依賴，稍後重試' : 'start_task 失敗且重試無用，交由呼叫端停下來處理',
+        this.log.warn(
+          { taskId: id, code: err.code, detail: err.error },
+          'start_task 失敗，交由呼叫端停下來處理（原始錯誤一起帶給人）',
         );
         return { ok: false, kind, detail: err.error };
       }

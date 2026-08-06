@@ -316,17 +316,43 @@ describe('CLI ask — 本機互動入口', () => {
   });
 
   describe('collectPending：掃出等人處理的事項', () => {
-    it('澄清：抓出問題並解析 agent 建議的預設', () => {
+    /**
+     * **建議預設讀欄位，不從正文撈。**
+     *
+     * 先前用 `/建議[：:]/` 掃問題正文，而那個值不只是顯示——CLI 的 `--default`
+     * 會把它當成人的答案送出去。agent 用英文寫、寫成條列、或正文裡剛好有一行
+     *「建議：先不要動某檔」當作說明脈絡，都會被當成人自己打的答案。
+     *
+     * agent 呼叫 ask_human 時就交了 { question, rationale, options }，
+     * 只是先前在 worker 就被丟掉、只留問題文字。
+     */
+    it('澄清：建議預設來自 agent 交的 options，不是從正文撈', () => {
       seedTask('T-1', '登入頁');
-      tmp.ledger.setBlock('T-1', 'needs_clarification', 'CTA 要固定底部還是隨內容捲動？\n建議：固定底部');
+      tmp.ledger.setBlock('T-1', 'needs_clarification', 'CTA 要固定底部還是隨內容捲動？');
+      tmp.ledger.logEvent('task', 'T-1', 'clarification_asked', JSON.stringify({
+        question: 'CTA 要固定底部還是隨內容捲動？',
+        options: ['固定底部', '隨內容捲動'],
+      }));
 
       const items = collectPending(tmp.ledger);
 
       assert.equal(items.length, 1);
       assert.equal(items[0]?.kind, 'clarification');
-      assert.equal(items[0]?.id, 'T-1');
       assert.equal(items[0]?.suggestion, '固定底部');
       assert.ok(items[0]?.actions.includes('--default'));
+    });
+
+    it('沒有 options → 就是沒有建議（不從正文猜一句出來當人的答案）', () => {
+      seedTask('T-1b', '登入頁');
+      tmp.ledger.setBlock('T-1b', 'needs_clarification', '要 A 還是 B？\n建議：先不要動 SandboxView.vue');
+
+      const item = collectPending(tmp.ledger).find((i) => i.id === 'T-1b');
+
+      assert.equal(
+        item?.suggestion,
+        undefined,
+        '那一行「建議：」是說明脈絡，猜錯就會被當成人的答覆送給 agent，而稽核上看起來像人自己打的',
+      );
     });
 
     it('無需改動：從 events 取回分類與依據（人要靠它判斷 agent 有沒有誤判）', () => {

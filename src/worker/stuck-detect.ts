@@ -81,34 +81,34 @@ export function repeatedFriction(events: LedgerEvent[]): RepeatedObstacle | unde
  * 只抽 `[...]` 裡的 docRef，不讀退回理由的內容。
  */
 export function repeatedRejection(events: LedgerEvent[]): RepeatedObstacle | undefined {
-  const rounds: { round: number; refs: string[]; text: string }[] = [];
-  for (const e of events) {
-    if (e.kind !== 'review_rejected' || !e.detail) continue;
-    const refs = [...e.detail.matchAll(/\[([^\]]*?\.md[^\]]*?)\]/g)].map((m) => m[1]!.trim());
-    rounds.push({ round: rounds.length + 1, refs: [...new Set(refs)], text: e.detail });
-  }
-  if (rounds.length < 2) return undefined;
-
-  const seenIn = new Map<string, number[]>();
-  for (const r of rounds) for (const ref of r.refs) seenIn.set(ref, [...(seenIn.get(ref) ?? []), r.round]);
-
-  for (const [ref, where] of seenIn) {
-    if (where.length < 2) continue;
-    return {
-      kind: 'spec',
-      count: where.length,
-      body: [
-        `第 ${where.join(' 與第 ')} 輪的審查都因為同一份規格被退回：${ref}`,
-        '而 agent 在兩次之間改過實作——這通常代表**幾條要求無法同時成立**，',
-        'agent 每次滿足其中一邊，就被另一邊擋下來。',
-        '',
-        '各輪退回的原話：',
-        ...rounds.map((r) => `\n── 第 ${r.round} 次 ──\n${r.text}`),
-      ].join('\n'),
-    };
-  }
-  return undefined;
+  // **只數次數，不讀內容。**
+  //
+  // 先前這裡用 `/\[(.*\.md.*)\]/` 從退回理由裡撈規格檔名，再比對「同一份規格被退回兩次」。
+  // 那是程式在讀審查者寫的散文然後猜「它在講哪一份規格」——換個寫法（不加方括號、
+  // 用英文檔名、根本沒提檔名）就撈不到，而撈不到就靜靜地不觸發。
+  //
+  // 真正數得準又不必讀內容的是**退回次數**：連續被退回三次還沒過，就代表
+  // 這個迴圈自己收斂不了，該交給人。至於「是不是同一件事」——那要讀懂內容才判斷得出來，
+  // 是人的事，所以把每一輪的原話原樣附上讓人自己看。
+  const rounds = events.filter((e) => e.kind === 'review_rejected' && e.detail);
+  if (rounds.length < REJECTIONS_BEFORE_HANDOFF) return undefined;
+  return {
+    kind: 'review',
+    count: rounds.length,
+    body: [
+      `審查連續退回了 ${rounds.length} 次，這個迴圈自己收斂不了。`,
+      '',
+      '**如果這幾條要求無法同時成立，需要你決定誰讓步**——',
+      'agent 每次滿足其中一邊都會被另一邊退回，再跑幾輪也一樣。',
+      '',
+      '各輪退回的原話：',
+      ...rounds.map((r, i) => `\n── 第 ${i + 1} 次 ──\n${r.detail}`),
+    ].join('\n'),
+  };
 }
+
+/** 連續被退回幾次就交人。三次＝agent 已經試過三種改法還是不過。 */
+const REJECTIONS_BEFORE_HANDOFF = 3;
 
 /**
  * 兩道保險合一。回傳第一個命中的；都沒有就 undefined。

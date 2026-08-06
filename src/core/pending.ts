@@ -126,7 +126,13 @@ export function collectPending(ledger: AskLedger): PendingItem[] {
       // 這與被換掉的「推論」是不同的事：那邊推的是**誰在等人**（會漏），
       // 這邊只是替一個**已經確定在清單上**的項目補齊 UI 要用的欄位。
       // 補不到就沒有，不影響它出不出現。
-      ...(h.kind === 'clarification' && parseSuggestion(h.body) ? { suggestion: parseSuggestion(h.body)! } : {}),
+      // 建議預設**讀欄位，不從正文撈**。
+      //
+      // 先前用 `/建議[：:]/` 掃問題正文，而那個值不只是顯示——CLI 的 `--default`
+      // 會把它當成人的答案送出去。agent 用英文寫、寫成條列、或正文裡剛好有一行
+      //「建議：先不要動某檔」當作說明脈絡，都會出事。
+      // 現在 clarification_asked 存的是整包 ClarificationCapture，讀 options 就好。
+      ...(h.kind === 'clarification' ? clarificationExtras(ledger, h.taskId) : {}),
       ...(h.kind === 'no_change' ? noChangeExtras(ledger, h.taskId) : {}),
     });
   }
@@ -182,6 +188,29 @@ function noChangeExtras(ledger: AskLedger, taskId: string | undefined): Partial<
 
 /** 自檢要看的狀態：跑到一半停住、而且系統不會自己再動它的那些。 */
 /** 見 handoff.ts：這份清單與 reviveGroup 願意復活的狀態**必須是同一份**。 */
+/**
+ * 澄清單的補充欄位：**讀 agent 自己交的結構，不解析它的散文。**
+ *
+ * agent 呼叫 ask_human 時就交了 { question, rationale, options }；
+ * 建議預設就是 options 裡標了推薦的那一個，沒有就是沒有——
+ * 那時人自己打字，而不是讓程式從正文猜一句出來當他的答案。
+ */
+function clarificationExtras(ledger: AskLedger, taskId: string | undefined): { suggestion?: string } {
+  if (!taskId) return {};
+  const e = ledger.latestEvent?.('task', taskId, 'clarification_asked');
+  if (!e?.detail) return {};
+  try {
+    const j = JSON.parse(e.detail) as { options?: unknown; recommendedDefault?: unknown };
+    if (typeof j.recommendedDefault === 'string' && j.recommendedDefault.trim()) {
+      return { suggestion: j.recommendedDefault };
+    }
+    if (Array.isArray(j.options) && typeof j.options[0] === 'string') return { suggestion: j.options[0] };
+  } catch {
+    // 舊資料是純文字的問題——沒有結構就沒有建議，照實不給
+  }
+  return {};
+}
+
 const SELF_CHECK_STATES: readonly Group['state'][] = STUCK_GROUP_STATES;
 
 /** 這一群留下過「停手交人」的痕跡嗎（事件層，與交接單獨立）。 */
@@ -202,11 +231,6 @@ function firstLine(s: string | undefined): string {
   return (s ?? '').split('\n')[0]?.trim().slice(0, 200) ?? '';
 }
 
-/** 從澄清問題的文字中撈出 agent 標註的建議預設（格式由 Worker 寫入，抓不到就沒有）。 */
-function parseSuggestion(detail: string): string | undefined {
-  const m = /建議[：:]\s*(.+?)(?:\n|$)/.exec(detail);
-  return m?.[1]?.trim();
-}
 
 function parseNoChangeEvent(
   ledger: AskLedger,

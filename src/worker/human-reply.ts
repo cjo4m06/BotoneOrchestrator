@@ -77,16 +77,63 @@ export function settledDecisions(
   ledger: { listEvents(q: { scope: 'task'; refId: string; kind?: string; limit?: number }): LedgerEvent[] },
   taskId: string,
 ): { question: string; answer: string }[] {
-  const asked = ledger.listEvents({ scope: 'task', refId: taskId, kind: 'clarification_asked', limit: 50 });
   const answered = ledger.listEvents({ scope: 'task', refId: taskId, kind: 'clarification_answer', limit: 50 });
   if (answered.length === 0) return [];
-  // 問題與答覆一一對應：兩邊都依事件 id 排序，第 n 個答覆對應第 n 個提問。
-  // 對不上時（重啟遺失、答覆比提問多）就只給答覆本身——有答案總比什麼都沒有好。
-  const questions = asked.map((e) => questionText(e.detail)).filter((q) => q !== '');
-  return answered.map((e, i) => ({
-    question: questions[i] ?? '（原問題已不可考）',
-    answer: answerText(e.detail),
-  })).filter((d) => d.answer !== '');
+  const asked = ledger.listEvents({ scope: 'task', refId: taskId, kind: 'clarification_asked', limit: 50 });
+
+  // **用 threadTs 對，不用位置對。**
+  //
+  // 先前是 `answered.map((e, i) => ({ question: questions[i] … }))`——用陣列位置
+  // 把答案綁到問題上，而兩張清單之間沒有任何參照關係。只要有一則提問還沒被回答，
+  // 整串就位移：agent 問 Q1 → 人答 A1 → 任務重跑 → agent 又問 Q2（還沒人回）→
+  // asked=[Q2,Q1]、answered=[A1] → 配出 {question: Q2, answer: A1}。
+  //
+  // 而這份東西會進 reviewer 的 prompt，開頭寫著「下面這些已經由需求方決定了，
+  // 不要因為規格沒寫而回報違規」——**等於程式編了一個沒有人做過的裁決，
+  // 然後叫審查者據此放行**。比漏掉更糟。
+  //
+  // threadTs 本來就是天然的關聯鍵（Slack thread ＝ 一次問答），只是先前沒被用來配對。
+  const byThread = new Map<string, string>();
+  for (const e of asked) {
+    const { threadTs, question } = parseAsked(e.detail);
+    if (threadTs && question) byThread.set(threadTs, question);
+  }
+
+  const out: { question: string; answer: string }[] = [];
+  for (const e of answered) {
+    const { threadTs, answer } = parseAnswer(e.detail);
+    if (!answer) continue;
+    // 對不到就照實說「對不到」，不要硬塞給最近的一則提問
+    out.push({ question: (threadTs && byThread.get(threadTs)) || '（這則答覆對不到原始提問）', answer });
+  }
+  return out;
+}
+
+/** clarification_asked 的 detail：新版是整包 JSON，舊版是純問題文字。 */
+function parseAsked(detail: string | undefined): { threadTs?: string; question?: string } {
+  if (!detail) return {};
+  try {
+    const j = JSON.parse(detail) as { question?: unknown; threadTs?: unknown };
+    return {
+      ...(typeof j.question === 'string' ? { question: j.question } : {}),
+      ...(typeof j.threadTs === 'string' ? { threadTs: j.threadTs } : {}),
+    };
+  } catch {
+    return { question: detail };
+  }
+}
+
+function parseAnswer(detail: string | undefined): { threadTs?: string; answer?: string } {
+  if (!detail) return {};
+  try {
+    const j = JSON.parse(detail) as { answer?: unknown; threadTs?: unknown };
+    return {
+      ...(typeof j.answer === 'string' ? { answer: j.answer } : {}),
+      ...(typeof j.threadTs === 'string' ? { threadTs: j.threadTs } : {}),
+    };
+  } catch {
+    return { answer: detail };
+  }
 }
 
 /** clarification_asked 的 detail 可能是 JSON 或純文字。 */

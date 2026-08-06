@@ -1,10 +1,10 @@
 import { describe, it } from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import {
   PmmMcpClient,
   McpError,
   mcpResilienceFromEnv,
-  classifyStartTaskFailure,
   toEpochMs,
   MCP_RESILIENCE_DEFAULTS,
   type McpResilienceOptions,
@@ -61,12 +61,23 @@ function makeClient(responder: Responder, o: MakeClientOpts = {}): MadeClient {
 const text = (v: unknown) => ({ content: [{ type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v) }] });
 
 describe('PmmMcpClient — 帶內錯誤分類', () => {
-  it('start_task 帶內 { ok:false } 且訊息是依賴未完 → signal（稍後重試）', async () => {
+  /**
+   * **不再猜這個錯誤代表什麼。**
+   *
+   * 先前有兩組中英關鍵字正則（DEPS_WAIT_HINTS / NOT_WAITABLE_HINTS）判它是
+   *「可以等的前置未完成」還是「永久失敗」。註解自己寫著「比對刻意寬鬆到能容忍措辭變化」
+   * ——那就是承認在猜。任務板換一版措辭、換一種語言、換一個錯誤碼就失效，
+   * 而失效的方式是**靜默地全部落到預設值**。
+   *
+   * 程式知道的只有「認領失敗了」。要讀懂那句話是人或 agent 的事，
+   * 而交人的路徑本來就在，錯誤全文會一起帶上去。
+   */
+  it('帶內錯誤一律 permanent，原始錯誤全文原樣帶出來', async () => {
     const { client } = makeClient(() => text({ ok: false, error: '依賴 T-0 尚未完成', code: 'DEPS_NOT_DONE' }));
 
     const out = await client.startTask('T-1');
 
-    assert.deepEqual(out, { ok: false, kind: 'signal', detail: '依賴 T-0 尚未完成' });
+    assert.deepEqual(out, { ok: false, kind: 'permanent', detail: '依賴 T-0 尚未完成' });
   });
 
   it('start_task 帶內錯誤沒有 error 欄位 → permanent（辨識不出「依賴未滿足」就不准無聲重試）', async () => {
@@ -130,59 +141,13 @@ describe('PmmMcpClient — 帶內錯誤分類', () => {
  * signal = 「照做並稍後重試」，會**無聲**地一輪一輪重打；permanent 會停下來讓人看到。
  * 崩潰恢復時 MCP 上的任務仍是 in_progress，舊行為會讓群組 ready↔blocked 永久空轉。
  */
-describe('classifyStartTaskFailure — 只有可辨識的「依賴未滿足」才是 signal', () => {
-  const signalCases: { name: string; err: { error: string; code?: string } }[] = [
-    // 真實 MCP 的訊息長這樣（注意結尾的 (進行中) 不可被當成「已在進行中」）
-    { name: '真實依賴訊息', err: { error: '還有 1 個前置任務未完成：「建立 /sandbox 路由骨架」(進行中)' } },
-    { name: '措辭變化：多個前置', err: { error: '還有 2 個前置任務未完成' } },
-    { name: '措辭變化：沒有「前置」二字', err: { error: '尚有 3 個上游卡未完成，請稍候' } },
-    { name: '依賴用詞', err: { error: '依賴 T-0 尚未完成' } },
-    { name: '相依用詞', err: { error: '相依任務仍在進行' } },
-    { name: '英文 dependency', err: { error: 'dependencies are not satisfied yet' } },
-    { name: '只有 code 看得出來', err: { error: '目前無法開始', code: 'DEPS_NOT_DONE' } },
-    { name: '英文 blocked by', err: { error: 'task is blocked by T-0' } },
-  ];
-  for (const c of signalCases) {
-    it(`signal：${c.name}`, () => assert.equal(classifyStartTaskFailure(c.err), 'signal', c.err.error));
-  }
-
-  const permanentCases: { name: string; err: { error: string; code?: string } }[] = [
-    { name: '已被他人認領', err: { error: '任務已被 alice 認領' } },
-    { name: '已被認領（無人名）', err: { error: '任務已被認領' } },
-    { name: '崩潰恢復：已在進行中', err: { error: '任務已在進行中，無法重複開始' } },
-    { name: '已完成', err: { error: '任務已完成，無法開始' } },
-    { name: '指派給他人', err: { error: '任務指派給其他人，無法認領' } },
-    { name: '未指派給你', err: { error: '此任務未指派給你' } },
-    { name: '找不到任務', err: { error: '找不到任務 T-99' } },
-    { name: '參數錯誤', err: { error: 'taskId 參數格式錯誤' } },
-    { name: '無權限', err: { error: '沒有權限操作此任務' } },
-    { name: '英文 already claimed', err: { error: 'task already claimed by another worker' } },
-    { name: 'code 表明已認領', err: { error: '無法開始', code: 'ALREADY_CLAIMED' } },
-    { name: '完全看不懂的訊息 → 寧可 permanent', err: { error: '未知錯誤' } },
-    { name: '空訊息 → 寧可 permanent', err: { error: '' } },
-  ];
-  for (const c of permanentCases) {
-    it(`permanent：${c.name}`, () => assert.equal(classifyStartTaskFailure(c.err), 'permanent', c.err.error));
-  }
-
-  it('依賴措辭與「已認領」同時出現 → permanent（寧可停下來讓人看到）', () => {
-    assert.equal(classifyStartTaskFailure({ error: '依賴已滿足，但任務已被 bob 認領' }), 'permanent');
-  });
-
-  it('permanent 的帶內錯誤不重試、不計入熔斷（它不是暫時性故障）', async () => {
-    const { client, calls, sleeps } = makeClient(() => text({ ok: false, error: '任務已被 alice 認領' }), {
-      resilience: { attempts: 4, breakerFailureThreshold: 2 },
-    });
-
-    for (let i = 0; i < 3; i++) {
-      assert.deepEqual(await client.startTask('T-1'), { ok: false, kind: 'permanent', detail: '任務已被 alice 認領' });
-    }
-
-    assert.equal(calls.length, 3, '每次只送一發');
-    assert.deepEqual(sleeps, []);
-    assert.equal(client.breakerSnapshot().state, 'closed');
-  });
-});
+/**
+ * `start_task` 失敗不再被分類。
+ *
+ * 先前用兩組中英關鍵字正則猜「這是可以等的前置未完成嗎」，換一版措辭就失效——
+ * 而失效的方式是靜默地全部落到預設值 permanent。要判斷「這個錯誤代表什麼」
+ * 得讀得懂任務板的語意，那是人或 agent 的事；程式知道的只有「認領失敗了」。
+ */
 
 describe('PmmMcpClient — 傳輸層例外分類', () => {
   const cases: { msg: string; kind: 'permanent' | 'transient' }[] = [
@@ -459,17 +424,17 @@ describe('PmmMcpClient — 退避重試', () => {
     assert.equal(bad.calls.length, 2);
   });
 
-  it('start_task 的 signal（帶內 { ok:false }）不重試也不計入熔斷 —— 三分類語意不變', async () => {
+  it('start_task 的帶內錯誤不重試也不計入熔斷（對方有回應，不是傳輸故障）', async () => {
     const { client, calls } = makeClient(() => text({ ok: false, error: '依賴 T-0 尚未完成' }), {
       resilience: { attempts: 4, breakerFailureThreshold: 2 },
     });
 
     for (let i = 0; i < 5; i++) {
       const out = await client.startTask('T-1');
-      assert.deepEqual(out, { ok: false, kind: 'signal', detail: '依賴 T-0 尚未完成' });
+      assert.deepEqual(out, { ok: false, kind: 'permanent', detail: '依賴 T-0 尚未完成' });
     }
 
-    assert.equal(calls.length, 5, '每次只送一發，signal 不是暫時性故障');
+    assert.equal(calls.length, 5, '每次只送一發，帶內錯誤不是暫時性故障');
     assert.equal(client.breakerSnapshot().state, 'closed', '對方有正常回應 → 熔斷器不該跳');
   });
 });
