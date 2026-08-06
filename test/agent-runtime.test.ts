@@ -305,6 +305,36 @@ test('環境隔離：agent 子行程拿不到 GitHub 認證，但保留自己要
   assert.equal(env.HOME, '/home/x');
 });
 
+test('環境隔離：daemon 自己的 NODE_ENV／ORCH_* 不漏給 agent', () => {
+  const env = buildAgentEnv({
+    PATH: '/usr/bin',
+    // launchd 就是這樣起 daemon 的
+    NODE_ENV: 'production',
+    ORCH_PROFILE: 'prod',
+    ORCH_DATA_ROOT: '/Users/x/BotoneOrchestrator/data',
+    ORCH_LEDGER_PATH: '/Users/x/BotoneOrchestrator/data/ledger.db',
+  } as NodeJS.ProcessEnv);
+
+  // npm 把 NODE_ENV=production 當成 --omit=dev：漏過去，agent 的 npm ci 就裝不到
+  // devDependencies，build 關卡紅在一個跟這張卡完全無關的地方（見 DAEMON_ONLY_ENV）
+  assert.equal(env.NODE_ENV, undefined);
+  assert.equal(env.ORCH_PROFILE, undefined);
+  assert.equal(env.ORCH_DATA_ROOT, undefined);
+  assert.equal(env.ORCH_LEDGER_PATH, undefined);
+  assert.equal(env.PATH, '/usr/bin');
+});
+
+test('環境隔離：只擋 daemon 自己的，不誤傷專案的同名前綴變數', () => {
+  const env = buildAgentEnv({
+    ORCHESTRA_API_KEY: 'keep',   // 不是 ORCH_，別被前綴比對掃到
+    NODE_OPTIONS: '--max-old-space-size=4096',
+    NODE_VERSION: '24',
+  } as NodeJS.ProcessEnv);
+  assert.equal(env.ORCHESTRA_API_KEY, 'keep');
+  assert.equal(env.NODE_OPTIONS, '--max-old-space-size=4096');
+  assert.equal(env.NODE_VERSION, '24');
+});
+
 test('prompt 明講禁令（第三層：讓 agent 知道為什麼被擋，別去找繞路）', () => {
   const p = buildAgentPrompt(input());
   assert.match(p, /不要使用 `gh`/);

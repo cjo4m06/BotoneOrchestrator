@@ -336,7 +336,28 @@ const MAX_STOP_BLOCKS = 2;
 const AGENT_GH_CONFIG_DIR = join(tmpdir(), 'orch-agent-gh-empty');
 
 /**
- * agent 子行程的環境：在繼承 process.env 的基礎上**移除 GitHub 認證**。
+ * daemon 自己的執行模式，**不可以漏給 agent**。
+ *
+ * launchd 是用 `NODE_ENV=production` 起這個 daemon 的（那是給 logger 用的，
+ * 見 observability/logger.ts）。而 buildAgentEnv 原本整份複製 process.env，
+ * 於是 agent 的 Bash 也帶著 `NODE_ENV=production` ——**npm 把它當成 `--omit=dev`**。
+ *
+ * 實際後果（2026-08-06，WorkerControl）：那個專案的 package.json 沒有 dependencies，
+ * vite / laravel-vite-plugin / sass-embedded 全在 devDependencies。`npm ci` 一個都沒裝，
+ * `npm run build` 回 `vite: command not found`（exit 127），build 關卡紅。
+ * 兩個群組的 agent 都正確診斷出根因、都用 `npm ci --include=dev` 證明了改完就綠、
+ * 都想寫一行 `.npmrc` 修掉——而 `.npmrc` 在 PROTECTED_PATHS.secrets 裡被擋，
+ * 於是兩群一起卡在 ask_human。症狀看起來像「專案設定寫錯」，其實是調度器漏出去的變數。
+ *
+ * ORCH_* 同理：那是 daemon 的資料庫路徑與 profile，agent 不該看見，
+ * 更不該在改到本 repo 時把 `ORCH_PROFILE=prod` 一起繼承過去。
+ * （注意 profileOf 的預設本來就是 prod，所以光是拿掉還不足以保護「agent 改調度器自己」
+ *   那個情境——那要另外處理，不要以為這一行就夠了。）
+ */
+const DAEMON_ONLY_ENV = /^(NODE_ENV|ORCH_.*)$/;
+
+/**
+ * agent 子行程的環境：在繼承 process.env 的基礎上**移除 GitHub 認證與 daemon 自身設定**。
  *
  * SDK 的 options.env 若有設就會完全取代子行程環境，所以必須先展開 process.env
  * （PATH/HOME/ANTHROPIC_AUTH_TOKEN 等都還要留著，agent 自己得靠它們運作）。
@@ -354,6 +375,8 @@ export function buildAgentEnv(
     if (v === undefined) continue;
     // gh 的 token 認證：一律不傳給 agent
     if (k === 'GH_TOKEN' || k === 'GITHUB_TOKEN' || k === 'GH_ENTERPRISE_TOKEN' || k === 'GITHUB_ENTERPRISE_TOKEN') continue;
+    // daemon 自己的執行模式：見 DAEMON_ONLY_ENV
+    if (DAEMON_ONLY_ENV.test(k)) continue;
     env[k] = v;
   }
   // gh 的檔案/keyring 認證：指到空目錄 ⇒ gh 變成「未登入」
