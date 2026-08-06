@@ -1,5 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { DOCS_TOOLS, createDocsServer, type DocsSource } from '../worker/docs-server.js';
+import { createGitInspectServer } from '../worker/git-inspect.js';
 import { serversFor, toolsFor } from '../worker/capabilities.js';
 import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
@@ -42,10 +43,19 @@ export type DriftVerdict =
 export interface DriftJudgeInput {
   /** 工作區（已 rebase 到最新 base 的狀態）。 */
   cwd: string;
-  /** base 在本群動工之後多出來的變更。 */
-  baseChanges: string;
-  /** 本群相對 base 的變更。 */
-  groupChanges: string;
+  /**
+   * 分岔點（merge base）。判斷者自己用它去查兩邊各改了什麼。
+   *
+   * 先前這裡收的是**程式先算好、再各砍到 40K（只留頭）的兩份 diff 全文**。
+   * 那有兩個壞處：改動一大就有整批檔案它根本沒看到（而且不知道被砍了什麼），
+   * 以及那份快照是一次性的——它想換個角度再看（只看某個檔、看 git log 的脈絡）都不行。
+   * 現在它有唯讀 git 工具，要看幾次、看多細由它自己決定。
+   */
+  mergeBase: string;
+  /** 目標分支的 ref（例如 origin/main）。 */
+  baseRef: string;
+  /** 本群的分支。 */
+  branch: string;
   /** 本群在做什麼（任務標題，給判斷者背景）。 */
   taskTitles: string[];
   /** 所屬 repo——判斷者要靠它去任務板查規格（程式不預抓）。 */
@@ -109,15 +119,12 @@ export class DriftJudge {
   async judge(input: DriftJudgeInput): Promise<DriftVerdict> {
     const hasAuth = this.deps.hasAuth ?? defaultHasAuth;
     if (!hasAuth()) return { status: 'skipped', reason: '未設定 Claude 認證' };
-    if (!input.baseChanges.trim()) {
-      // base 沒動過就沒有「兩邊」可言，這一層不適用
-      return { status: 'skipped', reason: 'base 在本群動工後沒有新變更' };
-    }
-    if (!input.groupChanges.trim()) return { status: 'skipped', reason: '本群沒有變更' };
+    // 「base 有沒有動過」「本群有沒有變更」由判斷者自己查——程式先算一次
+    // 只是為了跳過，而跳過的代價（漏判一次意圖打架）比多花一次判斷貴。
 
     let text: string;
     try {
-      text = await this.runQuery(buildDriftPrompt(input), input.cwd, input.repo);
+      text = await this.runQuery(buildDriftPrompt(input), input.cwd, input.repo, input.mergeBase);
     } catch (e) {
       // 判斷層失敗不該擋住一組已經全綠的證據
       this.deps.log.warn({ err: msg(e) }, '語意飄移判斷呼叫失敗，略過（不阻斷合併）');
@@ -136,12 +143,17 @@ export class DriftJudge {
     return verdict;
   }
 
-  private async runQuery(prompt: string, cwd: string, repo?: string): Promise<string> {
+  private async runQuery(prompt: string, cwd: string, repo?: string, mergeBase?: string): Promise<string> {
     // 這個角色自己去查規格。程式**不預抓內容**——docRef 字串對不上、
     // 或規格在任務進行中被更新，預抓的那份都會靜靜地是錯的。
     const docsSource = repo ? this.deps.docs?.(repo) : undefined;
     const docsServer = docsSource ? createDocsServer(docsSource, this.deps.log) : undefined;
-    const { servers, missing } = serversFor('drift_judge', { ...(docsServer ? { docs: () => docsServer } : {}) });
+    // 唯讀 git：判斷者要自己查兩邊各改了什麼（程式不再預算 diff 餵它）。
+    const gitServer = mergeBase ? createGitInspectServer({ cwd, baseRef: mergeBase, log: this.deps.log }) : undefined;
+    const { servers, missing } = serversFor('drift_judge', {
+      ...(docsServer ? { docs: () => docsServer } : {}),
+      ...(gitServer ? { git: () => gitServer } : {}),
+    });
     if (missing.length > 0) this.deps.log.warn({ role: 'drift_judge', missing }, '⚠️ 宣告了能力但沒接上材料');
 
     const q: DriftQueryFn =
@@ -186,8 +198,18 @@ export function buildDriftPrompt(input: DriftJudgeInput, maxChars = DEFAULT_MAX_
       '所以編譯層面的問題不用看——你要判斷的是兩邊的「意圖」有沒有打架。',
   );
   p.push(`\n## 本群在做什麼\n${input.taskTitles.map((t) => `- ${t}`).join('\n')}`);
-  p.push(`\n## 目標分支在本群動工之後多出來的變更\n\`\`\`diff\n${truncate(input.baseChanges, maxChars)}\n\`\`\``);
-  p.push(`\n## 本群的變更\n\`\`\`diff\n${truncate(input.groupChanges, maxChars)}\n\`\`\``);
+  p.push(
+    '\n## 兩邊各改了什麼——**自己查**',
+    '',
+    `分岔點：\`${input.mergeBase}\``,
+    `目標分支：\`${input.baseRef}\`　本群分支：\`${input.branch}\``,
+    '',
+    '用唯讀 git 工具自己看，要看幾次、看多細由你決定：',
+    `· 目標分支多出來的：\`git_changed_files\` / \`git_diff\` 比 ${input.mergeBase}..${input.baseRef}`,
+    `· 本群的：同樣的方式比 ${input.mergeBase}..${input.branch}`,
+    '',
+    '**先看檔案清單縮範圍，再挑要看的檔案細看**——不要一次把整份 diff 讀進來。',
+  );
   p.push(
     `\n## 你要找的東西\n` +
       `兩邊對**同一個行為**做了不能同時成立的決定。例如：\n` +

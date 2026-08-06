@@ -137,12 +137,36 @@ export class ReviewFeedbackStore {
       title: `審查要求修改（${fb.source}）`,
       // body 不可為空——審查者按了 Request changes 卻沒留字是有可能的，
       // 那時也要開得出單（不然這一群就從回灌路徑上消失了）。
-      body: fb.comments.length > 0 ? fb.comments.join('\n') : '審查者要求修改，但沒有留下文字說明。',
+      // **存 JSON，不要用換行 join。**
+      //
+      // 一則意見可以是多行的（合併守衛那則是「一段敘述 ＋ 編號步驟」）。用換行 join
+      // 存、用換行 split 讀，等於讓程式決定「一則意見的邊界在哪」，而它的判準是換行符號。
+      // 實跑撞到：一則多行敘述被還原成上千則編號意見（「3. 請這樣處理：」
+      //「4. 1. 先看目標分支上那些新變更做了什麼」），原本刻意寫的 1./2./3.
+      // 被外層編號吃掉變成巢狀，指示的優先順序整個亂掉。
+      // GitHub 上審查者寫的多段落 review 也一樣會被拆成 N 條。
+      body: fb.comments.length > 0 ? JSON.stringify(fb.comments) : '審查者要求修改，但沒有留下文字說明。',
       verdict: fb.source,
     });
     // 稽核：events 表仍留一份，事後查得到當時審查者要求改什麼
     this.ledger.logEvent('group', fb.groupId, FEEDBACK_EVENT_KIND, JSON.stringify(fb));
     return fb;
+  }
+
+  /**
+   * 把存下來的 body 還原成意見陣列。
+   *
+   * 新格式是 JSON 陣列；升級前存的是換行 join 的字串，解不出來就整個當成一則——
+   * 那比按換行拆成上千則接近事實（拆開之後每一行都會被加上編號送給 agent）。
+   */
+  private static parseComments(body: string): string[] {
+    try {
+      const j: unknown = JSON.parse(body);
+      if (Array.isArray(j) && j.every((x) => typeof x === 'string')) return j as string[];
+    } catch {
+      // 舊格式
+    }
+    return body.trim() === '' ? [] : [body];
   }
 
   has(groupId: string): boolean {
@@ -156,7 +180,9 @@ export class ReviewFeedbackStore {
     if (!row) return undefined;
     return {
       groupId,
-      comments: row.body.split('\n').filter((l) => l !== ''),
+      // 進去長什麼樣、出來就長什麼樣。舊資料（換行 join 的那些）解不出 JSON，
+      // 退回「整個 body 當成一則意見」——那比拆成上千則接近事實。
+      comments: ReviewFeedbackStore.parseComments(row.body),
       source: (row.verdict as FeedbackSource) ?? 'github_review',
       at: row.createdAt,
     };

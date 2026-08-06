@@ -1141,11 +1141,19 @@ export class Orchestrator {
       }
       this.clearApproval(d.groupId, 'rejected');
       this.askedApproval.delete(d.groupId);
-      this.feedback.save({
-        groupId: d.groupId,
-        comments: [`人工在 Slack 退回了這次合併（操作者 ${d.userId ?? '未知'}），請依 PR 上的意見修正後重新送審。`],
-        source: 'human_reject',
-      });
+      // **這裡不寫意見。**
+      //
+      // 先前這裡存一句程式編的罐頭話：「請依 PR 上的意見修正後重新送審」。
+      // 而 InboundRouter（同一個事件的另一個訂閱者）存的是**人實際打的字**，
+      // 兩邊都寫進同一個覆寫式的暫存區，接線順序讓這一句最後跑 → 蓋掉人的原話。
+      //
+      // 結果：人打「這個按鈕位置不對，要放右下」，agent 收到的是一句指向不存在
+      // 東西的廢話（意見在 Slack，不在 PR 上）。而它看起來完全正常——有意見、
+      // 有來源、有時間戳。這個函式的參數型別根本沒有 reason 欄位，
+      // 結構上就拿不到人說了什麼，所以它唯一能做的就是編。
+      //
+      // 人沒填理由時由 formatFeedback 的 FEEDBACK_EMPTY 講「退回了但沒留理由」——
+      // 那是誠實的，而編一句假的不是。
     } catch (err) {
       // Slack 回呼裡丟錯只會污染 log，不該影響 daemon
       this.deps.log.error({ err: err instanceof Error ? err.message : String(err) }, '處理合併裁決失敗（已吞下）');

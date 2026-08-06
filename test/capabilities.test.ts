@@ -199,14 +199,14 @@ describe('serversFor：宣告了能力卻沒材料，要講得出自己少了什
   });
 
   it('沒宣告的能力不會被掛上，就算材料給了也一樣', () => {
-    const r = serversFor('drift_judge', { docs: () => 'D', browser: () => 'B', ask: () => 'A' });
-    assert.deepEqual(Object.keys(r.servers), ['docs'], '飄移判斷者只判斷，不需要瀏覽器也不需要出口工具');
+    const r = serversFor('drift_judge', { docs: () => 'D', git: () => 'G', browser: () => 'B', ask: () => 'A' });
+    assert.deepEqual(Object.keys(r.servers).sort(), ['docs', 'git'], '飄移判斷者要自己查 diff，但不需要瀏覽器也不需要出口工具');
     assert.deepEqual(r.missing, []);
   });
 
   it('工廠函式只在角色宣告了該能力時才被呼叫（建 server 可能開行程／花錢）', () => {
     let built = 0;
-    serversFor('drift_judge', { browser: () => { built += 1; return 'B'; } });
+    serversFor('drift_judge', { browser: () => { built += 1; return 'B'; } });  // 它沒宣告 browser
     assert.equal(built, 0);
   });
 });

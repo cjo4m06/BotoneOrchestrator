@@ -102,7 +102,10 @@ export const ROLE_CAPABILITIES: Record<AgentRole, readonly Capability[]> = {
   planner: ['shell', 'docs', 'friction'],
 
   // 飄移判斷者：判「這一群的意圖有沒有跟 base 打架」，要查得動兩邊
-  drift_judge: ['shell', 'docs'],
+  // 飄移判斷者：判「這一群的意圖有沒有跟 base 打架」。**自己查 diff**——
+  // 先前是程式先算好兩份 diff、各砍到 40K（只留頭）貼進 prompt，
+  // 它連「被砍掉的是什麼」都不知道。
+  drift_judge: ['shell', 'docs', 'git_readonly'],
 
   // 合併風險判斷者：只回答「這個改動可不可逆」，要看得到 diff 與歷史
   risk_judge: ['shell', 'docs', 'git_readonly'],

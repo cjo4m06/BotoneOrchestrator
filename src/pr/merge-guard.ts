@@ -76,9 +76,11 @@ export interface MergeGuardOptions {
 export interface DriftJudgeLike {
   judge(input: {
     cwd: string;
-    baseChanges: string;
-    groupChanges: string;
+    mergeBase: string;
+    baseRef: string;
+    branch: string;
     taskTitles: string[];
+    repo?: string;
   }): Promise<DriftVerdict>;
 }
 
@@ -290,16 +292,16 @@ export class MergeGuard {
     const judge = this.opts.driftJudge;
     if (!judge || !mergeBase) return undefined;
     try {
-      // 兩份 diff 都用**明確的 ref 範圍**算，不依賴任何工作區的 HEAD——
-      // 先前用 `${baseRef}..HEAD` 是因為那時分支被 rebase 到主 clone 的 HEAD 上；
-      // 現在群分支不動，HEAD 在哪由呼叫者決定，寫死 HEAD 會算到別的東西。
-      const baseChanges = (await this.git(input.repoPath, ['diff', '--no-color', `${mergeBase}..${baseRef}`])).stdout;
-      const groupChanges = (await this.git(input.repoPath, ['diff', '--no-color', `${mergeBase}..${input.branch}`])).stdout;
+      // **程式不先算 diff。** 只給 ref，判斷者自己用唯讀 git 去看——
+      // 要先看檔案清單縮範圍、要挑哪幾個檔細看、要看幾次，由它決定。
+      // 先前是程式算好兩份 diff 各砍到 40K（只留頭）貼進 prompt：改動一大就有整批檔案
+      // 它根本沒看到，而且不知道被砍了什麼。
       const verdict = await judge.judge({
         // 判斷者要站在**合併後狀態**上看：那才是它要判斷「意圖有沒有打架」的世界
         cwd: treePath,
-        baseChanges,
-        groupChanges,
+        mergeBase,
+        baseRef,
+        branch: input.branch,
         taskTitles: input.taskTitles ?? [],
         ...(input.repo ? { repo: input.repo } : {}),
       });

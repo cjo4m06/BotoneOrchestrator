@@ -107,24 +107,22 @@ describe('runExperiment：用實驗回答「這個紅是誰造成的」', () => 
 });
 
 describe('formatExperiments：只陳述事實，不下結論', () => {
-  it('列出跑了幾次、每次的 exit code、原始輸出', () => {
-    const results: ExperimentResult[] = [{
-      spec: { ref: 'main', times: 3, question: 'base 上是不是本來就紅' },
-      runs: [
-        { attempt: 1, exitCode: 1, output: '❌ A 紅了', startedAt: 0, endedAt: 1 },
-        { attempt: 2, exitCode: 1, output: '❌ B 紅了', startedAt: 0, endedAt: 1 },
-      ],
-    }];
+  it('只列跑了幾次與每次的 exit code——**輸出不貼**（全文在 check_runs）', () => {
+    const text = formatExperiments([
+      {
+        spec: { ref: 'origin/main', times: 2, question: 'base 上紅不紅' },
+        runs: [
+          { attempt: 1, exitCode: 1, output: 'ZZZQQQ 這行不可以出現', startedAt: 0, endedAt: 1 },
+          { attempt: 2, exitCode: 0, output: 'ZZZQQQ 這行也不可以', startedAt: 0, endedAt: 1 },
+        ],
+      },
+    ]);
 
-    const text = formatExperiments(results);
-
-    assert.match(text, /base 上是不是本來就紅/);
-    assert.match(text, /exit code：1 \/ 1/);
-    assert.match(text, /❌ A 紅了/);
-    assert.match(text, /❌ B 紅了/, '每一次的全文都要在——兩次紅的是不是同一個測試，只有讀的人分得出來');
-    // 程式一旦開始下「所以這是不穩定的測試」這種結論，就會長出下一個 semantic_drift
-    assert.equal(/不穩定|語意飄移|所以/.test(text), false, '不下結論');
+    assert.match(text, /base 上紅不紅/);
+    assert.match(text, /exit code：1 \/ 0/);
+    assert.doesNotMatch(text, /ZZZQQQ/, '三次實驗的完整 build\/test 輸出接在判決後面回灌，就是在塞垃圾');
   });
+
 
   it('沒跑滿時把原因帶進文字（證據強度不同）', () => {
     const text = formatExperiments([{

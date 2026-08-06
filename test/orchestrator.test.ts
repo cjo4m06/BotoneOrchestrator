@@ -987,7 +987,15 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     assert.deepEqual(m.merges, [{ repo: 'acme/web', prNumber: 42, approvedBy: 'cli:alice' }]);
   });
 
-  it('人在 Slack 按退回 → 憑證作廢並存成可回灌的意見', async () => {
+  /**
+   * **退回時這裡只作廢憑證，不寫意見。**
+   *
+   * 先前它會存一句程式編的罐頭話（「請依 PR 上的意見修正後重新送審」），
+   * 而 InboundRouter（同一個事件的另一個訂閱者）存的是人**實際打的字**——
+   * 兩邊寫進同一個覆寫式的暫存區，接線順序讓罐頭句最後跑、蓋掉人的原話。
+   * 這個函式的參數型別根本沒有 reason 欄位，結構上就拿不到人說了什麼。
+   */
+  it('人在 Slack 按退回 → 憑證作廢，而且**不編**一句假的意見蓋掉人的話', async () => {
     const g = seedReviewedGroup({ state: 'merge_guard' });
     const m = fakeMerge();
     const gw = fakeGateway();
@@ -999,7 +1007,11 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, [], '退回之後不可再拿舊憑證去合併');
-    assert.equal(store.peek(g.id)?.source, 'human_reject');
+    assert.equal(
+      store.peek(g.id),
+      undefined,
+      '意見只能由「拿得到人打的字」的那一端寫；這裡編一句只會蓋掉真的那句',
+    );
   });
 });
 

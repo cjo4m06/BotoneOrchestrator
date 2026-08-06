@@ -15,8 +15,7 @@ import { createSilentLogger } from './helpers/index.js';
 
 const INPUT = {
   cwd: '/wt',
-  baseChanges: 'diff --git a/x.vue b/x.vue\n+需要二次確認',
-  groupChanges: 'diff --git a/x.vue b/x.vue\n+一鍵完成',
+  mergeBase: 'abc123', baseRef: 'origin/main', branch: 'orch/g',
   taskTitles: ['把清除資料改成一鍵完成'],
 };
 
@@ -116,8 +115,11 @@ describe('DriftJudge', () => {
         return reply(wrap({ status: 'clean', notes: [] }))();
       },
     });
-    assert.equal((await j.judge({ ...INPUT, baseChanges: '  ' })).status, 'skipped');
-    assert.equal(called, 0, '不該白花一次呼叫');
+    // 「base 沒有新變更就跳過」已退場：那個判斷要先讀 diff 才做得出來，
+    // 而 diff 現在是判斷者自己去查的。少跳過一次的代價（多花一次判斷）
+    // 比漏判一次意圖打架便宜。
+    assert.ok(j);
+    assert.equal(called, 0);
   });
 });
 
@@ -128,10 +130,11 @@ describe('buildDriftPrompt / driftFeedback', () => {
     assert.match(p, /把清除資料改成一鍵完成/);
   });
 
-  it('過長的 diff 會截斷並告訴它可以自己去讀檔案', () => {
-    const p = buildDriftPrompt({ ...INPUT, baseChanges: 'x'.repeat(500) }, 100);
-    assert.match(p, /過長已截斷/);
-    assert.match(p, /Read\/Grep/);
+  it('prompt 只給 ref，叫它自己查——不貼 diff', () => {
+    const p = buildDriftPrompt(INPUT);
+    assert.match(p, /自己查/);
+    assert.match(p, /git_changed_files/);
+    assert.doesNotMatch(p, /```diff/, '程式先算好再砍一半的 diff 已經不給了');
   });
 
   it('回灌給 agent 的意見要禁止「把對方的變更還原」', () => {

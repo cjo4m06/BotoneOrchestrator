@@ -162,12 +162,12 @@ describe('MergeGuard — 合併守衛', () => {
    */
   describe('語意飄移判斷層', () => {
     function spyJudge(verdict: Awaited<ReturnType<DriftJudgeLike['judge']>>) {
-      const calls: { baseChanges: string; groupChanges: string; taskTitles: string[] }[] = [];
+      const calls: { mergeBase: string; baseRef: string; branch: string; taskTitles: string[] }[] = [];
       return {
         calls,
         judge: {
           judge: async (i: Parameters<DriftJudgeLike['judge']>[0]) => {
-            calls.push({ baseChanges: i.baseChanges, groupChanges: i.groupChanges, taskTitles: i.taskTitles });
+            calls.push({ mergeBase: i.mergeBase, baseRef: i.baseRef, branch: i.branch, taskTitles: i.taskTitles });
             return verdict;
           },
         } as DriftJudgeLike,
@@ -193,8 +193,11 @@ describe('MergeGuard — 合併守衛', () => {
       assert.equal(verdict.ok === false ? verdict.reason : '', 'semantic_drift');
       assert.match(verdict.ok === false ? verdict.detail! : '', /feature\.js/);
       assert.deepEqual(spy.calls[0]?.taskTitles, ['把清除資料改成一鍵完成'], '要把本群在做什麼帶給判斷者');
-      assert.match(spy.calls[0]!.baseChanges, /readme\.md/, 'base 這段期間多的變更要餵進去');
-      assert.match(spy.calls[0]!.groupChanges, /feature\.js/, '本群的變更也要餵進去');
+      // **程式不再算 diff 餵進去**，只給 ref——判斷者用唯讀 git 自己查，
+      // 要先看檔案清單縮範圍、要挑哪幾個檔細看都由它決定。
+      assert.match(spy.calls[0]!.mergeBase, /^[0-9a-f]{7,40}$/, '要給分岔點，它才查得出兩邊各改了什麼');
+      assert.equal(spy.calls[0]?.branch, 'feat/a');
+      assert.match(spy.calls[0]?.baseRef ?? '', /main/);
     });
 
     it('判斷層說 clean → 照常放行', async () => {

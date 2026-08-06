@@ -160,10 +160,13 @@ export function formatExperiments(results: ExperimentResult[]): string {
     parts.push(`\n### 實驗：${r.spec.question}`);
     parts.push(`在 \`${r.spec.ref}\` 上跑 ${r.runs.length} 次` + (r.incomplete ? `（${r.incomplete}）` : ''));
     if (r.runs.length === 0) continue;
+    // **只列 exit code，不貼輸出。**
+    //
+    // 先前這裡把每一次的 stdout 全文都印出來（實驗最多跑 3 次，等於三份完整的
+    // build/test 輸出），接在判決後面一起回灌給 coder——那正是「塞一堆垃圾訊息」。
+    // 全文已經完整落在 check_runs（runExperiment 每一次都 record），
+    // 要看的人去那裡看；要判斷的 agent 自己在同一棵樹上重跑就有。
     parts.push(`exit code：${r.runs.map((x) => x.exitCode ?? '沒跑起來').join(' / ')}`);
-    for (const run of r.runs) {
-      parts.push(`\n#### 第 ${run.attempt} 次（exit ${run.exitCode ?? '—'}）\n${run.output}`);
-    }
   }
   return parts.join('\n');
 }
