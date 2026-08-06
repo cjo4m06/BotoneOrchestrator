@@ -6,6 +6,7 @@ import type { Logger } from '../observability/logger.js';
 import { createGitInspectServer } from '../worker/git-inspect.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 import { recordAgentUsage, type UsageSink } from './agent-usage.js';
+import { createToolAuditor, type ToolCallSink } from '../worker/tool-audit.js';
 
 /**
  * 合併風險判斷者：「這個改動要不要先讓人看一眼？」
@@ -97,6 +98,8 @@ export interface MergeRiskJudgeDeps {
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
   usage?: UsageSink;
+  /** 工具呼叫的稽核出口。未注入 → 不記（測試與無 ledger 的情境）。 */
+  toolAudit?: ToolCallSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -159,7 +162,15 @@ export class MergeRiskJudge {
             mcpServers: servers as never,
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
             // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。判斷者只看不動。
-            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: RISK_JUDGE_TOOLS })] }] },
+            // 它的 cwd 是實際的合併工作區——記下來才追得到「誰動了這個目錄」
+            hooks: {
+              PreToolUse: [{
+                hooks: [createPreToolUseGuard(
+                  this.deps.log, { mode: 'readonly', allowTools: RISK_JUDGE_TOOLS },
+                  createToolAuditor(this.deps.log, 'risk_judge', {}, this.deps.toolAudit),
+                )],
+              }],
+            },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

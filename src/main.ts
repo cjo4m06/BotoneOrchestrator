@@ -1441,6 +1441,9 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
       // 摩擦回報寫進 ledger events，之後才彙總得起來
       frictionSink: ledger,
+      // 每一次工具呼叫的全文。次數答不了「它到底跑了什麼」——工作區被清空那次
+      // 就是死在這上面（見 tool-audit.ts）。
+      toolAudit: ledger,
       // 規格文件讓 agent 自己找：程式只能照 docRef 字串比對，檔案改名／章節改名／
       // docType 對不上就整份讀不到（實跑：issues/ vs issue，每個帶 issue 規格的任務
       // 都是沒看過規格就做的）。搜尋是語意的、會回不相干的東西，所以要它自己判斷。
@@ -1469,13 +1472,13 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     allowLocalMerge: input.allowLocalMerge,
     // 只在自動合併開著時才會被呼叫：使用者說了「一般改動不必問我」，
     // 這一關只攔「做錯了救不回來」的那種。沒有認證時判斷者自己會回「要問人」。
-    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, docs: docsSourceOf, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
+    ...(hasClaudeAuth() ? { mergeRiskJudge: new MergeRiskJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(models.riskJudge ? { model: models.riskJudge } : {}) }) } : {}),
     // 獨立 reviewer：無金鑰時自身降級為 skipped，不阻擋流程
     // **審查者要有自己的瀏覽器暫存區。** 先前它的工具清單一直列著唯讀瀏覽器，
     // 但 server 從來沒被掛上——「自己開瀏覽器看畫面」在清單上成立、實際叫不動，
     // 而放行書填「沒看」完全合法，閘門照樣綠燈。key 用 review-<taskId>，多群同審不互相覆蓋。
     reviewer: new Reviewer({
-      log, usage: ledger, docs: docsSourceOf,
+      log, usage: ledger, toolAudit: ledger, docs: docsSourceOf,
       browserOutputRoot: browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT),
       ...(models.reviewer ? { model: models.reviewer } : {}),
     }),
@@ -1485,7 +1488,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     feedback,
     // 語意飄移的判斷層：事實層（衝突、rebase 後紅燈）之外，再問一次
     // 「兩邊的意圖有沒有打架」。無金鑰時自身降級為 skipped，不阻擋流程。
-    driftJudge: new DriftJudge({ log, usage: ledger, docs: docsSourceOf, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
+    driftJudge: new DriftJudge({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, ...(models.driftJudge ? { model: models.driftJudge } : {}) }),
   };
   const groupRunner = new GroupRunner(groupRunnerDeps);
 
@@ -1525,7 +1528,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
         // 沒有 Claude 認證時**不接**，而 Planner 沒有 planAgent 就會明確擲錯，
         // Orchestrator 據此開一張交接單。先前這裡會退回一套關鍵字相似度的啟發式——
         // 那是「換一塊任務板就安靜地分錯群，而症狀要到合併衝突才看得到」。
-        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, docs: docsSourceOf, frictionSink: ledger, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
+        ...(hasClaudeAuth() ? { planAgent: new PlanAgent({ log, usage: ledger, toolAudit: ledger, docs: docsSourceOf, frictionSink: ledger, ...(models.planner ? { model: models.planner } : {}) }) } : {}),
         // 規劃 agent 看得到「成果還沒進 base」的群組，才有辦法處理跨批次的依賴。
         // 任務是一批一批進來的：第二批規劃時，第一批可能已經做完開了 PR 但還沒合併——
         // 那些改動**不在 repo 裡**，agent 用 Read/Grep 是看不到的。

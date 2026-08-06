@@ -7,6 +7,7 @@ import type { Task } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 import { recordAgentUsage, type UsageSink } from './agent-usage.js';
+import { createToolAuditor, type ToolCallSink } from '../worker/tool-audit.js';
 
 /**
  * 規劃 agent：讀任務內容 + 實際的 repo，決定**分成哪幾群**與**群的執行順序**。
@@ -96,6 +97,8 @@ export interface PlanAgentDeps {
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
   usage?: UsageSink;
+  /** 工具呼叫的稽核出口。未注入 → 不記（測試與無 ledger 的情境）。 */
+  toolAudit?: ToolCallSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -217,7 +220,16 @@ export class PlanAgent {
             allowedTools: PLAN_TOOLS,
             systemPrompt: SYSTEM_PROMPT,
             // **真正的邊界在這裡。** allowedTools 對工具不具強制力（見 PLAN_TOOLS 的說明）
-            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, PLAN_TOOL_POLICY)] }] },
+            // ref 留空：規劃不屬於任何單一任務或群組。歸因靠 role ＋ cwd ＋ 時間，
+            // 而問題本來就是「**這個目錄**在那個時間被誰動了」。
+            hooks: {
+              PreToolUse: [{
+                hooks: [createPreToolUseGuard(
+                  this.deps.log, PLAN_TOOL_POLICY,
+                  createToolAuditor(this.deps.log, 'planner', {}, this.deps.toolAudit),
+                )],
+              }],
+            },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

@@ -6,8 +6,21 @@ import { SCHEMA, applyColumnMigrations, applyOneTimeDdl } from './schema.js';
 import type { Task, TaskState, Group, GroupState, BlockReason } from '../types.js';
 import type { Logger } from '../observability/logger.js';
 import { HANDOFF_ACTIONS, handoffKindOfBlock } from '../core/handoff.js';
+import type { ToolCallRecord } from '../worker/tool-audit.js';
 
 type Row = Record<string, unknown>;
+
+/**
+ * tool_calls 表的一列。
+ *
+ * role 刻意是 string 而不是 ToolCallRole：這是**從 DB 讀出來的**，
+ * 而舊資料與未來新增的角色都可能不在當下的列舉裡。讀取端假裝那個聯集成立，
+ * 只會把「有一個角色沒被畫面涵蓋」變成看不見的東西。
+ */
+export interface ToolCallRow extends Omit<ToolCallRecord, 'role'> {
+  id: number;
+  role: string;
+}
 
 /** events 表的三種歸屬。 */
 export type EventScope = 'task' | 'group' | 'system';
@@ -1133,6 +1146,95 @@ export class Ledger {
       .prepare('UPDATE tasks SET tool_calls = @json, updated_at = @ts WHERE id = @id')
       .run({ id: taskId, json: JSON.stringify(cur), ts: this.now() });
     if (r.changes === 0) this.log.warn({ taskId }, '累加工具計數時找不到任務');
+  }
+
+  /**
+   * 記下一次工具呼叫（全文）。上面那個 addTaskToolCalls 只有次數，答不了「它跑了什麼」。
+   *
+   * **絕不擲錯。** 這是稽核，不是流程的一部分——寫不進去只該少一筆紀錄，
+   * 不該讓 agent 的工具呼叫失敗。
+   */
+  recordToolCall(r: ToolCallRecord): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO tool_calls (at, role, task_id, group_id, cwd, tool, input, denied)
+           VALUES (@at, @role, @taskId, @groupId, @cwd, @tool, @input, @denied)`,
+        )
+        .run({
+          at: r.at,
+          role: r.role,
+          taskId: r.taskId ?? null,
+          groupId: r.groupId ?? null,
+          cwd: r.cwd ?? null,
+          tool: r.tool,
+          input: r.input,
+          denied: r.denied ?? null,
+        });
+    } catch (e) {
+      this.log.warn({ tool: r.tool, err: e instanceof Error ? e.message : String(e) }, '工具稽核寫入失敗（忽略）');
+    }
+  }
+
+  /**
+   * 查工具呼叫。**主軸是 cwd**：事後要問的永遠是「這個目錄在那段時間被誰動了什麼」，
+   * 而共用工作區的角色不只一個。
+   */
+  listToolCalls(q: {
+    taskId?: string;
+    cwd?: string;
+    role?: string;
+    tool?: string;
+    /** 只看被紅線擋下的。 */
+    deniedOnly?: boolean;
+    since?: number;
+    limit?: number;
+  } = {}): ToolCallRow[] {
+    const where: string[] = [];
+    if (q.taskId !== undefined) where.push('task_id = @taskId');
+    if (q.cwd !== undefined) where.push('cwd = @cwd');
+    if (q.role !== undefined) where.push('role = @role');
+    if (q.tool !== undefined) where.push('tool = @tool');
+    if (q.deniedOnly) where.push('denied IS NOT NULL');
+    if (q.since !== undefined) where.push('at >= @since');
+    const rows = this.db
+      .prepare(
+        `SELECT id, at, role, task_id, group_id, cwd, tool, input, denied FROM tool_calls
+         ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+         ORDER BY id DESC LIMIT @limit`,
+      )
+      .all({
+        taskId: q.taskId ?? null, cwd: q.cwd ?? null, role: q.role ?? null,
+        tool: q.tool ?? null, since: q.since ?? null, limit: q.limit ?? 200,
+      }) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      at: Number(r.at),
+      role: String(r.role),
+      ...(r.task_id ? { taskId: String(r.task_id) } : {}),
+      ...(r.group_id ? { groupId: String(r.group_id) } : {}),
+      ...(r.cwd ? { cwd: String(r.cwd) } : {}),
+      tool: String(r.tool),
+      input: String(r.input),
+      ...(r.denied ? { denied: String(r.denied) } : {}),
+    }));
+  }
+
+  /**
+   * 清除逾期的工具紀錄。
+   *
+   * 與 pruneEvents 分開的理由：這張表的成長速度是別人的一到兩個數量級
+   *（實跑一張卡 47 次呼叫），保留期多半要設得比稽核事件短。
+   * 混在同一個方法裡的話，之後想分開調就得先拆一次。
+   */
+  pruneToolCalls(cutoffMs: number): number {
+    if (!Number.isFinite(cutoffMs)) {
+      this.log.warn({ cutoffMs }, 'pruneToolCalls：cutoff 非有效數值，本次不清理');
+      return 0;
+    }
+    const res = this.db.prepare('DELETE FROM tool_calls WHERE at < @cutoff').run({ cutoff: cutoffMs });
+    if (res.changes > 0) this.log.info({ deleted: res.changes, cutoffMs }, '已清除逾期工具紀錄');
+    return res.changes;
   }
 
   /**

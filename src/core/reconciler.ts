@@ -50,6 +50,8 @@ export interface ReconcilerLedger {
   latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
   /** 可選：刪除 created_at 早於 cutoffMs 的稽核事件，回傳刪除筆數。 */
   pruneEvents?(cutoffMs: number): number;
+  /** 可選：刪除 at 早於 cutoffMs 的工具呼叫紀錄，回傳刪除筆數。 */
+  pruneToolCalls?(cutoffMs: number): number;
   /** 可選：刪除 created_at 早於 cutoffMs 的迭代紀錄，但每個任務至少保留 keepPerTask 筆。 */
 }
 
@@ -102,6 +104,14 @@ export interface RetentionPolicy {
   screenshotDays: number;
   /** events 稽核紀錄保留天數。 */
   eventDays: number;
+  /**
+   * 工具呼叫紀錄保留天數。
+   *
+   * 與 eventDays 分開：這張表的成長是別人的一到兩個數量級（實跑一張卡 47 次呼叫）。
+   * 但預設仍給滿 30 天——它存在的理由就是「事後才發現要查」，
+   * 而工作區被清空那次是隔了兩天才有人看到那筆回報。
+   */
+  toolCallDays: number;
   /** task_iterations 保留天數。 */
   iterationDays: number;
   /** 不論多舊，每個任務至少保留這麼多筆迭代紀錄（保住最後現場）。 */
@@ -113,6 +123,7 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
   terminalWorktreeDays: 7,
   screenshotDays: 14,
   eventDays: 30,
+  toolCallDays: 30,
   iterationDays: 30,
   keepIterationsPerTask: 20,
 };
@@ -658,6 +669,12 @@ export class Reconciler {
       if (n > 0) {
         report.eventsPruned = n;
         report.actions.push({ scope: 'retention', ref: 'events', decision: 'pruned', detail: `清除 ${n} 筆逾 ${this.retention.eventDays} 天的稽核事件` });
+      }
+    }
+    if (ledger.pruneToolCalls) {
+      const n = ledger.pruneToolCalls(now - this.retention.toolCallDays * DAY_MS);
+      if (n > 0) {
+        report.actions.push({ scope: 'retention', ref: 'tool_calls', decision: 'pruned', detail: `清除 ${n} 筆逾 ${this.retention.toolCallDays} 天的工具紀錄` });
       }
     }
     // task_iterations 的保留策略隨整張表一起退場（第 15 片）。

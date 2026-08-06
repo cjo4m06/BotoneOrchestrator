@@ -22,6 +22,7 @@ import {
   tokenizeShell,
 } from '../src/worker/agent-runtime.js';
 import type { ClarificationCapture, IterateInput } from '../src/worker/agent-runtime.js';
+import { NO_TOOL_AUDIT } from '../src/worker/tool-audit.js';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -720,7 +721,7 @@ test('正常的 package.json 維護一律放行', () => {
 
 test('PreToolUse hook：deny 時回傳 SDK 約定的 hookSpecificOutput 形狀', async () => {
   const rec = createRecordingLogger();
-  const guard = createPreToolUseGuard(rec.logger);
+  const guard = createPreToolUseGuard(rec.logger, undefined, NO_TOOL_AUDIT);
 
   const out = await guard({ tool_name: 'Bash', tool_input: { command: 'firebase deploy' } });
 
@@ -735,20 +736,20 @@ test('PreToolUse hook：deny 時回傳 SDK 約定的 hookSpecificOutput 形狀',
 });
 
 test('PreToolUse hook：放行時回空物件（不可誤回 deny 形狀）', async () => {
-  const guard = createPreToolUseGuard(createSilentLogger());
+  const guard = createPreToolUseGuard(createSilentLogger(), undefined, NO_TOOL_AUDIT);
   assert.deepEqual(await guard({ tool_name: 'Bash', tool_input: { command: 'npm run build' } }), {});
   assert.deepEqual(await guard({ tool_name: 'Read', tool_input: { file_path: '.env' } }), {});
 });
 
 test('PreToolUse hook：吃得下缺欄位的 hookInput，不丟例外', async () => {
-  const guard = createPreToolUseGuard(createSilentLogger());
+  const guard = createPreToolUseGuard(createSilentLogger(), undefined, NO_TOOL_AUDIT);
   assert.deepEqual(await guard({}), {});
   assert.deepEqual(await guard({ tool_name: 'Bash' }), {});
   assert.deepEqual(await guard({ tool_name: 'Write', tool_input: null }), {});
 });
 
 test('PreToolUse hook：專案覆寫的保護路徑會生效', async () => {
-  const guard = createPreToolUseGuard(createSilentLogger(), { protectedPaths: ['**/infra/**'] });
+  const guard = createPreToolUseGuard(createSilentLogger(), { protectedPaths: ['**/infra/**'] }, NO_TOOL_AUDIT);
   const out = await guard({ tool_name: 'Write', tool_input: { file_path: 'infra/main.tf' } });
   assert.match(String((out as { hookSpecificOutput?: { permissionDecisionReason?: string } }).hookSpecificOutput?.permissionDecisionReason), /專案保護路徑/);
 });
@@ -1184,7 +1185,7 @@ describe('瀏覽器工具的紅線', () => {
 describe('工具使用回報', () => {
   it('每次呼叫都回報工具名（放行與否不受影響）', async () => {
     const seen: string[] = [];
-    const guard = createPreToolUseGuard(createSilentLogger(), undefined, (n) => seen.push(n));
+    const guard = createPreToolUseGuard(createSilentLogger(), undefined, (e) => seen.push(e.tool));
 
     await guard({ tool_name: 'Read', tool_input: { file_path: '/a.ts' } });
     await guard({ tool_name: 'mcp__playwright__browser_navigate', tool_input: { url: 'http://127.0.0.1:5173' } });
@@ -1194,7 +1195,7 @@ describe('工具使用回報', () => {
 
   it('被擋下的呼叫**也要**回報（不然「它試了但被擋」就查不到）', async () => {
     const seen: string[] = [];
-    const guard = createPreToolUseGuard(createSilentLogger(), undefined, (n) => seen.push(n));
+    const guard = createPreToolUseGuard(createSilentLogger(), undefined, (e) => seen.push(e.tool));
 
     const v = await guard({ tool_name: 'mcp__playwright__browser_navigate', tool_input: { url: 'file:///etc/passwd' } });
 

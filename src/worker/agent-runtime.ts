@@ -14,6 +14,7 @@ import {
   FRICTION_TOOL_DESCRIPTION,
   type FrictionSink,
 } from './friction.js';
+import { createToolAuditor, type ToolCallEvent, type ToolCallSink } from './tool-audit.js';
 
 /** 沒接 sink 時的去處：什麼都不做，但不讓呼叫端崩掉。 */
 const NOOP_SINK: FrictionSink = { logEvent: () => {} };
@@ -415,6 +416,8 @@ export interface AgentRuntimeDeps {
    * 回報永遠不該因為缺少接線而讓任務失敗。
    */
   frictionSink?: FrictionSink;
+  /** 工具呼叫的稽核出口（Ledger 結構上即滿足）。未注入 → 不記（測試與無 ledger 的情境）。 */
+  toolAudit?: ToolCallSink;
 }
 
 /**
@@ -545,7 +548,7 @@ export class AgentRuntime {
         // 深度防禦：即使指令層紅線被繞過（先寫腳本再執行），agent 也拿不到 GitHub 認證
         env: buildAgentEnv(process.env, this.deps.envOverrides?.() ?? {}),
         hooks: {
-          PreToolUse: [{ hooks: [this.preToolUseGuard(toolsUsed)] }],
+          PreToolUse: [{ hooks: [this.preToolUseGuard(toolsUsed, input.task.id)] }],
           Stop: [{ hooks: [this.stopHook(input, captured, stopState)] }],
         },
       },
@@ -608,13 +611,17 @@ export class AgentRuntime {
   }
 
   /** PreToolUse 政策閘門（紅線）：擋強制推送/危險刪除等（DESIGN.md §10）。 */
-  private preToolUseGuard(used: Map<string, number>) {
-    // 記下每個工具用了幾次。存在的理由：agent 會在總結裡宣稱「已通過瀏覽器驗證」，
-    // 但它在**還沒有瀏覽器工具**的時候也寫過同一句話——自我宣稱不是證據。
-    // 工具呼叫都會經過這個閘門，這裡是唯一能拿到事實的地方。
-    return createPreToolUseGuard(this.log, this.deps.toolPolicy, (name) =>
-      used.set(name, (used.get(name) ?? 0) + 1),
-    );
+  private preToolUseGuard(used: Map<string, number>, taskId: string) {
+    // 這個閘門是每次工具呼叫的必經之處，也是唯一拿得到事實的地方，所以兩件事都掛這裡：
+    //
+    //   · 次數：agent 會在總結裡宣稱「已通過瀏覽器驗證」，但它在**還沒有瀏覽器工具**
+    //     的時候也寫過同一句話——自我宣稱不是證據。
+    //   · 全文：次數答不了「它到底跑了什麼」。工作區被清空那次就是死在這上面（見 tool-audit.ts）。
+    const record = createToolAuditor(this.log, 'coder', { taskId }, this.deps.toolAudit);
+    return createPreToolUseGuard(this.log, this.deps.toolPolicy, (e) => {
+      used.set(e.tool, (used.get(e.tool) ?? 0) + 1);
+      record(e);
+    });
   }
 
   /**
@@ -737,17 +744,30 @@ export const ASK_HUMAN_FALLBACK =
  */
 export function createPreToolUseGuard(
   log: Logger,
-  toolPolicy?: ToolPolicyOptions,
-  /** 每次工具呼叫回報一次（觀察用）。不影響放行與否。 */
-  onTool?: (toolName: string) => void,
+  toolPolicy: ToolPolicyOptions | undefined,
+  /**
+   * 每次工具呼叫回報一次（記帳／觀察用）。不影響放行與否。
+   *
+   * **必填，即使你不想記**（傳 NO_TOOL_AUDIT）。這道 hook 是每個角色唯一會經過的
+   * 工具閘門，也就是唯一拿得到事實的地方；做成選填的話，漏接一個角色的症狀是
+   * 「那個角色做的事完全沒有紀錄」——而那與「它沒做事」在資料上長得一模一樣。
+   */
+  audit: (e: ToolCallEvent) => void,
 ) {
   return async (hookInput: Record<string, unknown>) => {
     const toolName = String(hookInput.tool_name ?? '');
-    onTool?.(toolName);
     const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
     // hookInput.cwd 讓「讀被執行的腳本內容」能解析相對路徑
     const cwd = typeof hookInput.cwd === 'string' ? hookInput.cwd : undefined;
     const verdict = evaluateToolPolicy(toolName, toolInput, toolPolicy, cwd);
+    // 記在判定之後、回傳之前：**被擋下的嘗試也要記**，而且要記得它為什麼被擋。
+    // 那比成功的呼叫更值得看——它說明 agent 當時想做什麼。
+    audit({
+      tool: toolName,
+      input: toolInput,
+      ...(cwd ? { cwd } : {}),
+      ...(verdict.deny ? { denied: verdict.reason ?? '政策拒絕' } : {}),
+    });
     if (verdict.deny) {
       log.warn({ toolName, reason: verdict.reason }, '政策閘門擋下工具呼叫');
       return {

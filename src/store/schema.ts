@@ -266,6 +266,34 @@ CREATE TABLE IF NOT EXISTS irreversible_actions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_irrev_ref ON irreversible_actions(ref_id);
+
+-- agent 的每一次工具呼叫。**這是「誰在這個工作區做了什麼」的唯一事實源。**
+--
+-- 為什麼需要：先前只記 tasks.tool_calls（工具名 → 次數），連指令字串都沒有。
+-- 實跑 HIAzzBkS0x5a 的工作區在任務進行中被 git reset --hard HEAD 清空兩次，
+-- 未 commit 的實作全數消失（reflog 只留下 reset: moving to HEAD）。調度器程式碼裡
+-- 一個 reset/clean 都沒有，所以下手的是某個 agent——但 coder 與 reviewer 共用同一個
+-- worktree，而「誰下的」在任何地方都查不到，事後完全無法歸因。
+--
+-- cwd 是關鍵欄位：問題永遠是「**這個目錄**被誰動了」，不是「這個任務做了什麼」。
+-- denied 也存：被紅線擋下的嘗試比成功的呼叫更值得看（它說明 agent 想做什麼）。
+--
+-- input 存 JSON，長字串會截斷（見 tool-audit.ts 的 MAX_*）——Write/Edit 的整份檔案
+-- 內容對歸因沒有價值，但 Bash 的 command 有，而它幾乎都在上限內。
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  at       INTEGER NOT NULL,
+  role     TEXT NOT NULL,          -- coder | reviewer | planner | drift_judge | risk_judge
+  task_id  TEXT,
+  group_id TEXT,
+  cwd      TEXT,
+  tool     TEXT NOT NULL,
+  input    TEXT NOT NULL,          -- JSON（長字串截斷）
+  denied   TEXT                    -- 紅線擋下的理由；NULL ＝ 放行
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_task ON tool_calls(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_cwd  ON tool_calls(cwd, id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_at   ON tool_calls(at);
 `;
 
 /**

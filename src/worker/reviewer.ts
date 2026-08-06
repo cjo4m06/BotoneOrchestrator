@@ -11,6 +11,7 @@ import type { LoadedDoc } from './agent-runtime.js';
 import { collectDiffSince } from '../git/status.js';
 import { createPreToolUseGuard, READONLY_BROWSER_TOOLS } from './agent-runtime.js';
 import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
+import { createToolAuditor, type ToolCallSink } from './tool-audit.js';
 
 /**
  * 獨立 reviewer agent（DESIGN.md §5）。DoD 綠燈只證明「build/test 過」，證明不了
@@ -140,6 +141,8 @@ export interface ReviewerDeps {
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
   usage?: UsageSink;
+  /** 工具呼叫的稽核出口。未注入 → 不記（測試與無 ledger 的情境）。 */
+  toolAudit?: ToolCallSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -283,7 +286,20 @@ export class Reviewer {
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
             // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。reviewer只判斷、不動手，
             // 而它的 cwd 是實際的工作區——沒有這道 hook，唯一擋著它的只有提示詞。
-            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: REVIEWER_TOOLS })] }] },
+            // 稽核尤其重要：它跑在 coder 的工作區裡，掉在那裡的東西與清掉的東西
+            // 都會算到 coder 頭上（實跑：工作區被清空兩次，查不出是誰）。
+            hooks: {
+              PreToolUse: [{
+                hooks: [createPreToolUseGuard(
+                  this.deps.log,
+                  { mode: 'readonly', allowTools: REVIEWER_TOOLS },
+                  createToolAuditor(this.deps.log, 'reviewer', {
+                    ...(ctx?.taskId ? { taskId: ctx.taskId } : {}),
+                    ...(ctx?.groupId ? { groupId: ctx.groupId } : {}),
+                  }, this.deps.toolAudit),
+                )],
+              }],
+            },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 

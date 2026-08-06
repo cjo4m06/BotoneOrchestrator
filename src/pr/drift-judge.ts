@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { Logger } from '../observability/logger.js';
 import { createPreToolUseGuard } from '../worker/agent-runtime.js';
 import { recordAgentUsage, type UsageSink } from '../core/agent-usage.js';
+import { createToolAuditor, type ToolCallSink } from '../worker/tool-audit.js';
 
 /**
  * 語意飄移判斷（需求 7 的第二層）。
@@ -93,6 +94,8 @@ export interface DriftJudgeDeps {
    * 先前這個角色的花費完全沒被記，而預算閘門用的是同一份數字。
    */
   usage?: UsageSink;
+  /** 工具呼叫的稽核出口。未注入 → 不記（測試與無 ledger 的情境）。 */
+  toolAudit?: ToolCallSink;
   log: Logger;
   /** 模型別名（opus / sonnet / haiku）。未給 → SDK 預設。 */
   model?: string;
@@ -171,7 +174,15 @@ export class DriftJudge {
             // **邊界由這裡守，不是 allowedTools。** SDK 的 allowedTools 對工具不具強制力
             // （實跑證實規劃 agent 用了 9 次沒列進去的 Bash）。飄移判斷者只判斷、不動手，
             // 而它的 cwd 是實際的工作區——沒有這道 hook，唯一擋著它的只有提示詞。
-            hooks: { PreToolUse: [{ hooks: [createPreToolUseGuard(this.deps.log, { mode: 'readonly', allowTools: JUDGE_TOOLS })] }] },
+            // 同一個理由要記帳：它跟 coder、reviewer 共用那個目錄。
+            hooks: {
+              PreToolUse: [{
+                hooks: [createPreToolUseGuard(
+                  this.deps.log, { mode: 'readonly', allowTools: JUDGE_TOOLS },
+                  createToolAuditor(this.deps.log, 'drift_judge', {}, this.deps.toolAudit),
+                )],
+              }],
+            },
           },
         }) as AsyncIterable<Record<string, unknown>>);
 
