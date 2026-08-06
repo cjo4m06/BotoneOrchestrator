@@ -318,10 +318,17 @@ test('環境隔離：daemon 自己的 NODE_ENV／ORCH_* 不漏給 agent', () => 
   // npm 把 NODE_ENV=production 當成 --omit=dev：漏過去，agent 的 npm ci 就裝不到
   // devDependencies，build 關卡紅在一個跟這張卡完全無關的地方（見 DAEMON_ONLY_ENV）
   assert.equal(env.NODE_ENV, undefined);
-  assert.equal(env.ORCH_PROFILE, undefined);
   assert.equal(env.ORCH_DATA_ROOT, undefined);
   assert.equal(env.ORCH_LEDGER_PATH, undefined);
   assert.equal(env.PATH, '/usr/bin');
+  // ORCH_PROFILE 不是「拿掉」而是「改寫成 test」——拿掉的話 profileOf 會退回 prod
+  assert.equal(env.ORCH_PROFILE, 'test');
+});
+
+test('環境隔離：agent 改調度器自己時，測試吃的是沙盒庫不是正式庫', () => {
+  // daemon 沒設 ORCH_PROFILE（等同 profileOf 的 prod 預設）也一樣要被改寫
+  const env = buildAgentEnv({ PATH: '/usr/bin' } as NodeJS.ProcessEnv);
+  assert.equal(env.ORCH_PROFILE, 'test');
 });
 
 test('環境隔離：只擋 daemon 自己的，不誤傷專案的同名前綴變數', () => {
@@ -378,7 +385,6 @@ const protectedWrites: [string, RegExp][] = [
   ['certs/server.pem', /secrets/],
   ['certs/private.key', /secrets/],
   ['serviceAccount.json', /secrets/],
-  ['.npmrc', /secrets/],
   // git 內部
   ['.git/config', /git 內部檔/],
   ['.git/hooks/pre-commit', /git 內部檔/],
@@ -447,6 +453,16 @@ test('file_path 缺席或非字串時不誤擋', () => {
   assert.deepEqual(evaluateToolPolicy('Write', {}), { deny: false });
   assert.deepEqual(evaluateToolPolicy('Edit', { file_path: 42 }), { deny: false });
   assert.deepEqual(evaluateToolPolicy('Edit', { file_path: '   ' }), { deny: false });
+});
+
+test('.npmrc 是專案設定不是憑證：agent 要改得動', () => {
+  // 會放 token 的是使用者層級的 ~/.npmrc，不在 worktree 裡；repo 裡這個放的是
+  // registry／engine-strict／include=dev。曾經擋在 secrets 底下，結果沒擋到任何憑證，
+  // 只擋掉 agent 修環境問題的唯一路徑（見 PROTECTED_PATHS 的說明）。
+  for (const tool of ['Write', 'Edit']) {
+    assert.deepEqual(evaluateToolPolicy(tool, { file_path: '.npmrc' }), { deny: false });
+  }
+  assert.deepEqual(evaluateToolPolicy('Bash', { command: 'echo "include=dev" > .npmrc' }), { deny: false });
 });
 
 test('唯讀工具不受保護路徑限制（讀 .env 判斷設定是合理的）', () => {

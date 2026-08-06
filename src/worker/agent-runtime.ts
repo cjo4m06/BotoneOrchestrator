@@ -385,6 +385,17 @@ export function buildAgentEnv(
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_ASKPASS = '/bin/false';
 
+  // 調度器自己的資料庫：agent 一律走測試那套。
+  //
+  // 只是「不繼承 daemon 的 ORCH_PROFILE」不夠——profileOf 沒讀到這個變數時**預設回 prod**
+  // （見 config/bootstrap.ts：忘了設就該落在不會弄壞測試那邊，那個預設對 daemon 是對的）。
+  // 所以拿掉等於沒拿掉。要擋住得明確設成 test。
+  //
+  // 擋的是哪個情境：把 BotoneOrchestrator 這個 repo 自己丟進任務板時，
+  // agent 在 worktree 裡跑 `npm test` 會直接讀寫正式的 ledger.db——真的任務、真的群組。
+  // 那是 CLAUDE.md 第一條紅線。對其他專案來說這個變數沒有意義，設了也不影響。
+  env.ORCH_PROFILE = 'test';
+
   // 來自設定（資料庫）的覆寫，**每次執行都重新取**：換 Claude token 或端點不必重啟 daemon。
   // 空字串視為未設，才不會用一個空 token 覆蓋掉行程環境裡本來可用的那個。
   for (const [k, v] of Object.entries(overrides)) {
@@ -1475,7 +1486,16 @@ const PROTECTED_PATHS: Record<ProtectedPathCategory, string[]> = {
     '**/*.pfx',
     '**/*.keystore',
     '**/id_rsa*',
-    '**/.npmrc',
+    // 這裡曾經有 '**/.npmrc'，2026-08-06 拿掉。
+    //
+    // 分類本身就錯了：**repo 裡的 .npmrc 是普通專案設定**（registry、engine-strict、
+    // legacy-peer-deps、include=dev），跟憑證無關；會放 token 的是使用者層級的
+    // ~/.npmrc，那個不在任何 worktree 裡，本來就不會被這條規則保護到。
+    //
+    // 誤擋的代價是實際發生過的：daemon 漏了 NODE_ENV=production 給 agent，
+    // npm 因此略過 devDependencies，agent 正確診斷出根因、想寫一行
+    // `.npmrc`（include=dev）自救——被這條擋死，兩個群組一起卡在 ask_human。
+    // 也就是說這條規則沒有擋到任何憑證，只擋掉了 agent 唯一的自救路徑。
     '**/serviceAccount*.json',
   ],
   git: ['**/.git/**'],
