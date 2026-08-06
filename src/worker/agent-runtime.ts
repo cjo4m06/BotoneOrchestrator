@@ -437,10 +437,10 @@ export class AgentRuntime {
     // resume 失敗（session 不存在／已過期）不該讓這一輪整個報銷：
     // session 是**加速用**的上下文，不是任務的必要條件。降級成全新 session 重跑一次，
     // 答覆本來就會另外注入 prompt，所以資訊不會掉。
-    if (input.resumeSessionId && isResumeFailure(first)) {
+    if (input.resumeSessionId && shouldRetryWithoutResume(first)) {
       this.log.warn(
         { taskId: input.task.id, sessionId: input.resumeSessionId, sdkError: first.sdkError },
-        '無法續接原 session → 改用全新 session 重跑本輪',
+        '帶 resume 的這輪失敗 → 丟掉 session 重跑一次（可能是續接不到）',
       );
       const { resumeSessionId: _drop, ...withoutResume } = input;
       return this.runOnce(withoutResume);
@@ -796,18 +796,32 @@ export function createAskHumanHandler(captured: CapturedSignals, log: Logger, ta
 }
 
 /**
- * 這一輪的失敗是不是「續接不到 session」造成的？
+ * 這一輪失敗之後，值不值得**丟掉 session 重跑一次**？
  *
- * 只認**明確指向 session/conversation/resume 的錯誤訊息**。放寬條件會很貴：
- * 任何一輪失敗都重跑一次 = 每個真實故障都付兩份錢，而且看起來像系統在亂重試。
+ * ── 為什麼不去讀錯誤訊息 ──
+ *
+ * 這裡原本比對 `/session|conversation|resume/` ＋ `/not found|expired|不存在/`，
+ * 想從錯誤字串認出「續接不到」。但 SDK 的錯誤碼列舉裡**根本沒有 session-not-found
+ * 這個碼**，所以那兩條正則比對的是我猜的英文措辭——SDK 換一句話（或講中文、
+ * 或只回一個代碼）就靜靜地不再觸發，而症狀是「這輪報銷了」，看起來跟一般失敗一樣。
+ *
+ * 程式手上真正確定的事實只有兩件，兩件都是結構化的：
+ *   1. 這一輪**有沒有帶 resume**（我們自己傳的）
+ *   2. SDK 給的**錯誤碼**（封閉列舉）
+ *
+ * 所以改成反過來問：這個錯誤碼是不是「換新 session 也一樣會炸」？額度、授權、
+ * 計費、模型不存在、服務端錯誤都屬於這類——重跑純粹是燒錢。**其餘一律重跑一次**，
+ * 因為 session 只是加速用的上下文、不是任務的必要條件，而答覆本來就會另外注入
+ * prompt，資訊不會掉。代價上限是「失敗且帶 resume 的那一輪多跑一次」。
  */
-export function isResumeFailure(r: { isError: boolean; sdkError?: string; resultText?: string }): boolean {
+const RETRY_POINTLESS: ReadonlySet<SdkErrorCode> = new Set([
+  'authentication_failed', 'oauth_org_not_allowed', 'billing_error',
+  'rate_limit', 'overloaded', 'server_error', 'model_not_found', 'max_output_tokens',
+]);
+
+export function shouldRetryWithoutResume(r: { isError: boolean; sdkError?: SdkErrorCode }): boolean {
   if (!r.isError) return false;
-  const text = `${r.sdkError ?? ''} ${r.resultText ?? ''}`.toLowerCase();
-  if (text === ' ') return false;
-  const mentionsSession = /session|conversation|resume/.test(text);
-  const mentionsMissing = /not found|no such|unknown|invalid|expired|does not exist|missing|已過期|不存在/.test(text);
-  return mentionsSession && mentionsMissing;
+  return !(r.sdkError && RETRY_POINTLESS.has(r.sdkError));
 }
 
 export const NO_CHANGE_ACK =

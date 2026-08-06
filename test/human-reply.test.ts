@@ -102,25 +102,36 @@ describe('人類回覆 — 讀出、注入、只用一次', () => {
 
 // ── resume 失敗的判定 ──
 
-describe('isResumeFailure — 只有真的續接不到才降級重跑', () => {
+describe('shouldRetryWithoutResume — 用錯誤碼決定，不讀錯誤訊息', () => {
   // 動態載入避免與上面的 ledger 測試共用狀態
-  const load = async () => (await import('../src/worker/agent-runtime.js')).isResumeFailure;
+  const load = async () => (await import('../src/worker/agent-runtime.js')).shouldRetryWithoutResume;
 
-  it('明確指向 session 不存在 → true', async () => {
-    const isResumeFailure = await load();
-    assert.equal(isResumeFailure({ isError: true, sdkError: 'invalid_request', resultText: 'No conversation found for session abc' }), true);
-    assert.equal(isResumeFailure({ isError: true, resultText: 'Session xyz has expired' }), true);
-    assert.equal(isResumeFailure({ isError: true, resultText: '指定的 session 不存在' }), true);
+  it('沒失敗就不重跑', async () => {
+    assert.equal((await load())({ isError: false }), false);
   });
 
-  /** 放寬條件的代價是每個真實故障都付兩份錢，所以這幾條要是紅的就代表判準太鬆。 */
-  it('一般失敗一律 false（不重跑）', async () => {
-    const isResumeFailure = await load();
-    assert.equal(isResumeFailure({ isError: false, resultText: 'session not found' }), false, '沒失敗就不該重跑');
-    assert.equal(isResumeFailure({ isError: true, sdkError: 'rate_limit' }), false);
-    assert.equal(isResumeFailure({ isError: true, sdkError: 'authentication_failed' }), false);
-    assert.equal(isResumeFailure({ isError: true, resultText: 'file not found: src/app.ts' }), false, '「not found」但與 session 無關');
-    assert.equal(isResumeFailure({ isError: true }), false);
+  /**
+   * 「換個 session 也一樣會炸」的那幾類，重跑純粹是燒錢。
+   * 這幾條要是紅的，代表每次額度用完都會被多收一次。
+   */
+  it('額度／授權／計費／服務端錯誤 → 不重跑', async () => {
+    const f = await load();
+    for (const code of ['rate_limit', 'overloaded', 'authentication_failed', 'oauth_org_not_allowed',
+      'billing_error', 'server_error', 'model_not_found', 'max_output_tokens'] as const) {
+      assert.equal(f({ isError: true, sdkError: code }), false, `${code} 換新 session 也一樣`);
+    }
+  });
+
+  it('其餘一律重跑一次——**包含 SDK 沒給碼的時候**', async () => {
+    const f = await load();
+    assert.equal(f({ isError: true, sdkError: 'invalid_request' }), true);
+    assert.equal(f({ isError: true, sdkError: 'unknown' }), true);
+    assert.equal(
+      f({ isError: true }), true,
+      '舊版讀錯誤字串猜「續接不到」，但 SDK 的錯誤碼列舉裡沒有 session-not-found 這個碼——'
+      + '猜的措辭一換就靜靜地不再觸發，症狀跟一般失敗長得一模一樣。'
+      + '沒有碼的時候寧可多跑一次，也不要假裝分得出來',
+    );
   });
 });
 

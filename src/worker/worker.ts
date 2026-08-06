@@ -273,7 +273,7 @@ export class Worker {
     // 它會從零重新理解任務，先前試過又放棄的方向可能再試一次。
     //
     // session 存在 Claude Code engine 的磁碟上，不是我們行程的記憶體，重啟後照樣接得回來；
-    // 真的過期了 iterate 會自己降級開新的（isResumeFailure），不會讓這一輪報銷。
+    // 真的過期了 iterate 會自己降級開新的（shouldRetryWithoutResume），不會讓這一輪報銷。
     // **群內共用一條寫程式的 session**（使用者裁決）：先找同一群同一角色最近用的，
     // 沒有才退回這個任務自己的（單獨派工、或還沒有群的情況）。
     //
