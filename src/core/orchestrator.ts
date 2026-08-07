@@ -1339,9 +1339,23 @@ export class Orchestrator {
     }
     const proj = m.resolveProject(group.repo);
     if (!proj) {
-      log.error({ group: group.id, repo: group.repo }, '合併前找不到專案 runtime，群組標記 failed');
-      ledger.logEvent('group', group.id, 'merge_blocked', `找不到專案 runtime：${group.repo}`);
-      this.failGroup(group, `找不到專案 runtime：${group.repo}`);
+      // ── 這是**暫時性**的，不可以判死 ──
+      //
+      // 「查不到專案」有三種來源，全部都會自己好：
+      //   · 專案是 daemon 開機後才加進來的（合併管線在下一輪才補上工作區）
+      //   · 該專案的 MCP 這一輪連不上
+      //   · 合併工作區被清掉了（resolveProject 自己會非同步重建）
+      //
+      // 先前這裡直接 failGroup ＋ 作廢核准憑證。實跑撞到（2026-08-07，uniwork）：
+      // 使用者 18:26 停用專案 → 18:27 daemon 重啟（合併閉環只接到 dinosaur）→
+      // 18:30 把專案加回來。之後每按一次「核准」就多一次 failed，而工作區明明還在，
+      // 缺的只是記憶體裡那筆對照。**每按一次核准就毀掉一次核准**，是最糟的形狀。
+      //
+      // 現在維持 merge_guard 狀態、**保留核准憑證**，下一輪自己再試一次。
+      // 這不是靜默等待：事件有記、log 有 warn，而且工作區重建是同一輪就啟動的。
+      const why = `暫時找不到專案 runtime：${group.repo}（專案剛加回來／MCP 連不上／合併工作區重建中）→ 保留核准，下一輪再試`;
+      log.warn({ group: group.id, repo: group.repo }, '合併前查不到專案 runtime，本輪跳過（核准憑證保留）');
+      ledger.logEvent('group', group.id, 'merge_deferred', why);
       return;
     }
 

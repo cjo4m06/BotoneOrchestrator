@@ -918,7 +918,14 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     assert.ok(notif.events.some((e) => e.type === 'failed'));
   });
 
-  it('找不到專案 runtime → 標 failed，不合併', async () => {
+  /**
+   * 這條原本斷言 failed。實跑（2026-08-07，uniwork）證明那是錯的：
+   * 使用者停用專案 → daemon 重啟（合併閉環只接到另一個專案）→ 把專案加回來，
+   * 之後**每按一次「核准」就多一次 failed**，而合併工作區目錄明明還在，
+   * 缺的只是記憶體裡那筆對照。「查不到專案」的三種來源全部會自己好，
+   * 所以要保留現場與核准憑證，下一輪再試。
+   */
+  it('找不到專案 runtime → 保留核准、下一輪再試（**不可以判死**）', async () => {
     tmp.ledger.upsertGroup({
       id: 'g_unknown', repo: 'other/repo', branch: 'orch/repo/g', taskIds: [], footprint: [],
       afterGroups: [], rationale: '', state: 'in_review', prNumber: 7,
@@ -932,7 +939,8 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     await tickAndPlan(orch);
 
     assert.deepEqual(m.merges, []);
-    assert.equal(tmp.ledger.getGroup('g_unknown')?.state, 'failed');
+    assert.notEqual(tmp.ledger.getGroup('g_unknown')?.state, 'failed',
+      '判死等於毀掉人剛按的核准，而且下一輪就會成功的情況也救不回來');
   });
 
   it('審查事件的群組不存在 → 只記錄，不炸掉整輪', async () => {

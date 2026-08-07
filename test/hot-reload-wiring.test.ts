@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { ProjectRegistry } from '../src/core/project-registry.js';
 import { createSilentLogger } from './helpers/index.js';
@@ -97,4 +99,50 @@ test('五個角色的模型別名都是現拿的（控制台換模型不必重�
     assert.match(main, new RegExp(`model: modelOf\\('${r}'\\)`), `main.ts 的 ${r} 還在傳快照`);
   }
   assert.match(main, /liveSettings\(\)\.agent\.models/, 'modelOf 要從現拿的設定讀');
+});
+
+test('合併管線的專案清單是現拿的——開機後才加的專案也合併得了', async () => {
+  const { createMergePipeline } = await import('../src/main.js');
+  const specs: { id: string; runtime: never }[] = [];
+  const built: string[] = [];
+
+  const pipeline = await createMergePipeline({
+    // 一開始是空的（等同「開機時這個專案還沒加進來」）
+    projects: () => specs as never,
+    actions: { allowLocalMerge: true },
+    log: createSilentLogger(),
+    ensureWorkspace: async (i: { path: string }) => { built.push(i.path); return i.path; },
+  });
+  assert.equal(pipeline, undefined, '一個專案都沒有 → 不接線');
+
+  // 現在把專案加進來（＝控制台新增／重新啟用）
+  specs.push({ id: 'uniwork', runtime: { repo: 'acme/web', repoPath: '/repo', baseBranch: 'main', verifierConfig: {} } as never });
+
+  // 工作區路徑必須真的存在——resolveProject 會檢查（不在就當作被清掉了，回 undefined 並重建）
+  const ws = mkdtempSync(join(tmpdir(), 'orch-ws-'));
+  try {
+    const p2 = await createMergePipeline({
+      projects: () => specs as never,
+      actions: { allowLocalMerge: true },
+      log: createSilentLogger(),
+      ensureWorkspace: async (i: { path: string }) => { built.push(i.path); return ws; },
+    });
+    assert.notEqual(p2, undefined);
+    assert.ok(p2?.resolveProject('acme/web'), '現拿的清單要看得到後來才加的專案');
+    // 正式接線也要傳函式——只有這裡是函式、main.ts 傳快照的話，線上照樣壞
+    assert.match(code('src/main.ts'), /projects: \(\) => registry\.list\(\)/,
+      'main.ts 傳的是開機快照 ⇒ 開機後才加的專案永遠合併不了（實跑：uniwork）');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('查不到專案時不判死——那三種來源都會自己好', () => {
+  const src = code('src/core/orchestrator.ts');
+  assert.match(src, /merge_deferred/, '要記成 deferred 而不是 merge_blocked');
+  // failGroup 不可以出現在「查不到 runtime」那條路上
+  const idx = src.indexOf('暫時找不到專案 runtime');
+  assert.ok(idx > 0, '找不到延後處理的那段');
+  const block = src.slice(idx, idx + 600);
+  assert.doesNotMatch(block, /failGroup/, '判死等於毀掉人剛按的核准');
 });

@@ -42,6 +42,7 @@ import { MergeRiskJudge } from './core/merge-risk-judge.js';
 import { DriftJudge } from './pr/drift-judge.js';
 import { hasClaudeAuth } from './worker/reviewer.js';
 import { withFetchLock, FETCH_TIMEOUT_MS } from './git/fetch-lock.js';
+import { hotValue, type Hot } from './config/hot.js';
 import { InboundRouter, type CompleteTaskFn } from './notify/notifier.js';
 import { createNotifier, slackHandlesOf, type HumanGateway } from './slack/gateway.js';
 import { AppHome } from './slack/app-home.js';
@@ -610,7 +611,15 @@ export interface MergeProjectSpec {
 }
 
 export interface CreateMergePipelineInput {
-  projects: MergeProjectSpec[];
+  /**
+   * 要接進合併管線的專案。**傳函式才會熱重載**。
+   *
+   * 為什麼這件事會咬人：registry 本身是熱的（控制台新增／停用專案，下一輪就生效），
+   * 但合併管線的 repo → 工作區對照表是**開機建一次**的。實跑撞到（2026-08-07，uniwork）：
+   * 使用者停用專案 → daemon 重啟（合併閉環只接到另一個專案）→ 把專案加回來，
+   * 之後那個專案的群組每次走到合併都「找不到專案 runtime」，而工作區目錄明明還在。
+   */
+  projects: Hot<MergeProjectSpec[]>;
   /** 這個 profile 的資料根目錄；合併工作區建在它底下。 */
   dataRoot?: string;
   /** 已不再用於接線與否（保留給呼叫端記錄用途）。 */
@@ -694,7 +703,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
 
   /** 重建某個 repo 的合併工作區（含 node_modules 與本機設定檔）。 */
   const rebuildMergeWorkspace = async (repo: string, proj: MergeProject): Promise<void> => {
-    const entry = input.projects.find((p) => p.runtime.repo === repo);
+    const entry = (hotValue(input.projects) ?? []).find((p) => p.runtime.repo === repo);
     if (!entry) return;
     const path = await ensure({
       repoPath: entry.runtime.repoPath,
@@ -708,7 +717,13 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     log.info({ repo, path }, '合併工作區已重建');
   };
 
-  for (const { id, runtime } of input.projects) {
+  /**
+   * 幫一個專案備好合併工作區並登記進 byRepo。
+   *
+   * **開機與熱重載共用同一支**：先前開機那條是內嵌在迴圈裡的，於是「開機後才加進來的
+   * 專案」沒有任何路徑可以補登記——那正是 uniwork 的群組一直合併失敗的原因。
+   */
+  const addMergeWorkspace = async ({ id, runtime }: MergeProjectSpec): Promise<boolean> => {
     const path = await ensure({
       repoPath: runtime.repoPath,
       path: join(resolve(base), mergeWorkspaceSlug(id)),
@@ -716,7 +731,7 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       git,
       log,
     });
-    if (!path) continue;
+    if (!path) return false;
     // 依賴由專案自己的驗收指令負責；本機設定檔沒有版控對照物，只能從主 clone 帶
     await prepareLocalConfig(runtime.repoPath, path, log).catch((e) =>
       log.warn({ path, err: e instanceof Error ? e.message : String(e) }, '合併工作區的本機設定檔準備失敗'),
@@ -732,11 +747,23 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
       baseBranch: runtime.baseBranch,
       verifierConfig: runtime.verifierConfig,
     });
-  }
+    return true;
+  };
 
-  if (byRepo.size === 0) {
-    log.error('沒有任何專案取得合併專用工作區 → 合併管線不接線（已核准的 PR 需人工合併）');
+  for (const spec of hotValue(input.projects) ?? []) await addMergeWorkspace(spec);
+
+  // **只有「一個專案都沒有」才不接線。**
+  //
+  // 先前的條件是 `byRepo.size === 0`，也就是「開機當下沒有任何專案拿得到工作區」。
+  // 專案清單改成現拿之後那個條件是錯的：專案可能是開機後才加進來的，
+  // 而 resolveProject 現在會自己補建工作區。開機時拿不到就永遠不接線的話，
+  // 之後加回來的專案一樣沒有合併能力（而症狀是「已核准但合併管線沒接線 → failed」）。
+  if ((hotValue(input.projects) ?? []).length === 0) {
+    log.error('一個專案都沒有 → 合併管線不接線');
     return undefined;
+  }
+  if (byRepo.size === 0) {
+    log.warn('開機時沒有任何專案取得合併專用工作區 → 仍接線，工作區在第一次要用時補建');
   }
 
   log.info({ repos: [...byRepo.keys()] }, '✅ 合併閉環已接線：審查通過 → Merge Guard → 政策閘門 → 合併 PR');
@@ -752,7 +779,25 @@ export async function createMergePipeline(input: CreateMergePipelineInput): Prom
     // 缺的只是「在用之前再問一次」。
     resolveProject: (repo) => {
       const proj = byRepo.get(repo);
-      if (!proj) return undefined;
+      if (!proj) {
+        // **可能是 daemon 開機後才加進來的專案。**
+        //
+        // byRepo 是開機建的；registry 熱重載了新專案，這裡卻沒有對應的合併工作區，
+        // 於是那個專案的群組每次走到合併都查不到 runtime（實跑：uniwork 停用→重啟→加回來，
+        // 每按一次核准就多一次 failed，而工作區目錄明明還在）。
+        //
+        // 這裡同步回 undefined、非同步把工作區備好：呼叫端已改成「保留核准、下一輪再試」，
+        // 所以下一輪就會成功。不在這裡等，是因為 resolveProject 是同步介面，
+        // 而建工作區要跑 git（幾百毫秒到數秒）。
+        const spec = (hotValue(input.projects) ?? []).find((p) => p.runtime.repo === repo);
+        if (spec) {
+          log.warn({ repo, id: spec.id }, '合併管線還沒有這個專案的工作區（開機後才加進來）→ 本輪跳過，背景備好');
+          void addMergeWorkspace(spec).catch((e) =>
+            log.warn({ repo, err: e instanceof Error ? e.message : String(e) }, '補建合併工作區失敗'),
+          );
+        }
+        return undefined;
+      }
       if (!existsSync(proj.repoPath)) {
         // 同步路徑不能 await，所以這裡只標記；實際重建在下一輪由 rebuild 完成。
         // 立刻回 undefined 比讓它倒在 git 指令上好：後者的錯誤訊息完全看不出根因。
@@ -1950,7 +1995,8 @@ export async function main(): Promise<void> {
 
   // 需求 7「審查通過後合併 PR」：合併只在專用 worktree 內進行（不會動使用者主 clone 的分支）
   const merge = await createMergePipeline({
-    projects: registry.list().map((x) => ({ id: x.config.id, runtime: x.runtime })),
+    // 現拿：控制台新增／停用專案，合併管線下一次要用時就看得到（先前是開機快照）
+    projects: () => registry.list().map((x) => ({ id: x.config.id, runtime: x.runtime })),
     actions,
     log,
     dataRoot: boot.dataRoot,

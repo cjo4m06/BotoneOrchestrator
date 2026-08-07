@@ -814,9 +814,24 @@ test('createMergePipeline：兩個開關都開時接線，且工作目錄是專�
   assert.ok(pipeline!.fetchBase, '沒有 fetchBase 就是拿過期的 base 驗證，語意飄移抓不到');
 });
 
-test('createMergePipeline：所有專案都拿不到專用工作區 → 不接線（不會退回主 clone）', async () => {
+test('createMergePipeline：開機時拿不到工作區 → **照樣接線**（下次要用時自己補建）', async () => {
+  // 這條原本斷言「不接線」。專案清單改成現拿之後那是錯的：專案可能是開機後才加進來的，
+  // 而 resolveProject 現在會自己補建工作區。開機拿不到就永遠不接線的話，
+  // 之後加回來的專案一樣沒有合併能力——症狀是「已核准但合併管線沒接線 → failed」。
   const pipeline = await createMergePipeline({
     projects: specs(),
+    actions: { allowLocalMerge: true },
+    log: createSilentLogger(),
+    ensureWorkspace: async () => undefined,
+  });
+  assert.notEqual(pipeline, undefined, '有專案就要接線，工作區之後補得回來');
+  // 但這一刻確實還沒有工作區 → 查不到，呼叫端要「保留核准、下一輪再試」
+  assert.equal(pipeline?.resolveProject('acme/web'), undefined);
+});
+
+test('createMergePipeline：一個專案都沒有 → 才不接線', async () => {
+  const pipeline = await createMergePipeline({
+    projects: [],
     actions: { allowLocalMerge: true },
     log: createSilentLogger(),
     ensureWorkspace: async () => undefined,
