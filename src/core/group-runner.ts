@@ -556,6 +556,40 @@ const SUCCESS: RunOutcome = { ok: true, keep: false, reason: '' };
 import { withRepoLock } from './repo-lock.js';
 export { withRepoLock } from './repo-lock.js';
 
+/**
+ * 分支上有沒有東西可以開 PR。
+ *
+ * ── 為什麼要在開 PR **之前**問 ──
+ *
+ * `gh pr create` 對零 commit 的分支必定失敗（`GraphQL: No commits between …`），
+ * 而那個失敗會被收斂成 group_crashed → 群組進待處理清單 → 人按重試 → 一模一樣再來一次。
+ * 實跑（2026-08-11，g_327e5320a9ab）：使用者連按三次重試，每次都是同一則錯誤。
+ *
+ * 零 commit 不是錯誤，是**這一群沒有東西要交付**——典型來源是整群的任務都合法地
+ * 結束在「不需要改動」（agent 查證後判定規格才是落後的一方，改用 report_no_change
+ * ＋ report_friction 回報）。那條路先前沒有出口：收尾邏輯看到「任務都結案了但還沒開 PR」
+ * 就推去開 PR，而沒有人檢查分支上有沒有東西。
+ *
+ * ── 量不到就不要擋 ──
+ *
+ * base ref 解析不了（沒有 remote、分支名對不上）時回 undefined，呼叫端照常開 PR。
+ * 「量不到」不等於「沒有東西」，把交付擋在一個量測失敗上比讓 gh 報錯更糟。
+ */
+export async function branchHasCommits(
+  git: GitRunner,
+  wtPath: string,
+  baseBranch: string,
+  remote?: string,
+): Promise<boolean | undefined> {
+  for (const ref of [`${remote ?? 'origin'}/${baseBranch}`, baseBranch]) {
+    const r = await git(wtPath, ['rev-list', '--count', `${ref}..HEAD`]);
+    if (r.exitCode !== 0) continue;
+    const n = Number(r.stdout.trim());
+    if (Number.isFinite(n)) return n > 0;
+  }
+  return undefined;
+}
+
 export class GroupRunner {
   private wm: WorktreeLike;
   private pr: PrManagerLike;
@@ -1014,6 +1048,25 @@ export class GroupRunner {
           : []),
       );
 
+      // ── 開 PR 前的前置條件：分支上有東西嗎 ──
+      //
+      // 沒有的話 `gh pr create` 必定失敗，而那個失敗會變成 group_crashed ＋ 一顆
+      // 按幾次都一樣的重試鈕（見 branchHasCommits）。這裡把它變成一個**有結論的終點**：
+      // 這一群沒有東西要交付。agent 的結論（例如「規格才是落後的一方」）已經
+      // 透過 report_no_change／report_friction 進了帳，人在「等你處理」與
+      // 「agent 說你該知道」兩個地方都看得到。
+      if ((await this.branchHasCommits(wtPath, proj.baseBranch, proj.remote)) === false) {
+        const why = '這一群沒有東西要交付：分支上零 commit（群內任務都判定不需要改動）。'
+          + '開 PR 會失敗，重試也不會改變這件事——請看 agent 的結論再決定要不要調整規格或任務。';
+        log.warn({ group: group.id, branch: group.branch }, '分支零 commit → 不開 PR，直接結案交人');
+        ledger.logEvent('group', group.id, 'group_nothing_to_deliver', why);
+        this.notify(details, { type: 'problem', detail: why });
+        this.cards(details, 'awaiting_human', group.id);
+        ledger.updateGroupState(group.id, 'failed');
+        // worktree 可以收掉：零 commit 代表裡面沒有任何未保存的成果
+        return { ok: false, keep: false, reason: why };
+      }
+
       // 記在區域變數：`group` 是進入函式時的快照，updateGroupState 不會回寫它的 prNumber，
       // 後面「已開 PR 就不本地合併」的判斷若讀 group.prNumber 會永遠是 undefined（踩過）。
       // 開 PR 沒有開關：一群做完只有這一條出口，而審查是掛在 PR 上的。
@@ -1300,6 +1353,14 @@ export class GroupRunner {
   }
 
   /** 把群組 park 在可恢復狀態並通知（保留 worktree，成果不丟）。 */
+  private branchHasCommits(
+    wtPath: string,
+    baseBranch: string,
+    remote: string | undefined,
+  ): Promise<boolean | undefined> {
+    return branchHasCommits(gitExec, wtPath, baseBranch, remote);
+  }
+
   private parkGroup(group: Group, details: TaskDetail[], why: string): RunOutcome {
     const { ledger, log } = this.deps;
     log.warn({ group: group.id }, `群組 park：${why}`);

@@ -1,21 +1,8 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import type { AgentSummaryCapture } from '../src/worker/agent-runtime.js';
 import assert from 'node:assert/strict';
-import {
-  GROUP_DEPS_BLOCKED_EVENT,
-  GroupRunner,
-  shouldRequeueGroup,
-  type MergeApprovalAsk,
-  type FeedbackStoreLike,
-  type GitRunner,
-  type GroupRunnerDeps,
-  type MergeGuardLike,
-  type PrManagerLike,
-  type ProjectRuntime,
-  type WorktreeLike,
-  reworkProducedChanges,
-  stripAnsi,
-} from '../src/core/group-runner.js';
+import { readFileSync } from 'node:fs';
+import { GROUP_DEPS_BLOCKED_EVENT, GroupRunner, branchHasCommits, reworkProducedChanges, shouldRequeueGroup, stripAnsi, type FeedbackStoreLike, type GitRunner, type GroupRunnerDeps, type MergeApprovalAsk, type MergeGuardLike, type PrManagerLike, type ProjectRuntime, type WorktreeLike } from '../src/core/group-runner.js';
 import type { AgentLike, McpTaskClient, Notifier, VerifierLike } from '../src/contracts.js';
 import type { PolicyInput } from '../src/policy/policy-engine.js';
 import type { MergeGuardOptions } from '../src/pr/merge-guard.js';
@@ -1445,5 +1432,56 @@ describe('stripAnsi：只清色碼，不動內容', () => {
 
   it('沒有色碼就原樣回來', () => {
     assert.equal(stripAnsi('AssertionError: expected 1 to be 2'), 'AssertionError: expected 1 to be 2');
+  });
+});
+
+/**
+ * 開 PR 前的前置條件。實跑（2026-08-11，g_327e5320a9ab）：群內唯一的任務合法地
+ * 結束在「不需要改動」（agent 查證後判定規格才是落後的一方），於是分支上零 commit。
+ * 收尾邏輯照樣推去開 PR，`gh pr create` 必定失敗（`No commits between …`），
+ * 收斂成 group_crashed → 使用者連按三次重試，每次一模一樣。
+ */
+describe('開 PR 前先問「分支上有東西嗎」', () => {
+  const fakeGit = (out: Record<string, { exitCode: number; stdout: string }>) =>
+    (async (_cwd: string, args: string[]) =>
+      ({ stderr: '', ...(out[args[args.length - 1]!] ?? { exitCode: 128, stdout: '' }) })) as never;
+
+  it('零 commit → false（那正是 gh 會失敗的情況）', async () => {
+    const got = await branchHasCommits(fakeGit({ 'origin/main..HEAD': { exitCode: 0, stdout: '0\n' } }), '/wt', 'main');
+    assert.equal(got, false);
+  });
+
+  it('有 commit → true', async () => {
+    const got = await branchHasCommits(fakeGit({ 'origin/main..HEAD': { exitCode: 0, stdout: '3\n' } }), '/wt', 'main');
+    assert.equal(got, true);
+  });
+
+  it('沒有 remote 追蹤分支 → 退回本地 base 再問一次', async () => {
+    const got = await branchHasCommits(fakeGit({ 'main..HEAD': { exitCode: 0, stdout: '2\n' } }), '/wt', 'main');
+    assert.equal(got, true);
+  });
+
+  it('自訂 remote 會被用上', async () => {
+    const got = await branchHasCommits(fakeGit({ 'upstream/dev..HEAD': { exitCode: 0, stdout: '0\n' } }), '/wt', 'dev', 'upstream');
+    assert.equal(got, false);
+  });
+
+  it('**量不到就不要擋**：兩個 ref 都解析不了 → undefined（照常開 PR）', async () => {
+    const got = await branchHasCommits(fakeGit({}), '/wt', 'main');
+    assert.equal(got, undefined, '把交付擋在一個量測失敗上，比讓 gh 報錯更糟');
+  });
+
+  it('開 PR 那條路真的有接上這道檢查', () => {
+    const src = readFileSync('src/core/group-runner.ts', 'utf8')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    const i = src.indexOf('this.pr.openPr(');
+    assert.ok(i > 0);
+    // 檢查必須在呼叫 openPr **之前**，而且要比對**呼叫點**不是函式定義
+    //（定義在 class 之前，用 lastIndexOf 找 'branchHasCommits(' 會命中它而永遠成立）
+    assert.ok(
+      src.lastIndexOf('this.branchHasCommits(wtPath', i) > 0,
+      '前置條件要在動作之前，不是失敗後再分類',
+    );
+    assert.match(src, /group_nothing_to_deliver/);
   });
 });
