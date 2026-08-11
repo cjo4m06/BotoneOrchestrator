@@ -268,11 +268,33 @@ export const ALLOWED_TOOLS = toolsFor('coder', { full: BROWSER_TOOLS });
  * 寧可沒有瀏覽器，也不要讓它把暫存檔寫進 worktree。
  *
  * 每個旗標的理由：
- * · `--output-dir`  截圖／快照／log 一律寫到 worktree 外（見 browserOutputRoot 的說明）
- * · `--output-mode stdout`  能不落地就不落地，output-dir 只是最後的去處
+ * · `--output-dir`  沒指定檔名時的截圖／快照／log 落在這裡（worktree 外）
  * · `--isolated`    瀏覽器 profile 只留在記憶體，不在磁碟累積
  * · `--headless`    這是常駐 daemon，預設的 headed 會嘗試開視窗
  * · `--no-sandbox`  在無 GUI session 下啟動 Chromium 常因沙箱失敗
+ *
+ * ── 為什麼要用 `sh -c cd …`（不是直接 `npx`）──
+ *
+ * **`--output-dir` 只管得到「agent 沒指定檔名」的那些檔。** 實測（@playwright/mcp 1.63）：
+ *   browser_take_screenshot {}                    → 落在 --output-dir ✅
+ *   browser_take_screenshot { filename: 'a.png' } → 落在**行程的 cwd** ❌
+ * 而 agent 幾乎一定會指定檔名（它要用有意義的名字對照畫面）。SDK 的
+ * McpStdioServerConfig **沒有 cwd 欄位**，所以只能用 shell 包一層把 cwd 換掉。
+ *
+ * 這條路徑的好處是它**不需要判斷**：不是去猜「哪個檔是瀏覽器的垃圾、哪個是 agent 真的要的」
+ *（那猜不對，也不該由程式猜），而是讓相對路徑的原點根本不在專案資料夾裡。
+ * 剩下的漏洞只有「agent 明確給絕對路徑指回 worktree」——那是它自己的決定，
+ * 而提示詞已經告訴它暫存檔該放哪（見 scratchRule）。
+ *
+ * ── 為什麼不再有 `--output-mode stdout` ──
+ *
+ * **那個旗標已經不存在了**，而 commander 遇到不認識的選項會直接退出：
+ *   $ npx -y @playwright/mcp@latest … --output-mode stdout …
+ *   error: unknown option '--output-mode'
+ * 於是 stdio server 從來沒起來、SDK 靜默把它丟掉，agent 的工具清單裡真的沒有瀏覽器。
+ * 實跑（2026-08-10，任務 hWS1XSbnOkfd）：agent 回報「此執行環境沒有瀏覽器自動化工具」
+ * 並改走 SSR/元件層驗證——它說的每一句都是對的，只是原因在調度器這邊。
+ * 而我們自己的接線檢查全綠（材料備好了、目錄也建了），因為**沒有人檢查行程活著**。
  */
 export function browserServerConfig(
   outputRoot: string | undefined,
@@ -280,16 +302,14 @@ export function browserServerConfig(
 ): { command: string; args: string[] } | undefined {
   if (!outputRoot?.trim()) return undefined;
   const dir = scratchDirFor(outputRoot, taskId)!;
+  const quoted = `'${dir.replace(/'/g, `'\\''`)}'`;
   return {
-    command: 'npx',
+    command: 'sh',
     args: [
-      '-y',
-      '@playwright/mcp@latest',
-      '--headless',
-      '--isolated',
-      '--no-sandbox',
-      '--output-mode', 'stdout',
-      '--output-dir', dir,
+      '-c',
+      // exec：讓 npx 取代 shell 行程，SDK 殺得掉它（否則會留下孤兒）
+      `cd ${quoted} && exec npx -y @playwright/mcp@latest`
+      + ` --headless --isolated --no-sandbox --output-dir ${quoted}`,
     ],
   };
 }
@@ -561,6 +581,8 @@ export class AgentRuntime {
     });
 
     const outcome = await collectStreamOutcome(stream as AsyncIterable<unknown>);
+    // 掛上去的 MCP 有沒有真的活著。起不來時 SDK 是靜默丟掉的——見 reportMcpHealth。
+    reportMcpHealth(this.log, 'coder', Object.keys(servers), outcome.mcpServers);
     const { sessionId, resultText, isError } = outcome;
 
     // 這一輪實際用了哪些工具。**瀏覽器單獨列出**：UI 任務有沒有真的去看畫面，
@@ -923,6 +945,9 @@ export function createNoChangeHandler(captured: CapturedSignals, log: Logger, ta
   };
 }
 
+/** SDK 在 init 訊息回報的單一 MCP server 狀態。 */
+export interface McpServerStatus { name: string; status: string }
+
 export interface StreamOutcome {
   sessionId?: string;
   resultText: string;
@@ -937,6 +962,14 @@ export interface StreamOutcome {
   retries?: ApiRetryInfo[];
   /** 本輪的用量與花費（SDK 在 result 訊息給的實際數字，不是估算）。 */
   usage?: AgentUsage;
+  /**
+   * 這一輪每個 MCP server 的連線狀態（SDK 在 init 訊息給的）。
+   *
+   * **這是唯一能看出「掛上去的 MCP 有沒有真的活著」的地方。** 我們自己的接線檢查
+   * 只驗到「材料備好了」（serversFor 的 missing），驗不到「行程起不起得來」——
+   * 而起不來時 SDK 是靜默丟掉那個 server 的，agent 只會發現工具清單少了東西。
+   */
+  mcpServers?: McpServerStatus[];
 }
 
 /**
@@ -966,6 +999,7 @@ export async function collectStreamOutcome(stream: AsyncIterable<unknown>): Prom
   let lastSdkError: SdkErrorCode | undefined;
   let lastStatus: number | null | undefined;
   let usage: AgentUsage | undefined;
+  let mcpHealth: McpServerStatus[] | undefined;
   const retries: ApiRetryInfo[] = [];
 
   // 註：SDK 訊息為 discriminated union，欄位以 discriminant 保護後存取；
@@ -986,6 +1020,10 @@ export async function collectStreamOutcome(stream: AsyncIterable<unknown>): Prom
 
     if (m.type === 'system' && m.subtype === 'init') {
       sessionId = m.session_id ?? sessionId;
+      const list = (msg as { mcp_servers?: { name?: unknown; status?: unknown }[] }).mcp_servers;
+      if (Array.isArray(list)) {
+        mcpHealth = list.map((x) => ({ name: String(x?.name ?? ''), status: String(x?.status ?? '') }));
+      }
       continue;
     }
 
@@ -1036,7 +1074,45 @@ export async function collectStreamOutcome(stream: AsyncIterable<unknown>): Prom
     ...(lastStatus !== undefined && lastStatus !== null ? { httpStatus: lastStatus } : {}),
     ...(retries.length > 0 ? { retries } : {}),
     ...(usage ? { usage } : {}),
+    ...(mcpHealth ? { mcpServers: mcpHealth } : {}),
   };
+}
+
+/**
+ * 掛上去的 MCP server 有沒有真的活著。
+ *
+ * **這是這個系統缺了很久的一道。** 我們一直只檢查到「材料備好了」
+ *（serversFor 的 missing 清單），而 MCP 起不來時 SDK 是**靜默丟掉**那個 server 的：
+ * agent 只會發現工具清單少了東西，然後自己想辦法繞過去、或停下來回報限制。
+ * 實跑（2026-08-10）：`--output-mode` 這個旗標被上游拿掉，瀏覽器 MCP 從此起不來，
+ * 而 daemon 的 log 一行都沒有多——是 agent 回報「此執行環境沒有瀏覽器」才被發現的。
+ *
+ * 旗標還會再變，靜默不會自己好，所以這道要一直在。
+ * **只記錄、不擲錯**：少一個 MCP 不該讓任務直接失敗（agent 可能還有別的路），
+ * 但它必須在 log 裡大聲到查得到。
+ */
+export function reportMcpHealth(
+  log: Logger,
+  role: string,
+  expected: string[],
+  reported: McpServerStatus[] | undefined,
+): McpServerStatus[] {
+  if (!expected.length) return [];
+  if (!reported) {
+    // SDK 沒給 init 訊息（假件測試、舊版）→ 不是壞掉，只是量不到
+    return [];
+  }
+  const bad = expected.map((name) => {
+    const hit = reported.find((r) => r.name === name);
+    return { name, status: hit?.status ?? '（init 訊息裡沒有這個 server）' };
+  }).filter((x) => x.status !== 'connected');
+  if (bad.length > 0) {
+    log.error(
+      { role, broken: bad, reported },
+      '⚠️ 掛上去的 MCP server 沒有連上——agent 這一輪拿不到它的工具（工具清單會少東西，但不會有別的症狀）',
+    );
+  }
+  return bad;
 }
 
 /**

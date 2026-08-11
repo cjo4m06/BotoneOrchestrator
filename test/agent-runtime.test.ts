@@ -2,8 +2,8 @@ import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ALLOWED_TOOLS,
-  READONLY_BROWSER_TOOLS,
   ASK_HUMAN_FALLBACK,
+  READONLY_BROWSER_TOOLS,
   browserServerConfig,
   buildAgentEnv,
   buildAgentPrompt,
@@ -18,12 +18,13 @@ import {
   evaluateToolPolicy,
   isDeployScriptName,
   parseUsage,
+  reportMcpHealth,
   resolveToolPolicy,
   tokenizeShell,
 } from '../src/worker/agent-runtime.js';
 import type { ClarificationCapture, IterateInput } from '../src/worker/agent-runtime.js';
 import { NO_TOOL_AUDIT } from '../src/worker/tool-audit.js';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createRecordingLogger, createSilentLogger, makeGateReport, makeTaskDetail } from './helpers/index.js';
@@ -1143,21 +1144,34 @@ describe('browserServerConfig', () => {
   it('輸出目錄一任務一個，且帶上必要旗標', () => {
     const dir = mkdtempSync(join(tmpdir(), 'browser-root-'));
     const cfg = browserServerConfig(dir, 'LIVE-1')!;
-    assert.equal(cfg.command, 'npx');
-    const outIdx = cfg.args.indexOf('--output-dir');
-    assert.ok(outIdx > 0);
-    assert.equal(cfg.args[outIdx + 1], join(dir, 'LIVE-1'));
+    const cmd = `${cfg.command} ${cfg.args.join(' ')}`;
+    assert.ok(cmd.includes(`--output-dir '${join(dir, 'LIVE-1')}'`), cmd);
     assert.ok(existsSync(join(dir, 'LIVE-1')), '目錄要先建好，否則 MCP 可能退回當下工作目錄');
     for (const flag of ['--headless', '--isolated', '--no-sandbox']) {
-      assert.ok(cfg.args.includes(flag), `缺少 ${flag}`);
+      assert.ok(cmd.includes(flag), `缺少 ${flag}`);
     }
-    assert.equal(cfg.args[cfg.args.indexOf('--output-mode') + 1], 'stdout');
+    // **不可以再出現 --output-mode。** 那個旗標上游已經拿掉，commander 會直接
+    // `error: unknown option` 退出 → stdio server 起不來 → SDK 靜默丟掉它
+    // → agent 的工具清單裡真的沒有瀏覽器（實跑 2026-08-10，任務 hWS1XSbnOkfd）
+    assert.ok(!cmd.includes('--output-mode'), '死旗標會讓整個 MCP 起不來');
+  });
+
+  it('行程的 cwd 移出 worktree——否則 agent 指定檔名的截圖會掉進專案資料夾', () => {
+    // 實測（@playwright/mcp 1.63）：--output-dir 只管得到「沒指定檔名」的那些檔；
+    // browser_take_screenshot { filename: 'a.png' } 是相對於**行程 cwd** 解析的。
+    // SDK 的 McpStdioServerConfig 沒有 cwd 欄位，所以只能用 shell 包一層。
+    const dir = mkdtempSync(join(tmpdir(), 'browser-root3-'));
+    const cfg = browserServerConfig(dir, 'LIVE-2')!;
+    const cmd = `${cfg.command} ${cfg.args.join(' ')}`;
+    assert.match(cmd, /^sh -c cd '/, '沒有換 cwd 的話，具名截圖會落在 worktree');
+    assert.ok(cmd.includes(`cd '${join(dir, 'LIVE-2')}'`), cmd);
+    assert.ok(cmd.includes('exec npx'), 'exec：讓 npx 取代 shell，SDK 殺得掉它（否則留孤兒）');
   });
 
   it('任務 id 含路徑字元也不會跳出根目錄', () => {
     const dir = mkdtempSync(join(tmpdir(), 'browser-root2-'));
     const cfg = browserServerConfig(dir, '../../etc/passwd')!;
-    const out = cfg.args[cfg.args.indexOf('--output-dir') + 1]!;
+    const out = /--output-dir '([^']+)'/.exec(cfg.args.join(' '))![1]!;
     // 真正要驗的是「解析後仍在根目錄底下」。名字開頭有兩個點不代表能跳出去——
     // 路徑分隔符被換掉之後 `.._.._etc_passwd` 只是個難看的**單層**目錄名，不是 traversal。
     assert.ok(resolve(out).startsWith(resolve(dir) + sep), `跳出根目錄：${out}`);
@@ -1247,5 +1261,64 @@ describe('工具使用回報', () => {
 
     assert.equal(v.hookSpecificOutput?.permissionDecision, 'deny');
     assert.deepEqual(seen, ['mcp__playwright__browser_navigate']);
+  });
+});
+
+describe('MCP 健康檢查（掛上去的 server 有沒有真的活著）', () => {
+  /**
+   * 這道是 2026-08-10 那次事故補上的：`--output-mode` 被上游拿掉之後，
+   * 瀏覽器 MCP 從此起不來，而 daemon 的 log **一行都沒有多**——
+   * SDK 起不來就靜默丟掉那個 server，agent 只會發現工具清單少了東西。
+   * 是 agent 回報「此執行環境沒有瀏覽器」才被發現的。
+   */
+  function spyLog() {
+    const errs: unknown[] = [];
+    return { errs, log: { ...createSilentLogger(), error: (o: unknown) => void errs.push(o) } as never };
+  }
+
+  it('全部 connected → 不吵', () => {
+    const s = spyLog();
+    const bad = reportMcpHealth(s.log, 'coder', ['ask', 'browser'], [
+      { name: 'ask', status: 'connected' }, { name: 'browser', status: 'connected' },
+    ]);
+    assert.deepEqual(bad, []);
+    assert.equal(s.errs.length, 0);
+  });
+
+  it('有 server 沒連上 → 記成 error（含是哪一個、什麼狀態）', () => {
+    const s = spyLog();
+    const bad = reportMcpHealth(s.log, 'coder', ['ask', 'browser'], [
+      { name: 'ask', status: 'connected' }, { name: 'browser', status: 'failed' },
+    ]);
+    assert.deepEqual(bad, [{ name: 'browser', status: 'failed' }]);
+    assert.equal(s.errs.length, 1);
+  });
+
+  it('init 訊息裡整個少了那個 server → 也算沒連上（起不來時就是這個形狀）', () => {
+    const s = spyLog();
+    const bad = reportMcpHealth(s.log, 'coder', ['ask', 'browser'], [{ name: 'ask', status: 'connected' }]);
+    assert.equal(bad.length, 1);
+    assert.equal(bad[0]!.name, 'browser');
+    assert.equal(s.errs.length, 1);
+  });
+
+  it('SDK 沒給 init 訊息（假件／舊版）→ 不吵（量不到不等於壞掉）', () => {
+    const s = spyLog();
+    assert.deepEqual(reportMcpHealth(s.log, 'coder', ['browser'], undefined), []);
+    assert.equal(s.errs.length, 0);
+  });
+
+  it('collectStreamOutcome 會把 init 的 mcp_servers 帶出來', async () => {
+    const outcome = await collectStreamOutcome((async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 's1', mcp_servers: [{ name: 'browser', status: 'failed' }] };
+      yield { type: 'result', subtype: 'success', result: 'ok' };
+    })());
+    assert.deepEqual(outcome.mcpServers, [{ name: 'browser', status: 'failed' }]);
+  });
+
+  it('寫程式的 agent 那條路有接上這道檢查', () => {
+    const src = readFileSync('src/worker/agent-runtime.ts', 'utf8')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.match(src, /reportMcpHealth\(this\.log, 'coder', Object\.keys\(servers\)/);
   });
 });
