@@ -1035,7 +1035,7 @@ export class Ledger {
       .prepare(
         `DELETE FROM events
           WHERE created_at < @cutoff
-            AND NOT (scope = 'group' AND ref_id IN (SELECT id FROM groups WHERE state NOT IN ('merged','failed')))
+            AND NOT (scope = 'group' AND ref_id IN (SELECT id FROM groups WHERE state NOT IN ('merged','failed','closed')))
             AND NOT (scope = 'task'  AND ref_id IN (SELECT id FROM tasks  WHERE state <> 'done'))
             -- **摩擦回報與它的分診紀錄不受保留策略管。**
             --

@@ -12,7 +12,7 @@ import type { Group, GroupState, Task, TaskState } from '../types.js';
 
 export const TASK_STATES: TaskState[] = ['discovered', 'queued', 'blocked', 'in_progress', 'verifying', 'done'];
 export const GROUP_STATES: GroupState[] = [
-  'forming', 'ready', 'pr_open', 'in_review', 'changes_requested', 'merge_guard', 'merged', 'failed',
+  'forming', 'ready', 'pr_open', 'in_review', 'changes_requested', 'merge_guard', 'merged', 'failed', 'closed',
 ];
 
 /**
@@ -64,6 +64,7 @@ const GROUP_LABEL: Record<GroupState, string> = {
   merge_guard: '合併檢查中',
   merged: '已合併',
   failed: '失敗',
+  closed: '已結案（無交付）',
 };
 
 export interface StatusInput {

@@ -1471,6 +1471,28 @@ describe('開 PR 前先問「分支上有東西嗎」', () => {
     assert.equal(got, undefined, '把交付擋在一個量測失敗上，比讓 gh 報錯更糟');
   });
 
+  it('零 commit 的群走進 closed（終態、不是錯誤、不開 stuck 交接單）', () => {
+    // failed 會開 stuck_group 單、進待處理清單、給重試鈕——而這一群按幾次都一樣。
+    // 實跑 2026-08-11（g_327e5320a9ab）：人按了四次，每次都回到同一個畫面。
+    const src = readFileSync('src/core/group-runner.ts', 'utf8')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    const i = src.indexOf('group_nothing_to_deliver');
+    assert.ok(i > 0);
+    const block = src.slice(i, i + 400);
+    assert.match(block, /updateGroupState\(group\.id, 'closed'\)/, '標成 failed 就會出現重試鈕');
+    assert.doesNotMatch(block, /'failed'/);
+    assert.doesNotMatch(block, /awaiting_human/, '這一群不需要人做決定，別叫人去看一張沒東西可按的卡');
+  });
+
+  it('closed 在每一份終態清單裡都算終態（漏一份就會被當成還在跑）', () => {
+    const files: [string, RegExp][] = [
+      ['src/core/reconciler.ts', /GROUP_TERMINAL[^=]*=\s*\[[^\]]*'closed'/],
+      ['src/pr/review-watcher.ts', /TERMINAL_GROUP_STATES[^=]*=\s*\[[^\]]*'closed'/],
+      ['src/console/server.ts', /'merged', 'failed', 'closed'/],
+    ];
+    for (const [f, re] of files) assert.match(readFileSync(f, 'utf8'), re, `${f} 的終態清單漏了 closed`);
+  });
+
   it('開 PR 那條路真的有接上這道檢查', () => {
     const src = readFileSync('src/core/group-runner.ts', 'utf8')
       .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');

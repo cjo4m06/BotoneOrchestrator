@@ -231,7 +231,7 @@ export type WatchedReviewEvent =
  * 反過來寫（列出「已經結束、不用再追」的終態）才安全：日後多一個中間狀態，
  * 預設是會被追到，而不是默默漏掉。
  */
-const TERMINAL_GROUP_STATES: GroupState[] = ['merged', 'failed'];
+const TERMINAL_GROUP_STATES: GroupState[] = ['merged', 'failed', 'closed'];
 const LIVE_GROUP_STATES: GroupState[] = (
   ['forming', 'ready', 'pr_open', 'in_review', 'changes_requested', 'merge_guard'] as GroupState[]
 ).filter((s) => !TERMINAL_GROUP_STATES.includes(s));

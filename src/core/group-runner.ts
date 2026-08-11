@@ -1061,8 +1061,13 @@ export class GroupRunner {
         log.warn({ group: group.id, branch: group.branch }, '分支零 commit → 不開 PR，直接結案交人');
         ledger.logEvent('group', group.id, 'group_nothing_to_deliver', why);
         this.notify(details, { type: 'problem', detail: why });
-        this.cards(details, 'awaiting_human', group.id);
-        ledger.updateGroupState(group.id, 'failed');
+        // **不是 awaiting_human**：這一群不需要人做任何決定，它已經有結論了
+        //（agent 的 report_no_change／report_friction 都進了帳）。標成等你處理，
+        // 人會去看一張其實不用他管的卡，然後找不到有什麼好按的。
+        this.cards(details, 'done', group.id);
+        // **closed 不是 failed**：failed 會開 stuck_group 交接單、進待處理清單、給重試鈕，
+        // 而這一群重試幾次都一樣（見 types.ts 的 GroupState）。
+        ledger.updateGroupState(group.id, 'closed');
         // worktree 可以收掉：零 commit 代表裡面沒有任何未保存的成果
         return { ok: false, keep: false, reason: why };
       }

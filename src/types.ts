@@ -7,7 +7,18 @@ export type TaskState =
 
 export type GroupState =
   | 'forming' | 'ready' | 'pr_open' | 'in_review'
-  | 'changes_requested' | 'merge_guard' | 'merged' | 'failed';
+  | 'changes_requested' | 'merge_guard' | 'merged' | 'failed'
+  /**
+   * **終態，而且不是錯誤**：這一群沒有東西要交付。
+   *
+   * 唯一來源是「群內任務都合法地結束在不需要改動」——分支上零 commit，
+   * 開 PR 必定失敗。先前這種群被標成 `failed`，於是它在畫面上跟真的壞掉一模一樣，
+   * 還附一顆按幾次都一樣的重試鈕（實跑 2026-08-11，g_327e5320a9ab：人按了四次）。
+   *
+   * 與 `merged` 的差別：**沒有產出**。所以依賴這一群的後續群不會被放行——
+   * 它們的前提（這群的成果）並不存在。
+   */
+  | 'closed';
 
 export type BlockReason = 'deps' | 'needs_clarification' | 'needs_human';
 

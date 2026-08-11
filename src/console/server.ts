@@ -361,7 +361,7 @@ export class ConsoleServer {
           }),
           waitingFor: (g.afterGroups ?? [])
             .map((id) => ({ id, state: ledger.getGroup(id)?.state }))
-            .filter((x) => x.state !== undefined && x.state !== 'merged' && x.state !== 'failed'),
+            .filter((x) => x.state !== undefined && !['merged', 'failed', 'closed'].includes(x.state)),
           sinceMs: now - g.updatedAt,
         })),
       ),

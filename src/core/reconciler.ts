@@ -193,7 +193,7 @@ export interface ReconcileReport {
 const TASK_LIMBO: TaskState[] = ['in_progress', 'verifying'];
 
 /** 群組終態：不會再有任何機器流程推進它（worktree 可進入保留期倒數）。 */
-const GROUP_TERMINAL: GroupState[] = ['merged', 'failed'];
+const GROUP_TERMINAL: GroupState[] = ['merged', 'failed', 'closed'];
 
 /** 「群內任務正在跑」的狀態：崩潰殘留，需要重排任務。 */
 const GROUP_RUNNING: GroupState[] = ['forming'];
