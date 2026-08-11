@@ -630,7 +630,11 @@ async function loadState() {
     : running.map((r) => `<div class="row"><div class="grow"><div class="title">${esc(r.title)}</div>
         <div class="meta"><code>${esc(r.id)}</code> ${esc(shortRepo(r.repo))}</div></div></div>`).join('') + waits;
 
-  const gs = s.groups.filter((x) => x.state !== 'merged');
+  // 已經結束、而且沒有東西要人做的群組不列：merged（成果進了 base）與
+  // closed（沒有東西要交付）。**failed 要留著**——它需要人決定。
+  // 先前這裡只藏 merged，於是 closed 的群永遠掛在列表上（實跑撞到）。
+  const GROUP_DONE = ['merged', 'closed'];
+  const gs = s.groups.filter((x) => !GROUP_DONE.includes(x.state));
   // 「在等誰」「已經等多久」都是**事實**（after_groups ＋ updated_at）。
   // 刻意不顯示「還要多久」——那要看 agent 寫多久、build 跑多久、人什麼時候按核准，
   // 一個都預測不了，編一個數字出來只會讓人依賴一個假的東西。

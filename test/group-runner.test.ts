@@ -1507,3 +1507,13 @@ describe('開 PR 前先問「分支上有東西嗎」', () => {
     assert.match(src, /group_nothing_to_deliver/);
   });
 });
+
+describe('控制台畫面', () => {
+  it('群組列表也要把 closed 收起來（第六份終態清單）', () => {
+  // 我第一次改 closed 時更新了五份終態清單，漏了畫面這一份，於是那一群
+  // 永遠掛在群組列表上——使用者看到的還是「它卡在那裡」。
+  const ui = readFileSync('src/console/ui.html', 'utf8');
+  assert.match(ui, /GROUP_DONE\s*=\s*\['merged', 'closed'\]/, '群組列表沒把 closed 當成已結束');
+  assert.doesNotMatch(ui, /filter\(\(x\) => x\.state !== 'merged'\)/, '只藏 merged 就會漏掉 closed');
+});
+});
