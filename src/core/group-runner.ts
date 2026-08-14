@@ -1321,6 +1321,29 @@ export class GroupRunner {
       session = r.sessionId ?? session;
 
       if (r.askedClarification) {
+        // **問題要掛在任務上，不能只 park 群組。**
+        //
+        // 畫面的「等你處理」只讀 handoffs（見 core/pending.ts 的 collectPending），
+        // 而 parkGroup 只寫事件＋改狀態、不開單。先前這條路 park 的群組因此
+        // **完全看不見也答不了**：狀態是 changes_requested、問題全文躺在一筆群組事件裡，
+        // 而清單是空的（實跑 2026-08-14，g_dea636a3c852，停了 40 分鐘沒人看得到）。
+        //
+        // 不是在這裡自己開一張單——`ledger.setBlock` 本身就會開（ledger.ts 的
+        // openBlockHandoff：「停手與說話是同一個寫入動作」）。走它才會接上整條既有的路：
+        //   setBlock → 開 clarification 單 → 出現在清單 → 人回答 → handleAnswer
+        //   → clearBlock 回 queued → shouldRequeueGroup 成立 → 群組恢復派工
+        //
+        // 只 park 不 block 還有第二個死結：shouldRequeueGroup 要求「有任務不是 done」，
+        // 而重做時任務全部是 done ⇒ 就算人有辦法回答，群組也永遠不會被重新派工。
+        //
+        // 掛在 details[0]：重做用的就是它（見 reworkTaskOf）。
+        const head = details[0];
+        if (head) {
+          ledger.setBlock(head.id, 'needs_clarification', r.askedClarification.question);
+          // 問題原文另外存一份：clearBlock 會抹掉 block_detail，少了這筆，
+          // 續跑時 agent 只讀得到答案、讀不到自己問過什麼（與 worker.ts 同一個理由）。
+          ledger.logEvent('task', head.id, 'clarification_asked', JSON.stringify(r.askedClarification));
+        }
         return this.parkGroup(group, details, `重做時提出不可逆歧義，等人回覆：${r.askedClarification.question}`);
       }
       if (r.reportedNoChange) {

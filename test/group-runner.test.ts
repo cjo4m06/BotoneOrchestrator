@@ -1143,6 +1143,51 @@ describe('GroupRunner — 合併決策 / PR 敘事 / 合併後 revert / worktree
     assert.ok(h.notifier.events.some((e) => e.type === 'problem' && e.detail.includes('無需改動')));
   });
 
+  /**
+   * 實跑（2026-08-14，g_dea636a3c852）：重做時 agent 提問，群組 park 了、狀態也改了，
+   * 但**畫面上什麼都沒有**——「等你處理」只讀 handoffs，而 parkGroup 只寫事件＋改狀態。
+   * 問題全文躺在一筆群組事件裡，人看不到也答不了，群組停了 40 分鐘。
+   *
+   * 而且就算人有辦法回答也沒用：shouldRequeueGroup 要求「有任務不是 done」，
+   * 重做時任務全是 done ⇒ 群組永遠不會被重新派工。兩個死結都靠 setBlock 解開。
+   */
+  it('rework 時 agent 提問 → 任務要真的 blocked，清單上看得到（只 park 群組等於沒人看得到）', async () => {
+    const group = seedGroup(['已完成的任務']);
+    tmp.ledger.updateTaskState('T-1', 'done');
+    const agent: AgentLike = {
+      async iterate(): Promise<IterateResult> {
+        return {
+          sessionId: 's',
+          resultText: '',
+          isError: false,
+          toolCalls: {},
+          askedClarification: { question: '守衛的紅燈不是我造成的，要我怎麼處理？', rationale: '不可逆' },
+        };
+      },
+    };
+    const h = build({ agent, feedback: fakeFeedback(reviewFeedback(group.id, ['@bob: 請修'])) });
+
+    await h.runner.run(group);
+
+    const t = tmp.ledger.getTask('T-1');
+    assert.equal(t?.state, 'blocked', '只 park 群組、任務留在 done ⇒ 畫面空的、也永遠不會重新派工');
+    assert.equal(t?.block?.reason, 'needs_clarification');
+    assert.match(t?.block?.detail ?? '', /要我怎麼處理/);
+
+    // 這才是使用者看得到的東西：setBlock 會連帶開一張 clarification 單
+    const pending = tmp.ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true })
+      .filter((x) => x.kind === 'clarification');
+    assert.equal(pending.length, 1, '沒有單 ⇒ 控制台的「等你處理」是空的');
+    assert.match(pending[0]!.body, /要我怎麼處理/);
+
+    // 問題原文要另存一份：clearBlock 會抹掉 block_detail
+    assert.ok(tmp.ledger.listEvents({ scope: 'task', kind: 'clarification_asked', limit: 5 }).length > 0);
+
+    // 人回答之後群組才動得了：任務回 queued → shouldRequeueGroup 成立
+    assert.equal(shouldRequeueGroup({ state: 'changes_requested' }, [{ state: 'blocked' }]), false);
+    assert.equal(shouldRequeueGroup({ state: 'changes_requested' }, [{ state: 'queued' }]), true);
+  });
+
   it('意見還沒真的送達（agent 執行錯誤）→ 不清掉暫存，下一輪才能再回灌', async () => {
     const group = seedGroup(['已完成的任務']);
     tmp.ledger.updateTaskState('T-1', 'done');
