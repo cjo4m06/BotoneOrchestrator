@@ -1533,9 +1533,13 @@ describe('開 PR 前先問「分支上有東西嗎」', () => {
     const files: [string, RegExp][] = [
       ['src/core/reconciler.ts', /GROUP_TERMINAL[^=]*=\s*\[[^\]]*'closed'/],
       ['src/pr/review-watcher.ts', /TERMINAL_GROUP_STATES[^=]*=\s*\[[^\]]*'closed'/],
-      ['src/console/server.ts', /'merged', 'failed', 'closed'/],
     ];
     for (const [f, re] of files) assert.match(readFileSync(f, 'utf8'), re, `${f} 的終態清單漏了 closed`);
+    // console/server.ts 先前也列在這裡，但那一行是 **waitingFor 的過濾**、不是終態清單。
+    // 兩件事被混在一起：closed 對 reconciler 而言是「結束了、可以清 worktree」，
+    // 對下游群組而言卻**還在擋人**（Dispatcher 的已結束只認 merged）。
+    // 把它從 waitingFor 濾掉 ⇒ 人看到「排隊中」卻不知道在等一個不會動的東西（2026-08-17 實跑）。
+    // 那條的守門測試在 cli-ask.test.ts。
   });
 
   it('開 PR 那條路真的有接上這道檢查', () => {

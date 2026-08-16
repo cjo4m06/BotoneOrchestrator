@@ -640,7 +640,14 @@ async function loadState() {
   // 一個都預測不了，編一個數字出來只會讓人依賴一個假的東西。
   const waitNote = (x) => {
     if (!x.waitingFor?.length) return '';
+    // closed / failed 的上游**永遠不會進 base**——那不是排隊，是死等。要講清楚，
+    // 否則人看到的是一列正常的「排隊中」，而它會一直排下去（實跑：兩個上游卡了 53 小時）
+    const DEAD = ['closed', 'failed'];
+    const dead = x.waitingFor.filter((w) => DEAD.includes(w.state));
     const who = x.waitingFor.map((w) => `<code>${esc(w.id)}</code>（${esc(w.state)}）`).join('、');
+    if (dead.length) {
+      return `<div class="meta bad">⚠ 等 ${who} 進 base，但它<b>不會再動</b>（${esc(dead.map((w) => w.state).join('／'))}）——要嘛處理掉那一群，要嘛解除依賴</div>`;
+    }
     return `<div class="meta">排隊中 · 等 ${who} 進 base</div>`;
   };
   const taskList = (x) => (x.tasks ?? [])

@@ -361,7 +361,10 @@ export class ConsoleServer {
           }),
           waitingFor: (g.afterGroups ?? [])
             .map((id) => ({ id, state: ledger.getGroup(id)?.state }))
-            .filter((x) => x.state !== undefined && !['merged', 'failed', 'closed'].includes(x.state)),
+            // **只濾掉 merged。** closed 與 failed 仍然在擋下游（Dispatcher 的「已結束」
+            // 只認 merged），把它們濾掉等於讓人看到「排隊中」卻不知道在等一個永遠不會動的東西
+            // ——實跑：五個 ready 群等兩個死掉的上游，畫面上完全看不出來。
+            .filter((x) => x.state !== undefined && x.state !== 'merged'),
           sinceMs: now - g.updatedAt,
         })),
       ),

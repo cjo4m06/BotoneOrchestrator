@@ -1,5 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import type { GroupState } from '../src/types.js';
 import {
   buildCompleteTask,
   collectPending,
@@ -251,7 +253,7 @@ describe('CLI ask — 本機互動入口', () => {
    * 「等你處理」是空的——上面那個「一律要浮出來」的修正只套用到 failed。
    */
   describe('停在 failed 以外的狀態、但已經交人的群組也要浮出來', () => {
-    function stoppedGroup(id: string, taskId: string, state: 'changes_requested' | 'pr_open' | 'merge_guard') {
+    function stoppedGroup(id: string, taskId: string, state: GroupState) {
       seedTask(taskId, '某任務');
       const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: [taskId], footprint: [] });
       tmp.ledger.updateGroupState(g.id, state);
@@ -290,20 +292,76 @@ describe('CLI ask — 本機互動入口', () => {
     // **這一條驗的是最後一道防線。**
     // 前面每一條都假設「產生端記得開單」。萬一某條路徑忘了，症狀與「真的沒事」
     // 完全一樣——所以要有一道反向檢查主動把它撈出來。
+    /**
+     * ── 自檢的判準是**不變式**，不是事件白名單（2026-08-17 改）──
+     *
+     * 舊版要求「群組留下過四種停手事件之一」。實跑打臉三次：
+     * group_parked／base_moved／merge_deferred／group_nothing_to_deliver 都不在白名單裡，
+     * 而它們全都會讓群組永久停住。事件白名單跟狀態白名單一樣，漏一項就是一次靜默。
+     *
+     * 現在的判準是：**非終態 ＋ 沒有未消化的 human 單 ＋ 一段時間沒有任何動靜**。
+     */
+    const STALE = 31 * 60_000; // 超過 SELF_CHECK_STALE_MS
+
     it('產生端忘了開單 → 自檢仍要把它撈出來（不會悄悄消失）', () => {
       const gid = stoppedGroup('g-forgot', 'T-forgot', 'changes_requested');
-      // 只留停手的事件、故意不開單（模擬某條路徑漏接）
-      tmp.ledger.logEvent('group', gid, 'requeue_exhausted', '已重試 3 次');
-
-      const stuck = collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group');
+      // 故意不開單、也不留任何事件（模擬某條路徑漏接）
+      const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
 
       assert.equal(stuck.length, 1, '漏接的路徑必須被自檢接住');
+      assert.equal(stuck[0]!.id, gid);
       assert.match(stuck[0]!.detail, /說不出它在等什麼/, '要明講這是系統的漏接，而不是假裝知道原因');
     });
 
-    it('沒有交人事件的 changes_requested 群組不要列（它還在正常流程裡）', () => {
+    it('還在動的群組不要吵（剛剛才有狀態變動）', () => {
       stoppedGroup('g-f', 'T-F', 'changes_requested');
       assert.deepEqual(collectPending(tmp.ledger).filter((i) => i.kind === 'stuck_group'), []);
+    });
+
+    /**
+     * **這一條是這次事故的核心。**
+     *
+     * 每個任務交出非空總結都會替群組開一張 `kind:'delivery'`、`toRole:'coder'` 的單，
+     * 而全 repo 沒有任何地方消化 delivery。舊版的自檢查的是「有沒有未消化的單」
+     * 而**沒有限定 toRole** ⇒ 只要這一群跑過一個任務，這道網就永遠 continue。
+     * 實跑：g_86224a8df710 停了 53 小時，有 requeue_exhausted、照設計該被撈回來，
+     * 卻被自己的交付說明擋在門外。
+     */
+    it('給 coder 的單（delivery）不算「有人在處理」——它擋不住自檢', () => {
+      const gid = stoppedGroup('g-delivery', 'T-delivery', 'changes_requested');
+      tmp.ledger.openHandoff({
+        groupId: gid, fromRole: 'coder', toRole: 'coder', kind: 'delivery',
+        blocking: false, title: '交付說明', body: '我做了什麼',
+      });
+
+      const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
+      assert.equal(stuck.length, 1, '非人的單不代表人看得到東西');
+    });
+
+    it('已經有未消化的 human 單 → 不重複列', () => {
+      const gid = stoppedGroup('g-has', 'T-has', 'changes_requested');
+      openStuckGroupHandoff(tmp.ledger, createSilentLogger(), { groupId: gid, repo: 'o/r', why: '停手了' });
+
+      const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
+      assert.equal(stuck.length, 1, '應該只有那張真的單，不是自檢又補一張');
+      assert.match(stuck[0]!.detail, /停手了/);
+    });
+
+    /**
+     * 舊版只掃 changes_requested / failed / merge_guard（＝重試鈕認得的三個）。
+     * 而 forming / ready / pr_open 全都有實跑卡住的案例——它們看起來像在跑，其實沒人會再碰。
+     */
+    for (const st of ['forming', 'ready', 'pr_open', 'in_review', 'merge_guard'] as const) {
+      it(`停在 ${st} 又沒動靜 → 也要撈出來（舊版只掃三個狀態）`, () => {
+        stoppedGroup(`g-${st}`, `T-${st}`, st);
+        const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
+        assert.equal(stuck.length, 1, `${st} 卡住時人一樣看不到，不能不掃`);
+      });
+    }
+
+    it('merged / closed 不掃——那是真的結束了', () => {
+      for (const st of ['merged', 'closed'] as const) stoppedGroup(`g-done-${st}`, `T-done-${st}`, st);
+      assert.deepEqual(collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group'), []);
     });
 
     it('同一群同時是 failed 又有交人事件 → 只列一次', () => {
@@ -811,5 +869,27 @@ describe('buildCompleteTask — stdio 任務板要連得上', () => {
       t.cleanup();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('等你處理的清單：死掉的上游要看得見', () => {
+  /**
+   * 實跑（2026-08-17）：五個 ready 群組的 waitingFor 全指向兩個永遠不會動的上游，
+   * 5 個 queued 任務零進度，而畫面顯示的是一列正常的「排隊中」——
+   * 因為 console/server.ts 把 merged/failed/closed 三種上游一起濾掉了。
+   * merged 該濾（真的進 base 了），另外兩種**還在擋人**，濾掉就是把死等偽裝成排隊。
+   */
+  it('server 只濾掉 merged，closed／failed 的上游要留在 waitingFor 裡', () => {
+    const src = readFileSync('src/console/server.ts', 'utf8')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.match(src, /x\.state !== 'merged'/, 'waitingFor 的過濾條件變了');
+    assert.doesNotMatch(src, /\['merged', 'failed', 'closed'\]\.includes\(x\.state\)/,
+      '把 closed/failed 濾掉 ⇒ 人看不出自己在等一個不會動的東西');
+  });
+
+  it('畫面要把「不會再動的上游」標出來，不是顯示成排隊中', () => {
+    const ui = readFileSync('src/console/ui.html', 'utf8');
+    assert.match(ui, /不會再動/, '死等與排隊在畫面上長得一樣，人就不會去處理');
+    assert.match(ui, /DEAD = \['closed', 'failed'\]/);
   });
 });

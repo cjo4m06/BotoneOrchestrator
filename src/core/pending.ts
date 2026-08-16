@@ -93,7 +93,7 @@ export interface AskLedger {
  * 這一道刻意不精準（它說的是「我說不出這一群在等什麼」），但它保證
  * **不會有東西悄悄消失**。
  */
-export function collectPending(ledger: AskLedger): PendingItem[] {
+export function collectPending(ledger: AskLedger, now: number = Date.now()): PendingItem[] {
   const items: PendingItem[] = [];
 
   for (const h of ledger.listHandoffs({ toRole: 'human', unconsumedOnly: true })) {
@@ -137,29 +137,69 @@ export function collectPending(ledger: AskLedger): PendingItem[] {
     });
   }
 
-  // 正向自檢：停在非終態、又沒有任何未結案交接單的群組。
-  // 這一道抓的是「某條路徑忘了開單」——症狀與「真的沒事」完全一樣，
-  // 所以必須由程式主動找出來，而不是等人發現。
+  // ── 反向自檢：執行那條不變式 ──
+  //
+  // **不變式**：一個群組只要不是終態，系統就還欠它一個結果。所以它這一輪要嘛有推進，
+  // 要嘛在 ledger 留下一張未消化的 `toRole:'human'` 單。log.warn／warnOnce／logEvent／
+  // Slack 一次性推播**一律不算數**——那些人在畫面上看不到。
+  //
+  // ── 這一道先前形同虛設（2026-08-17 稽核，23 條無聲死路）──
+  //
+  // 三重收窄，任何一個都足以讓它永遠不觸發：
+  //
+  // ① `listHandoffs` **沒有 toRole 條件**。每個任務交出非空總結都會替群組開一張
+  //    `kind:'delivery'`、`toRole:'coder'` 的單（group-runner 的交付說明），
+  //    而全 repo 沒有任何地方消化 delivery。⇒ **只要這一群跑過一個任務，這道網就永遠 continue。**
+  //    已知實例：g_86224a8df710 停了 53 小時，有 requeue_exhausted 事件、照設計該被撈回來，
+  //    卻被自己的交付說明擋在門外。
+  //
+  // ② 事件白名單只認四種 kind。group_parked／base_moved／merge_deferred／
+  //    merge_needs_human／group_nothing_to_deliver 全部不算「停手」。
+  //
+  // ③ 狀態白名單只有三個（＝重試鈕認得的那三個）。forming／ready／pr_open 一律不掃，
+  //    而那三個正好是「看起來像在跑、其實沒人會再碰它」的狀態。
+  //
+  // 現在三個都拿掉，改成不變式本身：**非終態 ＋ 沒有未消化的 human 單 ＋ 一段時間沒有任何動靜**。
+  // 「沒有動靜」用群組與其任務的 updatedAt 取最大值判斷——那是機械事實，不是猜測：
+  // 真的在跑的群，任務狀態每幾分鐘就會變一次（claimed → in_progress → verifying → done）。
   const seen = new Set(items.map((i) => i.id));
   for (const st of SELF_CHECK_STATES) {
     for (const g of ledger.listGroupsByState(st)) {
       if (seen.has(g.id)) continue;
-      if (ledger.listHandoffs({ groupId: g.id, unconsumedOnly: true, limit: 1 }).length > 0) continue;
-      if (!hasStopSignal(ledger, g.id)) continue;
+      // **一定要限定 toRole='human'**：非人的單（delivery／review_feedback 給 coder 的那些）
+      // 不代表人看得到東西，拿它們當「已經有人在處理」是這道網先前失效的直接原因。
+      if (ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) continue;
+      const idleMs = now - lastTouchedAt(ledger, g);
+      if (idleMs < SELF_CHECK_STALE_MS) continue; // 還在動，不要吵
       items.push({
         kind: 'stuck_group',
         id: g.id,
         title: `群組 ${g.id}`,
         repo: g.repo,
         detail:
-          `這一群停在 ${g.state} 而且沒有在跑，但系統說不出它在等什麼——` +
-          '這代表某條停手路徑忘了開交接單。成果保留著，請看 log 或按重試。',
+          `這一群停在 ${g.state}、已經 ${Math.round(idleMs / 60_000)} 分鐘沒有任何動靜，` +
+          '而系統說不出它在等什麼——這代表某條停手路徑忘了開交接單。成果保留著，請看 log 或按重試。',
         actions: ['retry'],
       });
     }
   }
 
   return items;
+}
+
+/**
+ * 這一群最後一次有動靜是什麼時候（群組本身與其任務的 updatedAt 取大者）。
+ *
+ * 為什麼不用事件時間：事件是「有人主動記了一筆」，而這道網要抓的正是**沒有人記**的情況。
+ * updatedAt 是每次狀態寫入都會動的機械欄位，漏不掉。
+ */
+function lastTouchedAt(ledger: AskLedger, g: Group): number {
+  let last = g.updatedAt;
+  for (const id of g.taskIds) {
+    const t = ledger.getTask?.(id);
+    if (t && t.updatedAt > last) last = t.updatedAt;
+  }
+  return last;
 }
 
 /**
@@ -211,14 +251,28 @@ function clarificationExtras(ledger: AskLedger, taskId: string | undefined): { s
   return {};
 }
 
-const SELF_CHECK_STATES: readonly Group['state'][] = STUCK_GROUP_STATES;
+/**
+ * 自檢要掃哪些狀態：**除了真的結束的以外，全部**。
+ *
+ * 先前是 `STUCK_GROUP_STATES`（重試鈕認得的那三個），而那份清單的用途是
+ *「哪些狀態按得動重試」——拿它來當「哪些狀態可能卡住」是兩件事混用。
+ * forming／ready／pr_open 都會卡（實跑各有實例），而它們一個都不在那份清單裡。
+ *
+ * `merged` / `closed` 是真的結束了（有產出／沒有東西要交付），不必再問人。
+ * `failed` **要留著**：它是終態，但語意是「等人決定」，單被消化掉之後照樣得撈回來。
+ */
+const SELF_CHECK_STATES: readonly Group['state'][] = [
+  'forming', 'ready', 'pr_open', 'in_review', 'changes_requested', 'merge_guard', 'failed',
+];
 
-/** 這一群留下過「停手交人」的痕跡嗎（事件層，與交接單獨立）。 */
-function hasStopSignal(ledger: AskLedger, groupId: string): boolean {
-  return ['requeue_exhausted', 'reconcile_needs_human', 'group_failed', 'merge_guard_blocked'].some(
-    (k) => ledger.latestEvent?.('group', groupId, k),
-  );
-}
+/**
+ * 多久沒有任何動靜就算「這一輪沒推進」。
+ *
+ * 30 分鐘：正常在跑的群每幾分鐘就有任務狀態變動；而最慢的單一步驟是
+ * 合併守衛跑完整測試套件（實測 15-25 分鐘），所以門檻要蓋得過它，否則會把正在驗的群誤報成卡住。
+ */
+export const SELF_CHECK_STALE_MS = 30 * 60_000;
+
 
 /** 後面還有幾群等著它進 base。空的就完全不提，不要多出一句沒資訊的話。 */
 function waitingSuffix(waiting: string[] | undefined): string {
