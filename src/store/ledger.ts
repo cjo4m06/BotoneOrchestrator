@@ -937,6 +937,19 @@ export class Ledger {
    * 從稽核軌跡撈回來，而不是隨程序記憶體一起蒸發（群組因此不會永遠卡住）。
    * 以 id 遞減取最新：同毫秒寫入時 created_at 會相同，只有自增 id 能保證「最後寫的贏」。
    */
+  /**
+   * 有哪些群組在等這一群進 base（它們的 after_groups 含這個 id）。
+   *
+   * 給待處理清單用：一個永遠不會 merged 的群（closed）擋著別人時，
+   * 要講得出「它擋住了誰」——否則人只看到一則「這一群結案了」，不知道那是別人卡住的原因。
+   */
+  listGroupsBlockedBy(groupId: string): string[] {
+    return (this.db
+      .prepare(`SELECT id FROM groups WHERE state NOT IN ('merged','closed','failed') AND after_groups LIKE ?`)
+      .all(`%"${groupId}"%`) as { id: string }[])
+      .map((r) => r.id);
+  }
+
   latestEvent(scope: EventScope, refId: string | null, kind: string): LedgerEvent | undefined {
     const row = this.db
       .prepare('SELECT * FROM events WHERE scope = ? AND ref_id IS ? AND kind = ? ORDER BY id DESC LIMIT 1')

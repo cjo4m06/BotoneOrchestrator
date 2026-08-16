@@ -359,6 +359,61 @@ describe('CLI ask — 本機互動入口', () => {
       });
     }
 
+    /**
+     * **在等前面的群 ＝ 排隊，不是卡住。**
+     *
+     * 壞掉的是上游，處理下游一百次也等不到。先前這道自檢把下游也列出來，
+     * 而且給了一顆按不動的重試鈕（reviveGroup 只認 changes_requested/failed/merge_guard）
+     * ——方向反了，而且製造了正是這整串在修的「按了什麼都不會發生」。
+     */
+    it('在等還沒進 base 的上游 → 不列（那是排隊）', () => {
+      const up = stoppedGroup('g-up', 'T-up', 'changes_requested');
+      seedTask('T-down', '下游任務');
+      const down = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b2', taskIds: ['T-down'], footprint: [], afterGroups: [up] });
+
+      const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
+      assert.equal(stuck.some((i) => i.id === down.id), false, '下游在排隊，不該被當成卡住');
+      assert.equal(stuck.some((i) => i.id === up), true, '真正卡住的是上游');
+    });
+
+    /**
+     * 但上游若是 closed（永遠不會 merged），下游就是**死等**——
+     * 這件事要以**上游**的名義講出來，因為要處理的是它。
+     */
+    it('上游是 closed 又擋著人 → 以上游的名義列出來，並說出擋住誰', () => {
+      const up = stoppedGroup('g-closed-up', 'T-cu', 'closed');
+      seedTask('T-d2', '下游任務');
+      const down = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b3', taskIds: ['T-d2'], footprint: [], afterGroups: [up] });
+
+      const stuck = collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group');
+      const item = stuck.find((i) => i.id === up);
+      assert.ok(item, 'closed 但擋著別人 → 必須看得見');
+      assert.match(item.detail, new RegExp(down.id), '要說出擋住的是誰');
+      assert.deepEqual(item.actions, [], '沒有可按的動作就不要給按鈕');
+      assert.equal(stuck.some((i) => i.id === down.id), false, '下游不列');
+    });
+
+    it('按不動的狀態不給重試鈕（給了就是「按了什麼都不會發生」）', () => {
+      // reviveGroup 只認 changes_requested / failed / merge_guard；forming 按下去必定回
+      // 「無法復活這個群組」。沒有可按的動作就不要給按鈕。
+      stoppedGroup('g-forming-alone', 'T-fa', 'forming');
+      const item = collectPending(tmp.ledger, Date.now() + STALE).find((i) => i.kind === 'stuck_group');
+      assert.ok(item, 'forming 卡住又沒在等人 → 要看得見');
+      assert.deepEqual(item.actions, [], 'forming 按不動重試');
+      assert.match(item.detail, /按不了重試/);
+    });
+
+    it('停手中的狀態才給重試鈕', () => {
+      stoppedGroup('g-cr-alone', 'T-cra', 'changes_requested');
+      const item = collectPending(tmp.ledger, Date.now() + STALE).find((i) => i.kind === 'stuck_group');
+      assert.deepEqual(item?.actions, ['retry']);
+    });
+
+    it('closed 但沒擋到任何人 → 不列（沒資訊的訊息就是雜訊）', () => {
+      stoppedGroup('g-closed-alone', 'T-ca', 'closed');
+      assert.deepEqual(collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group'), []);
+    });
+
     it('merged / closed 不掃——那是真的結束了', () => {
       for (const st of ['merged', 'closed'] as const) stoppedGroup(`g-done-${st}`, `T-done-${st}`, st);
       assert.deepEqual(collectPending(tmp.ledger, Date.now() + STALE).filter((i) => i.kind === 'stuck_group'), []);

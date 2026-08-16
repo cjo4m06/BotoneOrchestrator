@@ -2,7 +2,7 @@ import { NO_CHANGE_BLOCK_PREFIX, RECLAIM_BLOCK_PREFIX } from '../notify/notifier
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Group, Task } from '../types.js';
 import type { HandoffRow } from '../store/ledger.js';
-import { STUCK_GROUP_STATES, HANDOFF_ACTIONS } from './handoff.js';
+import { STUCK_GROUP_STATES, HANDOFF_ACTIONS, isStuckGroupState } from './handoff.js';
 
 /**
  * 「有哪些事在等人」的唯一定義。
@@ -70,6 +70,8 @@ export interface AskLedger {
   getTask?(id: string): Task | undefined;
   getGroup?(id: string): Group | undefined;
   latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
+  /** 有哪些群組的 afterGroups 指向這一群（＝在等它進 base）。未實作 → 退化成不列。 */
+  listGroupsBlockedBy?(groupId: string): string[];
 }
 
 /**
@@ -171,20 +173,64 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
       if (ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) continue;
       const idleMs = now - lastTouchedAt(ledger, g);
       if (idleMs < SELF_CHECK_STALE_MS) continue; // 還在動，不要吵
+      // **在等前面的群 ＝ 正常排隊，不是卡住。**
+      //
+      // 這種群組沒有任何事情要人做：前面動了它就動。列出來只會多一顆按不動的鈕
+      // ——而且方向是反的，壞掉的是上游，處理下游一百次也等不到。
+      // 所以有未完成上游的一律跳過；真正該被看見的是**上游自己**（它會以自己的名義出現）。
+      if (unfinishedUpstream(ledger, g).length > 0) continue;
+
+      const canRetry = isStuckGroupState(g.state);
       items.push({
         kind: 'stuck_group',
         id: g.id,
         title: `群組 ${g.id}`,
         repo: g.repo,
         detail:
-          `這一群停在 ${g.state}、已經 ${Math.round(idleMs / 60_000)} 分鐘沒有任何動靜，` +
-          '而系統說不出它在等什麼——這代表某條停手路徑忘了開交接單。成果保留著，請看 log 或按重試。',
-        actions: ['retry'],
+          `這一群停在 ${g.state}、已經 ${Math.round(idleMs / 60_000)} 分鐘沒有任何動靜，`
+          + '而且沒有在等任何人——系統說不出它在等什麼，這代表某條停手路徑忘了開交接單。'
+          + (canRetry ? '成果保留著，可以按重試。' : `（${g.state} 按不了重試，重試只對停手中的群組有效。）`),
+        ...(canRetry ? { actions: ['retry'] } : { actions: [] }),
       });
     }
   }
 
+  // ── 擋住別人的死上游：以**上游自己**的名義出現一次 ──
+  //
+  // `closed`（沒有東西要交付）是終態，永遠不會變 merged，而 Dispatcher 的「已結束」只認 merged
+  // ⇒ 等它的群組會永遠排下去。這件事必須以上游的名義講出來，因為要處理的是它：
+  // 要嘛解除那幾群的依賴，要嘛承認那條線就到這裡為止。
+  // （`failed` 不用在這裡處理——它自己就會開 stuck_group 單。）
+  for (const g of ledger.listGroupsByState('closed')) {
+    if (seen.has(g.id)) continue;
+    const blocked = ledger.listGroupsBlockedBy?.(g.id) ?? [];
+    if (blocked.length === 0) continue; // 沒擋到人就沒事，不要多一則沒資訊的訊息
+    if (ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) continue;
+    items.push({
+      kind: 'stuck_group',
+      id: g.id,
+      title: `群組 ${g.id}（已結案，但擋著 ${blocked.length} 群）`,
+      repo: g.repo,
+      detail:
+        `這一群沒有東西要交付（分支零 commit）所以結案了，但它永遠不會進 base，`
+        + `而下面這 ${blocked.length} 群在等它：${blocked.join('、')}。`
+        + '它們會一直排下去——請解除那幾群的依賴，或確認那條線就到這裡為止。',
+      actions: [],
+    });
+  }
+
   return items;
+}
+
+/**
+ * 這一群在等哪些還沒進 base 的上游。
+ *
+ * 「已結束」的判準與 Dispatcher 一致：**只有 merged 算進了 base**。
+ * closed / failed 的上游雖然是終態，但它們永遠不會 merged ⇒ 對下游而言仍然是「還在等」，
+ * 而那正是死等的來源（所以那種情況要以**上游**的名義開一則，不是在下游身上開）。
+ */
+function unfinishedUpstream(ledger: AskLedger, g: Group): string[] {
+  return (g.afterGroups ?? []).filter((id) => ledger.getGroup?.(id)?.state !== 'merged');
 }
 
 /**
