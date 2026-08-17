@@ -702,7 +702,7 @@ function pendingRow(p, canDecide) {
     // 這顆按鈕是人表態「我知道，照樣上」的唯一出口——按下去理由會留在 PR 內文與 ledger。
     'land-anyway': ['照樣落地', 'danger'],
     approve: ['核准合併', 'primary'],
-    deny: ['退回', ''],
+    deny: ['退回', '', '要改什麼？（會原封不動交給 agent 重做；留空＝只是先停下來，沒有人會自動動它）'],
   };
   // 後端對 clarification 給的是 ['<你的答案>','--default','abort']（那是 CLI 的說法），
   // 畫面上只需要一顆「回答」。其餘 kind 的 actions 已經是動作碼。
@@ -714,7 +714,7 @@ function pendingRow(p, canDecide) {
     for (const a of acts) {
       const spec = ACT[a];
       if (!spec) continue; // 不認得的動作碼寧可不畫，也不要畫一顆按了會失敗的鈕
-      buttons.push(btn(spec[0], `${a}:${p.id}`, spec[1]));
+      buttons.push(btn(spec[0], `${a}:${p.id}`, spec[1], spec[2]));
     }
   }
   return `<div class="row"><div class="grow">
@@ -722,7 +722,8 @@ function pendingRow(p, canDecide) {
     <div class="meta">${esc(shortRepo(p.repo))} · ${esc(p.detail)}</div>
   </div>${buttons.join('')}</div>`;
 }
-const btn = (label, act, cls = '') => `<button class="btn ${cls}" data-act="${esc(act)}">${esc(label)}</button>`;
+const btn = (label, act, cls = '', ask = '') =>
+  `<button class="btn ${cls}" data-act="${esc(act)}"${ask ? ` data-ask="${esc(ask)}"` : ''}>${esc(label)}</button>`;
 
 document.addEventListener('click', async (ev) => {
   const el = ev.target.closest('button[data-act]');
@@ -742,6 +743,12 @@ document.addEventListener('click', async (ev) => {
   if (action === 'land-anyway') {
     text = prompt('你要帶著一個已知的紅落地。請說明為什麼它不是這一群造成的（會記進 PR 內文與 ledger）：');
     if (text === null || text.trim() === '') return;
+  }
+  // 按鈕自己帶提問（data-ask）——例如「退回」要問「要改什麼」。
+  // 取消＝不送出；留空是合法的（＝只是先停下來），後端會據此開一張說明用的單。
+  if (!text && el.dataset.ask) {
+    text = prompt(el.dataset.ask);
+    if (text === null) return;
   }
   el.disabled = true;
   try {

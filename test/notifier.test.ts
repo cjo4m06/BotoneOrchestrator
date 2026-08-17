@@ -470,12 +470,56 @@ describe('requestNoChangeConfirmation — 通知端能力偵測', () => {
 });
 
 describe('InboundRouter — 合併裁決', () => {
+  /**
+   * approve 一直有守門（park 中的群不可核准），reject 先前完全沒有。
+   * 於是 Slack 上一則**舊訊息**的「退回」會把已經 merged 的群拉回 changes_requested——
+   * 而那是一個沒有出口的狀態（任務全 done、有 PR、無意見 → 每輪 warnOnce 然後跳過）。
+   */
+  it('退回也要守門：已經 merged 的群不可以被舊訊息拉回來', () => {
+    const tmp = createTmpLedger();
+    try {
+      const g = tmp.ledger.createGroup({ repo: 'acme/web', branch: 'b', taskIds: ['T-1'], footprint: [] });
+      tmp.ledger.updateGroupState(g.id, 'merged');
+      const router = new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() });
+
+      router.handleMergeDecision({ groupId: g.id, approved: false, userId: 'U1' });
+
+      assert.equal(tmp.ledger.getGroup(g.id)?.state, 'merged', '已經合併的群不該被退回');
+      assert.ok(tmp.ledger.listEvents({ scope: 'group', refId: g.id, kind: 'merge_reject_ignored_state' }).length > 0);
+    } finally { tmp.cleanup(); }
+  });
+
+  /**
+   * 沒有意見的退回是合法的（「先停下來」），但它會掉進一個沒有出口的狀態：
+   * 任務全 done ＋ 有 PR ＋ 沒有可回灌的意見 ⇒ orchestrator 每輪只 warnOnce 然後跳過。
+   * 而控制台的退回鈕先前**結構上帶不了理由**，所以每一次從控制台退回都必定走這條。
+   */
+  it('沒附理由的退回 → 開一張單（而且不給「照樣落地」，這裡沒有紅燈可放行）', () => {
+    const tmp = createTmpLedger();
+    try {
+      const g = tmp.ledger.createGroup({ repo: 'acme/web', branch: 'b', taskIds: ['T-1'], footprint: [] });
+      tmp.ledger.updateGroupState(g.id, 'in_review');
+      const router = new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() });
+
+      router.handleMergeDecision({ groupId: g.id, approved: false, userId: 'U1' });
+
+      const hs = tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true });
+      assert.equal(hs.length, 1, '沒有單 ⇒ 這一群從此沒有人會動它，而畫面上什麼都沒有');
+      assert.match(hs[0]!.body, /沒有留下要改什麼/);
+      assert.deepEqual(hs[0]!.options, ['retry'], '這個情境沒有紅燈，不該出現「照樣落地」');
+    } finally { tmp.cleanup(); }
+  });
+
   it('核准 → merge_guard；退回 → changes_requested', () => {
     const tmp = createTmpLedger();
     try {
       const g1 = tmp.ledger.createGroup({ repo: 'acme/web', branch: 'b1', taskIds: ['T-1'], footprint: [] });
       const g2 = tmp.ledger.createGroup({ repo: 'acme/web', branch: 'b2', taskIds: ['T-2'], footprint: [] });
       const router = new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() });
+
+      // 退回現在有狀態守門（見 handleMergeDecision）：只有在等審查／等合併的群才退得回去。
+      // 剛建好的群是 forming，那不是「等你裁決」的狀態。
+      tmp.ledger.updateGroupState(g2.id, 'in_review');
 
       router.handleMergeDecision({ groupId: g1.id, approved: true, userId: 'U1' });
       router.handleMergeDecision({ groupId: g2.id, approved: false, userId: 'U1' });

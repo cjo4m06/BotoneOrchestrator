@@ -279,6 +279,14 @@ const IN_FLIGHT_GROUP_STATES: GroupState[] = ['forming', 'ready', 'merge_guard']
  * park 的稽核事件（等人回覆／等人裁決）。orchestrator 靠它與下面的 deps 事件**分辨這次 park 的原因**
  * ——兩者都停在 PARKED_GROUP_STATE，狀態本身分不出來（比事件 id 誰新即可）。
  */
+/**
+ * 「這一群需要重跑一次合併守衛」。
+ *
+ * 與 park 的差別：park 是「要人決定」，這個是「系統自己該再跑一次」——
+ * base 被外部動過就屬於後者，沒有東西要人裁決。requeue 認得這筆事件就會把群組送回 ready。
+ */
+export const GROUP_RERUN_REQUESTED_EVENT = 'group_rerun_requested';
+
 export const GROUP_PARKED_EVENT = 'group_parked';
 
 /**
@@ -1127,6 +1135,16 @@ export class GroupRunner {
       if (moved) {
         log.warn({ group: group.id, ...moved }, 'base 在守衛通過後被外部動過 → 不合併，下一輪重跑守衛');
         ledger.logEvent('group', group.id, 'base_moved', `守衛驗的是 ${moved.verified}，現在是 ${moved.current}`);
+        // ── 要做的只有「再跑一次守衛」，不是叫人決定什麼 ──
+        //
+        // 先前這裡 park 到 changes_requested 就 return：任務全 done ＋ 有 PR ＋ 無意見
+        // ⇒ 必定掉進 orchestrator 那條「沒有可回灌的意見」的死路，而 changes_requested
+        // **沒有任何「重跑守衛」的入口**（對帳自己都寫了「目前沒有自動回步驟 5 的路徑」）。
+        //
+        // 留一筆明確的「要求重跑」事件，讓 requeue 認得它並把群組送回 ready——
+        // 這不是缺陷、也不需要人裁決，所以不開單。
+        ledger.logEvent('group', group.id, GROUP_RERUN_REQUESTED_EVENT,
+          `base 在守衛通過後被外部動過（驗的是 ${moved.verified}，現在是 ${moved.current}）`);
         ledger.updateGroupState(group.id, PARKED_GROUP_STATE);
         return { ok: false, keep: false, reason: 'base 被外部動過，重跑守衛' };
       }
@@ -1344,7 +1362,8 @@ export class GroupRunner {
           // 續跑時 agent 只讀得到答案、讀不到自己問過什麼（與 worker.ts 同一個理由）。
           ledger.logEvent('task', head.id, 'clarification_asked', JSON.stringify(r.askedClarification));
         }
-        return this.parkGroup(group, details, `重做時提出不可逆歧義，等人回覆：${r.askedClarification.question}`);
+        // setBlock 已經開了一張可以**回答**的 clarification 單，不要再疊一張只能重試的
+        return this.parkGroup(group, details, `重做時提出不可逆歧義，等人回覆：${r.askedClarification.question}`, { handoff: false });
       }
       if (r.reportedNoChange) {
         // agent 認為審查意見不需要改動。這是「人的意見」與「agent 的判斷」衝突，必須交人裁決
@@ -1389,11 +1408,31 @@ export class GroupRunner {
     return branchHasCommits(gitExec, wtPath, baseBranch, remote);
   }
 
-  private parkGroup(group: Group, details: TaskDetail[], why: string): RunOutcome {
+  /**
+   * 群組停手等人。
+   *
+   * **park ＝ 一定要留下一張人看得見的單。** 先前這裡只寫事件＋改狀態＋發通知，
+   * 而畫面只讀未消化的 human 單 ⇒ 這些群組完全看不見，停在 changes_requested
+   * 每一輪被跳過（實跑最久 53 小時，而且堵住下游五個群）。
+   *
+   * 唯一的例外是「重做時 agent 提問」那條：它走 setBlock，setBlock 自己就會開
+   * clarification 單（而且那張單可以回答，比 stuck_group 的重試鈕精確）。
+   * 那條路傳 `handoff: false`。
+   */
+  private parkGroup(
+    group: Group,
+    details: TaskDetail[],
+    why: string,
+    opts: { handoff?: boolean } = {},
+  ): RunOutcome {
     const { ledger, log } = this.deps;
     log.warn({ group: group.id }, `群組 park：${why}`);
     ledger.logEvent('group', group.id, GROUP_PARKED_EVENT, why);
     ledger.updateGroupState(group.id, PARKED_GROUP_STATE);
+    if (opts.handoff !== false) {
+      // 這幾條都是「系統做不下去、要人決定」——沒有紅燈可放行，所以只給重試
+      openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why, options: ['retry'] });
+    }
     this.notify(details, { type: 'problem', detail: `需要人工處理：${why}` });
     this.cards(details, 'awaiting_human', group.id);
     return { ok: false, keep: true, reason: why };

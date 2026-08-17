@@ -470,7 +470,14 @@ export class ConsoleServer {
         return { ok: true };
       case 'approve':
       case 'deny': {
-        router.handleMergeDecision({ groupId: id, approved: action === 'approve', userId: 'console' });
+        // **退回要帶得了理由。** 先前這裡不讀 input.text，畫面也沒送——
+        // 於是每一次從控制台退回都必定走「沒有意見」那條（agent 不知道要改什麼，
+        // 而群組掉進一個沒有出口的狀態）。
+        const reason = String(input.text ?? '').trim();
+        router.handleMergeDecision({
+          groupId: id, approved: action === 'approve', userId: 'console',
+          ...(reason ? { reason } : {}),
+        });
         // **講出「什麼時候會真的動」。**
         //
         // 裁決是當下寫進 ledger 的，但實際合併要等下一輪 tick（預設 180 秒）。
@@ -482,7 +489,11 @@ export class ConsoleServer {
           ok: true,
           detail: action === 'approve'
             ? `已核准${when}（合併要跑建置與測試，需要幾分鐘）`
-            : `已退回${when}，agent 會帶著意見重做`,
+            // 沒有意見時不要說「agent 會帶著意見重做」——那是 API 回應裡的假話，
+            // 實際上沒有任何人會動它（已改成同時開一張單）。
+            : reason
+              ? `已退回${when}，agent 會帶著你的意見重做`
+              : '已退回（未附意見）。不會有人自動動它——已列進「等你處理」，可按重試原樣再送，或補上意見。',
         };
       }
       default:

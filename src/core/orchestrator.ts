@@ -4,6 +4,7 @@ import {
   DISPATCHABLE_GROUP_STATE,
   GROUP_DEPS_BLOCKED_EVENT,
   GROUP_PARKED_EVENT,
+  GROUP_RERUN_REQUESTED_EVENT,
   PARKED_GROUP_STATE,
   shouldRequeueGroup,
   stripAnsi,
@@ -842,6 +843,14 @@ export class Orchestrator {
       }
       if (tasks.some((t) => t.state === 'blocked')) continue; // 仍在等人，靜靜等著
 
+      // A1.5) **被明確要求重跑守衛**（base 在守衛通過後被外部動過）。
+      //       這不是「要人決定」，是系統自己該再跑一次——而 changes_requested 沒有
+      //       任何「重跑守衛」的入口，不接這一條的話它會掉進下面 A2(ii) 那條死路。
+      if (this.wantsRerun(g)) {
+        this.toReady(g, 'base 在守衛通過後被外部動過 → 重跑合併守衛');
+        continue;
+      }
+
       // A2) 任務都做完了。此時 PARKED_GROUP_STATE 有兩種來源，處置完全不同：
       if (!hasFeedback) {
         // (i) 從未開過 PR ⇒ 這是「park 等人」的群，人把最後一張卡結案了
@@ -853,8 +862,23 @@ export class Orchestrator {
           this.toReady(g, '群內任務都已結案但尚未收尾（未開 PR）→ 重新派工做收尾');
           continue;
         }
-        // (ii) 已經開過 PR ⇒ 這是審查要求修改，但意見不見了（多半是 daemon 重啟）。
-        //     沒有意見就重派只會讓 agent 盲改，寧可停著等人。
+        // (ii) 已經開過 PR ⇒ 這是審查要求修改，但意見不見了（多半是退回時沒填理由，或 daemon 重啟）。
+        //     沒有意見就重派只會讓 agent 盲改，寧可停著等人——**但一定要真的交到人手上**。
+        //
+        //     先前這裡只有 warnOnce：群組停在 changes_requested、每一輪走到同一行、
+        //     畫面上完全看不到（實跑 g_dea636a3c852 停了 5 小時、g_86224a8df710 停了 53 小時，
+        //     而且它們還堵住五個下游群）。
+        openStuckGroupHandoff(ledger, log, {
+          groupId: g.id,
+          repo: g.repo,
+          // 這裡沒有紅燈可放行，所以不給「照樣落地」
+          options: ['retry'],
+          why: 'PR 已經開了、群內任務也都做完了，但沒有可回灌的審查意見'
+            + '（多半是退回時沒填理由，或 daemon 重啟把暫存的意見丟了）。\n'
+            + '沒有意見就重派只會讓 agent 盲改，所以系統停在這裡等你：\n'
+            + '· 按「重試」＝原樣送回合併流程（會重跑守衛）。\n'
+            + '· 要 agent 動手改：用附理由的退回。',
+        });
         this.warnOnce(
           `nofb:${g.id}`,
           { group: g.id, pr: g.prNumber },
@@ -1569,6 +1593,23 @@ export class Orchestrator {
         reasons,
       }),
     ).catch((e) => log.warn({ err: e instanceof Error ? e.message : String(e) }, '發送合併核准請求失敗（忽略）'));
+  }
+
+  /**
+   * 這一群有沒有一筆「還沒被消費掉」的重跑請求。
+   *
+   * **只認一次**：比對事件 id——重派（REQUEUE_EVENT）或新的 park 之後那筆就失效，
+   * 否則同一筆請求會讓群組每一輪都被重派。
+   */
+  private wantsRerun(g: Group): boolean {
+    const { ledger } = this.deps;
+    const req = ledger.latestEvent('group', g.id, GROUP_RERUN_REQUESTED_EVENT);
+    if (!req) return false;
+    const consumed = Math.max(
+      ledger.latestEvent('group', g.id, REQUEUE_EVENT)?.id ?? 0,
+      ledger.latestEvent('group', g.id, GROUP_PARKED_EVENT)?.id ?? 0,
+    );
+    return req.id > consumed;
   }
 
   private failGroup(group: Group, detail: string): void {

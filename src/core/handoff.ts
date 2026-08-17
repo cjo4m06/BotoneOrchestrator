@@ -187,7 +187,11 @@ export function openMergeApprovalHandoff(
 export function openStuckGroupHandoff(
   ledger: HandoffLedger,
   log: Logger,
-  input: { groupId: string; repo: string; why: string; waitingGroups?: string[] },
+  input: {
+    groupId: string; repo: string; why: string; waitingGroups?: string[];
+    /** 覆寫按鈕。**空陣列＝沒有可按的動作**（例如「沒理由的退回」沒有紅燈可放行）。 */
+    options?: string[];
+  },
 ): string | undefined {
   const waiting = input.waitingGroups ?? [];
   // 已經有一張未消化的同類單就不再開（見 HandoffLedger.listHandoffs）
@@ -200,7 +204,7 @@ export function openStuckGroupHandoff(
       kind: 'stuck_group',
       title: `群組 ${input.groupId} 停手，需要你決定`,
       body: input.why.trim() || '（沒有留下原因，請看 log）',
-      options: HANDOFF_ACTIONS.stuck_group,
+      options: input.options ?? HANDOFF_ACTIONS.stuck_group,
       ...(waiting.length
         ? { ifIgnored: `還有 ${waiting.length} 群在等它進 base：${waiting.join('、')}` }
         : {}),

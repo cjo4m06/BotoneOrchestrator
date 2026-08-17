@@ -15,7 +15,7 @@ import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Logger } from '../observability/logger.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from '../core/merge-credential.js';
 import { STANDING_DECISION } from '../worker/human-reply.js';
-import { isStuckGroupState } from '../core/handoff.js';
+import { isStuckGroupState, openStuckGroupHandoff, type HandoffLedger } from '../core/handoff.js';
 import type { FeedbackSource } from '../pr/review-watcher.js';
 
 /** 事件轉為簡短中文摘要（Slack 與 console 共用文案）。 */
@@ -143,6 +143,12 @@ const PARKED_STATE: GroupState = 'changes_requested';
  * 用結構介面而非直接相依 Ledger，測試才能塞假件。
  */
 export interface InboundLedger {
+  /**
+   * 開交接單（停手與說話是同一個寫入動作）。
+   * 可選：測試假件不必實作；缺了只是少一張單，會被 pending 的兜底自檢撈到。
+   */
+  openHandoff?(input: Parameters<HandoffLedger['openHandoff']>[0]): string;
+  listHandoffs?(q: { groupId?: string; kind?: string; toRole?: string; unconsumedOnly?: boolean; limit?: number }): unknown[];
   getTask(id: string): Task | undefined;
   getGroup(id: string): Group | undefined;
   setBlock(id: string, reason: BlockReason, detail?: string): void;
@@ -489,6 +495,16 @@ export class InboundRouter {
         return;
       }
 
+      // **退回也要守門。** approve 上面有守門、reject 先前完全沒有：
+      // Slack 上一則舊訊息的「退回」會把**已經 merged** 的群拉回 changes_requested，
+      // 而那是一個沒有出口的狀態（任務全 done、有 PR、無意見 → 每輪 warnOnce）。
+      const REJECTABLE: GroupState[] = ['in_review', 'merge_guard', 'pr_open'];
+      if (!d.approved && !REJECTABLE.includes(group.state)) {
+        log.warn({ groupId: d.groupId, state: group.state }, '⚠️ 這個群組現在不在等審查／等合併，已忽略此次退回');
+        ledger.logEvent('group', d.groupId, 'merge_reject_ignored_state', group.state);
+        return;
+      }
+
       const next: GroupState = d.approved ? 'merge_guard' : 'changes_requested';
       ledger.updateGroupState(d.groupId, next);
       ledger.logEvent('group', d.groupId, d.approved ? 'merge_approved' : 'merge_rejected', d.userId ?? '');
@@ -514,9 +530,27 @@ export class InboundRouter {
           ledger.logEvent('group', d.groupId, 'review_feedback_human', reason);
           log.info({ groupId: d.groupId }, '↩️ 已退回並附上修改意見（下一輪會回灌給 agent）');
         } else {
-          // 沒有意見的退回是合法的（「先停下來」），但要講清楚後果
-          log.warn({ groupId: d.groupId }, '↩️ 已退回但沒有附意見：agent 不會知道要改什麼，重派後很可能原樣再送一次');
+          // ── 沒有意見的退回是合法的（「先停下來」），但它會掉進一個沒有出口的狀態 ──
+          //
+          // 任務全 done ＋ 有 PR ＋ 沒有可回灌的意見 ⇒ orchestrator 每一輪只會 warnOnce
+          // 然後跳過，永遠不動。而控制台的退回鈕**結構上帶不了理由**（見 server.ts），
+          // 所以每一次從控制台退回都必定走這一條。
+          //
+          // 不要「沒理由就存一則空意見叫 agent 盲改」——那是程式替人決定「沒說＝去盲改」，
+          // 而盲改的下場已知：agent 多半一行不改，撞上「重做後零變更」再 park 一次。
+          log.warn({ groupId: d.groupId }, '↩️ 已退回但沒有附意見：沒有人會自動動它，已列進「等你處理」');
           ledger.logEvent('group', d.groupId, 'review_rejected_no_reason', d.userId ?? '');
+          // 假件 ledger 可能沒有 openHandoff（測試）；缺了只是少一張單，不擋流程
+          if (ledger.openHandoff) openStuckGroupHandoff(ledger as HandoffLedger, log, {
+            groupId: group.id,
+            repo: group.repo,
+            // **不給「照樣落地」**：這個情境沒有紅燈可放行，那顆鈕在這裡沒有意義
+            options: ['retry'],
+            why: '你退回了這一群，但沒有留下要改什麼。agent 不知道要改哪裡，'
+              + '現在沒有任何人在動它（成果、分支、PR 都還在）。\n'
+              + '· 按「重試」＝原樣送回合併流程（會重跑守衛與風險判斷）。\n'
+              + '· 要 agent 動手改：請用附理由的退回。',
+          });
         }
       }
 

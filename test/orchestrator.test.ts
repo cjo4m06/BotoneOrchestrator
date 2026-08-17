@@ -1,4 +1,5 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
+import { GROUP_RERUN_REQUESTED_EVENT } from '../src/core/group-runner.js';
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import {
@@ -1019,6 +1020,53 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       undefined,
       '意見只能由「拿得到人打的字」的那一端寫；這裡編一句只會蓋掉真的那句',
     );
+  });
+
+  // ── 第 2 刀：退回／park 一定要留下出口 ──
+
+  /**
+   * 實跑：g_dea636a3c852 停 5 小時、g_86224a8df710 停 53 小時，兩個都堵住五個下游群，
+   * 而畫面顯示「目前沒有需要你決定的事」。這條路先前只有 warnOnce。
+   */
+  it('任務全 done ＋ 有 PR ＋ 沒有可回灌的意見 → 開一張單（不再只是 warnOnce）', async () => {
+    const g = seedReviewedGroup({ state: 'changes_requested' });
+    for (const id of g.taskIds) tmp.ledger.updateTaskState(id, 'done');
+    const { orch } = build({ merge: fakeMerge().deps });
+
+    await tickAndPlan(orch);
+
+    const hs = tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true });
+    assert.equal(hs.length, 1, '停在非終態又沒推進 ⇒ 必須留下人看得見的東西');
+    assert.match(hs[0]!.body, /沒有可回灌的審查意見/);
+    assert.deepEqual(hs[0]!.options, ['retry'], '這裡沒有紅燈可放行');
+  });
+
+  /**
+   * base 被外部動過**不是這一群的缺陷**，要做的只有再跑一次守衛。
+   * 先前它 park 到 changes_requested（一個沒有「重跑守衛」入口的狀態）⇒ 必落上面那條死路。
+   */
+  it('base 被外部動過 → 送回 ready 重跑守衛，不是丟給人', async () => {
+    const g = seedReviewedGroup({ state: 'changes_requested' });
+    for (const id of g.taskIds) tmp.ledger.updateTaskState(id, 'done');
+    tmp.ledger.logEvent('group', g.id, GROUP_RERUN_REQUESTED_EVENT, 'base 被動過');
+    const { orch } = build({ merge: fakeMerge().deps });
+
+    await tickAndPlan(orch);
+
+    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'ready', '要自己重跑，不該停著等人');
+  });
+
+  it('重跑請求只認一次（重派之後那筆就失效，不會每輪重派）', async () => {
+    const g = seedReviewedGroup({ state: 'changes_requested' });
+    for (const id of g.taskIds) tmp.ledger.updateTaskState(id, 'done');
+    tmp.ledger.logEvent('group', g.id, GROUP_RERUN_REQUESTED_EVENT, 'base 被動過');
+    const { orch } = build({ merge: fakeMerge().deps });
+
+    await tickAndPlan(orch);
+    tmp.ledger.updateGroupState(g.id, 'changes_requested'); // 假裝又 park 回來
+    await tickAndPlan(orch);
+
+    assert.notEqual(tmp.ledger.getGroup(g.id)?.state, 'ready', '舊的重跑請求不可以一直生效');
   });
 
   // ── 第 1 刀：合併路徑不再有無聲循環 ──
