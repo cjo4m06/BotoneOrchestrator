@@ -1635,8 +1635,10 @@ export function buildPipeline(input: PipelineInput): Pipeline {
       ...(input.merge ? {
         merge: {
           ...input.merge,
-          guardFor: input.merge.guardFor ?? ((ctx: { repo: string; branch: string }) => createMergeGuard({
+          guardFor: input.merge.guardFor ?? ((ctx: { repo: string; branch: string; onStage?: (d: string) => void }) => createMergeGuard({
             log,
+            // 守衛跑到哪一段 → 呼叫端的活動列（Orchestrator 在這裡包了 withActivity）
+            onStage: ctx.onStage ?? ((): void => {}),
             ctx: { repo: ctx.repo, branch: ctx.branch, workspaceKind: 'merge_tree', requestedBy: 'merger' },
             makeVerifier: (c: CheckContext) => new Verifier(log, {
               ...verifierDepsOf(config.orchestrator, log, browserOutputRootOf(input.dataRoot ?? DEFAULT_DATA_ROOT), ledger, ledger),

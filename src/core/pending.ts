@@ -132,7 +132,7 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
       // 先前寫的是 `h.options?.length ? …`，於是「這張單沒有可按的動作」（存 `[]`）
       // 會退回 kind 的預設清單 ⇒ 用 options:[] 表達「不要給按鈕」在資料層根本做不到。
       // 只有「完全沒給 options」才退回預設。
-      ...(h.options ? { actions: h.options } : { actions: HANDOFF_ACTIONS[h.kind] ?? [] }),
+      ...(h.options ? { actions: usableNow(ledger, h, group) } : { actions: HANDOFF_ACTIONS[h.kind] ?? [] }),
       ...(h.evidence?.length ? { evidence: h.evidence.join(' ') } : {}),
       // ── 細節補強 ──
       //
@@ -238,6 +238,32 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
   }
 
   return items;
+}
+
+/**
+ * 這張單當初寫的動作，**現在**還按得動嗎。
+ *
+ * `options` 是開單那一刻寫下的，而群組狀態會在那之後變。停在裡面的「重試」是
+ * 最容易過期的一個：`reviveGroup` 只認 STUCK_GROUP_STATES，群組一旦離開那幾個狀態，
+ * 那顆鈕就變成「按了什麼都不會發生」——而這正是這一整串在修的東西
+ *（實跑：使用者連按數次，每次都拿到「無法復活這個群組」）。
+ *
+ * 所以顯示前用**現在**的狀態再篩一次。真相是群組的當下狀態，不是開單當時的快照。
+ */
+function usableNow(
+  ledger: AskLedger,
+  h: { kind: string; options?: string[] },
+  group: Group | undefined,
+): string[] {
+  const opts = h.options ?? [];
+  if (h.kind !== 'stuck_group' || !group) return opts;
+  return opts.filter((a) => {
+    // 這兩顆都會呼叫 updateGroupState(id, 'ready')，前提是群組還在停手狀態
+    if (a === 'retry' || a === 'land-anyway') return isStuckGroupState(group.state);
+    // 放行是對「上游永遠不會進 base」的處置：已經進了就沒什麼好放的
+    if (a === 'release_deps') return group.state !== 'merged' && !isDepsReleased(ledger, group.id);
+    return true;
+  });
 }
 
 /**

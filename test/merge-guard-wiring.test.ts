@@ -48,6 +48,7 @@ const baseWiring = () => {
     sourceRepoPath: '/main/clone',
     verifyTreeRoot: '/data/verify-trees',
     onBaseFreshness: () => {},
+    onStage: () => {},
   };
 };
 
@@ -125,8 +126,12 @@ test('兩個呼叫點都出現 createMergeGuard（少一邊就是又只修了一
 
 test('合併那條路的守衛是「每群現造」，不是一顆共用實例', () => {
   // 共用實例造不出每群不同的 CheckContext，那正是 check_runs 整輪缺席的原因
-  assert.match(codeOf('src/core/orchestrator.ts'), /guardFor\(ctx: \{ repo: string; branch: string \}\)/);
-  assert.match(codeOf('src/core/orchestrator.ts'), /m\.guardFor\(\{ repo: group\.repo, branch: group\.branch \}\)/);
+  assert.match(codeOf('src/core/orchestrator.ts'), /guardFor\(ctx: \{\s*repo: string;\s*branch: string;/);
+  assert.match(
+    codeOf('src/core/orchestrator.ts'),
+    /m\.guardFor\(\{ repo: group\.repo, branch: group\.branch, onStage: update \}\)/,
+    '守衛跑到哪一段要接回活動列——不然核准後那十幾分鐘畫面上一片空白',
+  );
 });
 
 test('MergeProject 帶主 clone 路徑（不然工廠無從知道 .env 該去哪裡拿）', () => {

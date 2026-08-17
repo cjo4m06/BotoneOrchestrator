@@ -70,6 +70,13 @@ export interface MergeGuardOptions {
   /** 每次 attempt() 回報一次 base 新鮮度，讓呼叫端能把「但書」帶進通知/PR 內文 */
   onBaseFreshness?: (freshness: BaseFreshness) => void;
   /**
+   * 現在跑到哪一段。**這是這條路上唯一會動的東西**——守衛期間任務狀態不變、
+   * 群組狀態不變、事件表沒有新列，而它可以跑十幾分鐘（建樹、npm ci、build、
+   * test、歸咎實驗、飄移判斷）。沒有它，畫面上就是「什麼都沒在做」。
+   * 未接 → 什麼都不做（純顯示用，不影響判決）。
+   */
+  onStage?: (detail: string) => void;
+  /**
    * 語意飄移的**判斷層**（rebase 成功且測試綠之後才跑）。未注入就不跑這層。
    * 見 drift-judge.ts：前兩層是事實（衝突、紅燈），這一層是判斷（意圖打不打架）。
    */
@@ -140,6 +147,7 @@ export class MergeGuard {
 
     // 1) 取最新 base。不 fetch 的話驗的是「本地那份可能停在舊 commit 的 base」，
     //    也就是一個不存在的世界——而真正會出事的情況恰恰就是 remote 有新變更。
+    this.opts.onStage?.(`取最新的 ${base}`);
     const freshness = await this.resolveBase(repoPath, base);
     this.opts.onBaseFreshness?.(freshness);
     if (freshness.caveat) {
@@ -153,6 +161,7 @@ export class MergeGuard {
     ).stdout.trim();
 
     // 2) 建拋棄式驗收樹（群分支 ＋ 最新 base）。併不起來就是 code_conflict。
+    this.opts.onStage?.(`把 ${freshness.ref} 併進 ${branch}，建一棵拋棄式驗收樹`);
     const built = await createMergeTree({
       repoPath,
       branch,
@@ -181,6 +190,7 @@ export class MergeGuard {
     const { tree } = built;
     try {
       // 3) 在「合併後狀態」重跑關卡。
+      this.opts.onStage?.('在合併後的狀態重跑關卡（build／test）');
       const gate = await this.verifier.check({ cwd: tree.path, config: input.verifierConfig });
       if (!gate.green) {
         // **紅了不代表是這一群造成的。**
@@ -192,6 +202,7 @@ export class MergeGuard {
         //   1. 同一顆 base 上（不含本群）跑幾次 → base 本來就紅嗎？
         //   2. 同一個合併後狀態再跑一次 → 這個紅穩定嗎？
         // 實驗**只產生事實**，結論由讀的人下（見 pr/blame.ts）。
+        this.opts.onStage?.('紅了 → 跑歸咎實驗（base 本來就紅嗎？這個紅穩定嗎？）');
         const evidence = await this.gatherBlameEvidence(input, freshness.ref, tree.path);
         this.log.warn(
           { branch, base: freshness.ref, experiments: evidence.length },
@@ -207,6 +218,7 @@ export class MergeGuard {
       // 4) 事實層都綠了 → 判斷層：兩邊的意圖有沒有打架。
       //    抓的是「能編譯、測試也綠，但合起來的產品行為自相矛盾」——量不出來，
       //    只有讀得懂意圖的才判斷得出。判不出來就放行（見 drift-judge.ts）。
+      this.opts.onStage?.('關卡都綠 → 判斷語意飄移（兩邊的意圖有沒有打架）');
       const drift = await this.judgeDrift(input, freshness.ref, mergeBase, tree.path);
       if (drift) return drift;
 

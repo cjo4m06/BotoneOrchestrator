@@ -70,6 +70,15 @@ export interface MergeGuardWiring {
    */
   onBaseFreshness: (freshness: BaseFreshness) => void;
 
+  /**
+   * 守衛跑到哪一段。**必填**——可以傳空實作，但要在呼叫端明寫出來。
+   *
+   * 這一項先前根本不存在：守衛可以跑十幾分鐘，期間 ledger 完全靜止，
+   * 而控制台的「現在在做什麼」顯示「閒著」。使用者的原話：「我以為整個專案都在停擺」。
+   * 設成必填是因為這個 repo 反覆踩到的正是「可選項某一邊忘了傳」。
+   */
+  onStage: (detail: string) => void;
+
   /** 測試接縫：給假守衛。 */
   makeGuard?: ((verifier: VerifierLike, options: MergeGuardOptions) => MergeGuardLike) | undefined;
 }
@@ -92,6 +101,7 @@ export function createMergeGuard(w: MergeGuardWiring): MergeGuardLike {
     },
     treeRoot: w.verifyTreeRoot,
     onBaseFreshness: w.onBaseFreshness,
+    onStage: w.onStage,
     ...(w.remote ? { remote: w.remote } : {}),
     ...(w.driftJudge ? { driftJudge: w.driftJudge } : {}),
     ...(w.recordCheck ? { recordCheck: w.recordCheck } : {}),

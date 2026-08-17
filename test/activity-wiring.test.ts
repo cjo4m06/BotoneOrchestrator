@@ -178,3 +178,53 @@ test('活動標題帶得出是第幾輪（人要看得出它在動，不是卡�
   const i = src.indexOf("'依審查意見重做'");
   assert.match(src.slice(i, i + 700), /第 \$\{round\}/);
 });
+
+/**
+ * ── 合併把關那十幾分鐘先前完全看不見 ──
+ *
+ * 開 PR 前那次守衛（group-runner，包在 withRepoLock 裡）根本沒包 withActivity；
+ * 核准後那次（orchestrator）只有一個沒有 refId、沒有階段的 `tick:merge`。
+ * 而這段可以跑十幾分鐘：等同 repo 的鎖、建拋棄式驗收樹、npm ci、build、test、
+ * 歸咎實驗、語意飄移判斷、風險判斷、開 PR。期間任務狀態不變、群組狀態不變、
+ * 事件表沒有新列 ⇒ 畫面上就是「閒著」。
+ */
+test('守衛本身會回報跑到哪一段（沒有它，包了 withActivity 也只是一句固定的字）', async () => {
+  const { MergeGuard } = await import('../src/pr/merge-guard.js');
+  const stages: string[] = [];
+  const guard = new MergeGuard(
+    { check: async () => ({ green: true, checks: [] }) } as never,
+    createSilentLogger(),
+    {
+      onStage: (d) => void stages.push(d),
+      // 併不起來就停在第二段——重點是「前兩段有回報」，不是判決內容
+      git: async () => ({ exitCode: 1, stdout: '', stderr: 'no remote' }),
+    },
+  );
+
+  await guard.attempt({ repoPath: '/repo', branch: 'orch/x', base: 'main', verifierConfig: {} as never });
+
+  assert.ok(stages.some((s) => s.includes('取最新')), '取 base 也要算——網路慢的時候它自己就是幾分鐘');
+  assert.ok(stages.some((s) => s.includes('驗收樹')), '建樹＋npm ci 是最久的一段');
+});
+
+test('開 PR 前那次守衛有包 withActivity，而且在搶鎖之前就開始', () => {
+  const src = readFileSync('src/core/group-runner.ts', 'utf8');
+  const act = src.indexOf("id: `merge:${group.id}`");
+  assert.ok(act > 0, '開 PR 前那次守衛沒有登記「現在在做什麼」');
+  // **順序很重要**：同 repo 的守衛是序列的，排隊本身就是花掉的時間，
+  // 而排隊中的群在畫面上原本完全看不見（不在「開發中」，也還沒到「等審查」）。
+  assert.ok(
+    src.indexOf('withActivity(', act - 400) < src.indexOf('withRepoLock(proj.repoPath', act),
+    'withActivity 要包在 withRepoLock 外面，否則排隊那段仍然是空白',
+  );
+  assert.match(src.slice(act, act + 4000), /onStage: update/, '守衛內部的階段要接回這一列');
+});
+
+test('核准後那次守衛也有自己的活動列（tick:merge 沒有 refId、沒有階段）', () => {
+  const src = readFileSync('src/core/orchestrator.ts', 'utf8');
+  const i = src.indexOf('const verdict = await withActivity(');
+  assert.ok(i > 0, '核准後那次守衛沒有登記');
+  const block = src.slice(i, i + 900);
+  assert.match(block, /refId: group\.id/, '沒有 refId 的話畫面只知道「有人在合併」，不知道是哪一群');
+  assert.match(block, /onStage: update/);
+});

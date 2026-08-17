@@ -230,6 +230,25 @@ describe('CLI ask — 本機互動入口', () => {
     assert.equal(tmp.ledger.getGroup(g.id)?.state, 'forming');
   });
 
+  /**
+   * `options` 是開單那一刻寫下的，而群組狀態會在那之後變。
+   * 實測（2026-08-17，瀏覽器）：一張帶 retry 的舊單掛在一個已經離開停手狀態的群上，
+   * 畫面照樣畫出「重試」，按下去什麼都不會發生。真相是群組的**當下**狀態。
+   */
+  it('單子上寫的動作要用「現在」的狀態再篩一次（開單當時能按 ≠ 現在能按）', () => {
+    seedTask('T-stale', '某任務');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b-stale', taskIds: ['T-stale'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'failed');
+    openStuckGroupHandoff(tmp.ledger, createSilentLogger(), { groupId: g.id, repo: 'o/r', why: '壞了' });
+    assert.ok(collectPending(tmp.ledger).find((i) => i.id === g.id)?.actions.includes('retry'));
+
+    // 群組被別的路徑推進了（例如人在別的介面按過、或 daemon 自己續跑）
+    tmp.ledger.updateGroupState(g.id, 'ready');
+    const item = collectPending(tmp.ledger).find((i) => i.id === g.id);
+    assert.ok(item, '單還在（沒有人消化它），所以項目還在');
+    assert.deepEqual(item.actions, [], 'ready 按不動重試——畫得出來就要按得動');
+  });
+
   it('已合併的群組不可以被「復活」（那是終態，復活會讓它再跑一次）', async () => {
     seedTask('T-MG', '某任務');
     const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-MG'], footprint: [] });
@@ -1021,8 +1040,8 @@ describe('三個介面都要看 actions（少一個就是同一個病的另一�
   it('options 存了空陣列就是「沒有動作」，不可以退回 kind 預設', () => {
     const src = read('src/core/pending.ts')
       .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
-    assert.match(src, /h\.options \? \{ actions: h\.options \}/);
-    assert.doesNotMatch(src, /h\.options\?\.length \? \{ actions: h\.options \}/,
+    assert.match(src, /h\.options \? \{ actions: usableNow\(/);
+    assert.doesNotMatch(src, /h\.options\?\.length \?/,
       '用 length 判斷 ⇒ 空陣列退回預設 ⇒「不要給按鈕」在資料層做不到');
   });
 

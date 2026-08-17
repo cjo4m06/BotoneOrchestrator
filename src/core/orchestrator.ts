@@ -168,7 +168,16 @@ export interface MergePipelineDeps {
    * （repo/branch），而那是每群不同的；先前這裡是一顆共用實例，於是那條路的
    * Verifier 沒有 ctx，整輪關卡一列 check_run 都不寫。
    */
-  guardFor(ctx: { repo: string; branch: string }): MergeGuardLike;
+  guardFor(ctx: {
+    repo: string;
+    branch: string;
+    /**
+     * 守衛跑到哪一段 → 「現在在做什麼」。守衛可以跑十幾分鐘（建驗收樹、npm ci、
+     * build、test、歸咎實驗、飄移判斷），期間 ledger 完全靜止；沒有它，
+     * 核准之後那次把關在畫面上就是一片空白。
+     */
+    onStage?: (detail: string) => void;
+  }): MergeGuardLike;
   pr: PrMergeLike;
   /**
    * 合併前把最新 base 抓下來。**強烈建議提供**：不抓最新 base 的話，守衛驗的是
@@ -1423,14 +1432,30 @@ export class Orchestrator {
 
     const tasksOfGroup = group.taskIds.map((id) => ledger.getTask(id)).filter((t): t is Task => t !== undefined);
     const head = tasksOfGroup[0];
-    const verdict = await m.guardFor({ repo: group.repo, branch: group.branch }).attempt({
-      repo: group.repo,
-      repoPath: proj.repoPath,
-      branch: group.branch,
-      base: proj.baseBranch,
-      verifierConfig: proj.verifierConfig,
-      taskTitles: tasksOfGroup.map((t) => t.title),
-    });
+    // **核准之後那次把關也要看得見。**
+    //
+    // 外層的 `tick:merge` 只說「處理已核准、等著合併的群組」，沒有 refId、沒有階段——
+    // 而真正花時間的是這裡：守衛可以跑十幾分鐘，期間群組狀態停在 merge_guard 不動。
+    // 人按了核准之後看到的就是「什麼都沒發生」，然後再按一次。
+    const verdict = await withActivity(
+      ledger,
+      {
+        id: `merge:${group.id}`,
+        kind: 'merge',
+        repo: group.repo,
+        refId: group.id,
+        title: `${group.id}　核准後的合併把關`,
+        detail: '準備中',
+      },
+      (update) => m.guardFor({ repo: group.repo, branch: group.branch, onStage: update }).attempt({
+        repo: group.repo,
+        repoPath: proj.repoPath,
+        branch: group.branch,
+        base: proj.baseBranch,
+        verifierConfig: proj.verifierConfig,
+        taskTitles: tasksOfGroup.map((t) => t.title),
+      }),
+    );
     // **合併工作區用完要把分支放開。**
     //
     // git 不允許同一條分支同時被兩個 worktree 檢出。守衛會把這個工作區檢出到群組分支，

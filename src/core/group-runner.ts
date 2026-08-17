@@ -916,8 +916,27 @@ export class GroupRunner {
     // 鍵是 repo：**不同專案完全並行**，只有同一個 repo 的群互相排隊。
     // 代價是同 repo 的守衛不再並行——但那本來就不該並行（三份 build+test+瀏覽器
     // 同時跑在一台機器上，本身就是互相拖慢與搶埠的來源）。
-    return withRepoLock(proj.repoPath, async (): Promise<RunOutcome> => {
+    // **收尾這一段也要記「現在在做什麼」。**
+    //
+    // 從這裡到合併為止可以跑十幾分鐘（等同 repo 的鎖、建驗收樹、npm ci、build、test、
+    // 歸咎實驗、飄移判斷、風險判斷、開 PR），而期間任務狀態不變、群組狀態不變、
+    // 事件表沒有新列——控制台的「現在在做什麼」顯示「閒著」，畫面上什麼都不會動。
+    //
+    // **活動要在搶鎖之前就開始**：同 repo 的守衛是序列的，排隊本身就是花掉的時間，
+    // 而排隊中的群在畫面上原本完全看不見（它已經不在「開發中」，也還沒到「等審查」）。
+    return withActivity(
+      ledger,
+      {
+        id: `merge:${group.id}`,
+        kind: 'merge',
+        repo: group.repo,
+        refId: group.id,
+        title: `${group.id}　合併把關`,
+        detail: '等同一個 repo 的其他群把關完（一次只能一群）',
+      },
+      (update) => withRepoLock(proj.repoPath, async (): Promise<RunOutcome> => {
       // Merge Guard（本地 rebase + 重測 + 語意飄移）
+      update('準備合併把關');
       ledger.updateGroupState(group.id, 'merge_guard');
       // 但書載體：沒 fetch 到最新 base 的綠燈是「有但書的綠燈」（§9 前置），
       // 這件事必須被看見——寫進 ledger event、通知，並列進 PR 的「假設與待確認」。
@@ -946,6 +965,9 @@ export class GroupRunner {
           log.warn({ group: group.id, ref: f.ref, caveat: f.caveat }, 'Merge Guard 的 base 新鮮度有但書');
           this.notify(details, { type: 'problem', detail: `⚠ 合併守衛有但書：${f.caveat}` });
         },
+        // 守衛內部跑到哪一段（建樹／關卡／歸咎實驗／飄移判斷）——那是這十幾分鐘裡
+        // 畫面上唯一會動的東西
+        onStage: update,
         makeGuard: this.deps.makeMergeGuard,
       });
       const verdict = await guard.attempt({
@@ -1039,6 +1061,7 @@ export class GroupRunner {
       const canMerge = typeof this.deps.allowLocalMerge === 'function'
         ? this.deps.allowLocalMerge()
         : this.deps.allowLocalMerge;
+      if (canMerge) update('判斷這一群要不要先讓人看一眼（合併風險）');
       const risk = canMerge
         ? await this.judgeMergeRisk(group, proj, wtPath, details, tasks)
         : { needsHuman: true as const, risks: [{ what: '自動合併未開啟', why: '每個 PR 都由人審查' }] };
@@ -1083,6 +1106,7 @@ export class GroupRunner {
       // 記在區域變數：`group` 是進入函式時的快照，updateGroupState 不會回寫它的 prNumber，
       // 後面「已開 PR 就不本地合併」的判斷若讀 group.prNumber 會永遠是 undefined（踩過）。
       // 開 PR 沒有開關：一群做完只有這一條出口，而審查是掛在 PR 上的。
+      update('開 PR');
       const pr = await this.pr.openPr({
         repoPath: wtPath, repo: proj.repo, branch: group.branch, base: proj.baseBranch,
         title: `${details.map((d) => d.title).join('、')}`, body, draft: true,
@@ -1151,9 +1175,11 @@ export class GroupRunner {
 
       log.info({ group: group.id, pr: prNumber }, '自動合併已開啟且無不可逆風險 → 合併該 PR');
       ledger.logEvent('group', group.id, 'auto_merge_pr', `PR #${prNumber}：自動合併（無不可逆風險）`);
+      update(`合併 PR #${prNumber}`);
       const merged = await this.mergeOpenPr(group, proj, prNumber, details);
       return merged ? SUCCESS : { ok: false, keep: true, reason: `自動合併 PR #${prNumber} 未成功` };
-    });
+      }),
+    );
   }
 
   /**
