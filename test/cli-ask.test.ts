@@ -948,3 +948,34 @@ describe('等你處理的清單：死掉的上游要看得見', () => {
     assert.match(ui, /DEAD = \['closed', 'failed'\]/);
   });
 });
+
+describe('控制台的按鈕：由 actions 決定，不是照 kind 硬寫', () => {
+  /**
+   * 實跑（2026-08-17）：後端算出「這一項沒有可按的動作」（群組停在 forming／ready，
+   * 而 reviveGroup 只認 changes_requested/failed/merge_guard），畫面照樣畫出「重試」「照樣落地」，
+   * 按下去 log 印「群組不在停手狀態，不需要復活」。
+   * 後端把 actions 算對了沒有用——畫面根本不看它。
+   */
+  const ui = () => readFileSync('src/console/ui.html', 'utf8');
+
+  it('pendingRow 讀 p.actions，而不是 if (kind === ...) 硬加按鈕', () => {
+    const src = ui();
+    assert.match(src, /const acts = /, '沒有從 actions 取動作');
+    assert.match(src, /p\.actions \?\? \[\]/, '要以後端算出來的 actions 為準');
+    assert.doesNotMatch(src, /if \(p\.kind === 'needs_human' \|\| p\.kind === 'stuck_group'\) buttons\.push/,
+      '照 kind 硬寫就會畫出按不動的鈕');
+  });
+
+  it('不認得的動作碼寧可不畫（畫了就是一顆按了會失敗的鈕）', () => {
+    assert.match(ui(), /if \(!spec\) continue;/);
+  });
+
+  it('畫面送出的動作碼，後端 /api/decide 都接得住', () => {
+    const codes = [...ui().matchAll(/^ {4}'?([a-z_-]+)'?: \['/gm)].map((m) => m[1]);
+    assert.ok(codes.length >= 6, `動作表解析不到：${codes.join(',')}`);
+    const server = readFileSync('src/console/server.ts', 'utf8');
+    for (const c of codes) {
+      assert.match(server, new RegExp(`case '${c}'`), `後端沒有處理 ${c} —— 按下去必定失敗`);
+    }
+  });
+});
