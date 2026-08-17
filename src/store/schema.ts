@@ -224,6 +224,9 @@ CREATE TABLE IF NOT EXISTS handoffs (
   id          TEXT PRIMARY KEY,
   group_id    TEXT,
   task_id     TEXT,
+  -- 掛在**專案**上的單（環境擋住：MCP 連不上、repo 沒有 remote…）。
+  -- 那種問題不屬於任何一個群組或任務——先前沒有這個維度，於是它只能寫進 log。
+  repo        TEXT,
   from_role   TEXT NOT NULL,             -- planner | coder | reviewer | merger | program
   to_role     TEXT NOT NULL,             -- planner | coder | reviewer | merger | human
   -- UI 路由碼：這張單要畫哪一組按鈕、按下去打到哪個 handler。
@@ -245,6 +248,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
   consumed_at INTEGER                    -- 人／下一棒處理完的時間。NULL = 還在等
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_inbox ON handoffs(to_role, consumed_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_repo ON handoffs(repo, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_handoffs_group ON handoffs(group_id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
 
@@ -321,6 +325,9 @@ export const COLUMN_MIGRATIONS: { table: string; column: string; ddl: string }[]
   { table: 'tasks', column: 'task_start_sha', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_sha TEXT' },
   { table: 'tasks', column: 'task_start_branch', ddl: 'ALTER TABLE tasks ADD COLUMN task_start_branch TEXT' },
   { table: 'tasks', column: 'tool_calls', ddl: 'ALTER TABLE tasks ADD COLUMN tool_calls TEXT' },
+  // 掛在專案上的交接單（環境擋住）。**兩邊都要加**：只加 CREATE TABLE 的話，
+  // 新庫（測試）是綠的，正式庫升級才炸。
+  { table: 'handoffs', column: 'repo', ddl: 'ALTER TABLE handoffs ADD COLUMN repo TEXT' },
 ];
 
 export interface MigratableDb {

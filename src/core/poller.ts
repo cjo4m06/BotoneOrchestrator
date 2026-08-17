@@ -46,6 +46,11 @@ export class Poller {
     private sources: PollSource[] | (() => PollSource[]),
     private ledger: Ledger,
     private log: Logger,
+    /**
+     * 專案健康度計數器。**未注入 → 只留 log（舊行為）**。
+     * 注入之後，任務板連不上會升級成一張人看得見的單（見 core/project-health.ts）。
+     */
+    private health?: { fail(f: { repo: string; reason: string; fix: string; retryable?: boolean }, now: number): void; ok(repo: string): void },
   ) {}
 
   private currentSources(): PollSource[] {
@@ -60,8 +65,17 @@ export class Poller {
         briefs = await src.client.listTasks({ repo: src.repo, status: 'todo', mine: src.mine });
       } catch (e) {
         this.log.warn({ repo: src.repo, err: msg(e) }, 'listTasks 失敗，略過本輪該來源');
+        // **這是主要的那一半。** registry 指紋沒變就不會重建 runtime，所以
+        // 「跑三天後 MCP 掛掉／token 過期／任務板改權限」只有這裡看得到。
+        // 先前只有一行 warn ⇒ 該專案的群組全部靜默停住，畫面顯示綠色「啟用中」。
+        this.health?.fail({
+          repo: src.repo,
+          reason: `向任務板要任務失敗（listTasks）：${msg(e)}`,
+          fix: '任務板連線或權限變了：到控制台「專案」分頁按「測試連線」看實際錯誤',
+        }, Date.now());
         continue;
       }
+      this.health?.ok(src.repo);
 
       for (const b of briefs) {
         let detail: TaskDetail;
@@ -69,6 +83,12 @@ export class Poller {
           detail = await src.client.getTask(b.id);
         } catch (e) {
           this.log.warn({ id: b.id, err: msg(e) }, 'getTask 失敗，略過該任務');
+          // 權限只擋單張卡時走這條（listTasks 會過、getTask 會炸）
+          this.health?.fail({
+            repo: src.repo,
+            reason: `讀任務內容失敗（getTask ${b.id}）：${msg(e)}`,
+            fix: '多半是任務板的單卡權限：到控制台「專案」分頁按「測試連線」，或確認該卡的存取權',
+          }, Date.now());
           continue;
         }
         const res = this.ledger.upsertDiscoveredTask({

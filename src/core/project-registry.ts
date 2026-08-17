@@ -117,7 +117,17 @@ export class ProjectRegistry {
    *
    * @returns 這次實際做了什麼，供呼叫端寫 log／回報給控制台。
    */
-  async sync(desired: ProjectConfig[]): Promise<{ added: string[]; updated: string[]; removed: string[]; failed: string[] }> {
+  async sync(
+    desired: ProjectConfig[],
+    /**
+     * 每個專案這一輪「連得上／連不上」的回報出口。
+     *
+     * **不要把健康狀態放進 registry**：它只在指紋變動時才會重建 runtime，
+     * 所以「跑三天後 MCP 掛掉」它完全看不到——那一半要靠 poller 餵（見 project-health.ts）。
+     * registry 這端只回報自己知道的：建不建得起來。
+     */
+    on?: { fail(id: string, repo: string, f: { reason: string; fix: string; retryable?: boolean }): void; ok(id: string, repo: string): void },
+  ): Promise<{ added: string[]; updated: string[]; removed: string[]; failed: string[] }> {
     const added: string[] = [];
     const updated: string[] = [];
     const removed: string[] = [];
@@ -142,6 +152,9 @@ export class ProjectRegistry {
         //
         // 完全一樣則什麼都不算：sync 每輪都會被呼叫，把「沒變」也記成 updated
         // 會讓 log 每 15 秒噴一次「專案清單已更新」——真正的變更就淹沒在裡面了。
+        // 指紋沒變 ＝ 連線還在 ⇒ 這一端認定它是好的。
+        // **一定要回報 ok**，否則修好之後 registry 這端永遠不會把它標回健康，那張單就收不掉。
+        on?.ok(id, cfg.repo);
         if (JSON.stringify(existing.config) !== JSON.stringify(cfg)) {
           existing.config = cfg;
           // **runtime 也要跟著換**：讀取端拿的是 runtime，只換 config 等於沒改
@@ -157,14 +170,23 @@ export class ProjectRegistry {
         const built = await this.factory(cfg);
         if (!built) {
           failed.push(id);
+          // **這裡不回報失敗原因。** 原因只有 factory 自己知道（MCP 設定不完整、
+          // 連不上、repo 沒有 remote 各有不同的解法），所以由它在發生的那一行直接回報
+          //（見 main.ts 的 buildProject）。這裡再寫一筆只會用一句沒資訊的話蓋掉它。
           continue;
         }
         this.items.set(id, { ...built, fingerprint: fp });
+        on?.ok(id, cfg.repo);
         (existing ? updated : added).push(id);
       } catch (e) {
         // 單一專案失敗不能連累其他專案（其中一個 MCP 掛了，其餘照常運作）
         this.log.error({ id, err: e instanceof Error ? e.message : String(e) }, '專案載入失敗，略過');
         failed.push(id);
+        on?.fail(id, cfg.repo, {
+          reason: `專案載入擲出例外：${e instanceof Error ? e.message : String(e)}`,
+          fix: '看 daemon log 的堆疊，或到控制台「專案」分頁按「測試連線」',
+          retryable: true,
+        });
       }
     }
 

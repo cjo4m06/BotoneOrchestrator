@@ -43,6 +43,7 @@ import { DriftJudge } from './pr/drift-judge.js';
 import { hasClaudeAuth } from './worker/reviewer.js';
 import { withFetchLock, FETCH_TIMEOUT_MS } from './git/fetch-lock.js';
 import { hotValue, type Hot } from './config/hot.js';
+import { ProjectHealthTracker, reportProjectHealth } from './core/project-health.js';
 import { InboundRouter, type CompleteTaskFn } from './notify/notifier.js';
 import { createNotifier, slackHandlesOf, type HumanGateway } from './slack/gateway.js';
 import { AppHome } from './slack/app-home.js';
@@ -1380,6 +1381,10 @@ export interface PipelineInput {
   /** 花費上限檢查（現算）。 */
   budget?: () => BudgetVerdict;
   /**
+   * 專案健康度計數器（Poller 的失敗要餵它）。未給 → 任務板連不上時只留 log（舊行為）。
+   */
+  projectHealth?: { fail(f: { repo: string; reason: string; fix: string; retryable?: boolean }, now: number): void; ok(repo: string): void };
+  /**
    * 控制台設定的**現拿**入口（`() => store.settings()`）。
    * 未給 → 用 config 的開機快照，行為與加這個欄位之前一致。
    */
@@ -1582,7 +1587,7 @@ export function buildPipeline(input: PipelineInput): Pipeline {
   const orchestrator = new Orchestrator(
     {
       // 傳函式而不是陣列：控制台新增／停用專案，下一輪輪詢就生效
-      poller: new Poller(() => registry.sources(), ledger, log),
+      poller: new Poller(() => registry.sources(), ledger, log, input.projectHealth),
       // 有本地 checkout 才掃得到真實檔案足跡；掃不到會自動退回 docRef 代理
       planner: new Planner({
         resolveRepoPath: (repo) => registry.runtimeOf(repo)?.repoPath,
@@ -1853,14 +1858,32 @@ export async function main(): Promise<void> {
   const resilience = mcpResilienceFromEnv();
 
   // 專案的建立流程收斂成一個工廠，registry 才能在執行期反覆呼叫它（新增／改設定／重連）
+  // 專案健康度：**兩個產生端共用一個計數器**（這裡的 buildProject 與 Poller）。
+  // 為什麼不能只靠這裡：registry 指紋沒變就不會重建 runtime，所以「跑三天後 MCP 掛掉」
+  // 這一端一次都不會觸發——而那正是「畫面全綠、佇列不動」最常見的來源。
+  const health = new ProjectHealthTracker();
+
   const buildProject = async (p: ProjectConfig): Promise<Omit<RegisteredProject, 'fingerprint'> | undefined> => {
     const client = createMcpClient(p, log, resilience);
-    if (!client) return undefined;
+    if (!client) {
+      health.fail({
+        repo: p.repo, projectId: p.id,
+        reason: 'MCP 設定不完整（transport／command／url 缺項），連都連不了',
+        fix: '控制台 →「專案」→ 編輯這個專案 → 補齊 MCP 設定 → 按「測試連線」',
+        retryable: false,
+      }, Date.now());
+      return undefined;
+    }
     try {
       // 連線已內建退避重試；重試完仍連不上就略過該專案，其他專案照常運作
       await client.connect();
     } catch (e) {
       log.error({ id: p.id, err: e instanceof Error ? e.message : String(e) }, 'MCP 連線失敗，略過該專案');
+      health.fail({
+        repo: p.repo, projectId: p.id,
+        reason: `MCP 連線失敗：${e instanceof Error ? e.message : String(e)}`,
+        fix: '控制台 →「專案」→ 編輯這個專案 → 按「測試連線」看實際錯誤（多半是 token 或指令路徑）',
+      }, Date.now());
       return undefined;
     }
     // ── 這個專案有沒有辦法走完整條路？ ──
@@ -1880,6 +1903,14 @@ export async function main(): Promise<void> {
         '專案的 repo 沒有 remote，走不了「開 PR → 審查 → 合併」這條唯一的出口，不予登錄'
           + '（要嘛替它設好 remote，要嘛把這個專案停用）',
       );
+      health.fail({
+        repo: p.repo, projectId: p.id,
+        reason: `本地 repo 沒有 remote「${remote}」，走不了「開 PR → 審查 → 合併」這條唯一的出口`,
+        // **這一格不能寫「去按測試連線」**：那顆只測 MCP，按了會拿到綠燈、問題還在。
+        // 按得動但按了不解決，比沒有按鈕更糟。
+        fix: `到 ${p.repoPath} 執行 git remote add origin <url>，或到控制台把這個專案停用`,
+        retryable: false,
+      }, Date.now());
       await client.close?.();
       return undefined;
     }
@@ -1896,7 +1927,13 @@ export async function main(): Promise<void> {
   const registry = new ProjectRegistry(buildProject, log, (runtime, cfg) => {
     runtime.verifierConfig = verifierConfigOf(cfg);
   });
-  await registry.sync(config.projects);
+  /** 同步專案清單，並把「連得上／連不上」餵進同一個計數器。兩個呼叫點共用。 */
+  const syncProjects = (desired: Parameters<typeof registry.sync>[0]) => registry.sync(desired, {
+    fail: (id, repo, f) => health.fail({ repo, projectId: id, ...f }, Date.now()),
+    ok: (_id, repo) => health.ok(repo),
+  });
+
+  await syncProjects(config.projects);
 
   if (registry.size() === 0) {
     log.warn('無可用專案（用控制台新增）。daemon 仍會啟動但無事可做。');
@@ -2023,7 +2060,9 @@ export async function main(): Promise<void> {
     // 每輪把 DB 的專案清單與 GitHub token 套用一次：控制台（含獨立行程）改完，下一輪就生效
     beforeTick: async () => {
       applyGh(store.settings().github.token);
-      await registry.sync(store.projects());
+      await syncProjects(store.projects());
+      // sync 與 poll 都跑過之後才回報：這一輪的健康狀態才是完整的
+      reportProjectHealth({ ledger, log, now: Date.now(), downs: health.blocked(Date.now()) });
     },
     // Claude 認證同樣現拿（設定留空時沿用行程環境，既有安裝不受影響）
     agentEnv: () => agentAuthEnv(store.settings().agent),
@@ -2038,6 +2077,7 @@ export async function main(): Promise<void> {
     allowLocalMerge: () => externalActionFlags(store.settings(), process.env).allowLocalMerge,
     // 控制台改指令逾時／其他設定，下一次用到就生效
     liveSettings: () => store.settings(),
+    projectHealth: health,
     ...(merge ? { merge } : {}),
   });
 

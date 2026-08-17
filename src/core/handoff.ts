@@ -83,6 +83,9 @@ export const HANDOFF_ACTIONS: Record<HandoffKind, string[]> = {
   // 解法**不在這個系統裡**：任務板上那張卡還停在「進行中」，而 MCP 沒有取消認領的工具。
   // 人必須去任務板改回「待辦」，在這邊按重試永遠沒用（實跑：使用者按了 4 次）。
   reclaim_blocked: [],
+  // 環境擋住：解法在機器上（改設定、加 remote、修 MCP），這個系統按什麼都沒用。
+  // 與 reclaim_blocked 同一個形狀——**沒有可按的動作就不要給按鈕**。
+  env_blocked: [],
   merge_approval: ['approve', 'deny'],
   // 「重試」＝再跑一次；「照樣落地」＝我知道這個紅，但它不是這一群造成的（定案③）。
   //

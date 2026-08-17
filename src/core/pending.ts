@@ -25,7 +25,13 @@ export type PendingKind =
    */
   | 'reclaim_blocked'
   | 'merge_approval'
-  | 'stuck_group';
+  | 'stuck_group'
+  /**
+   * 環境擋住——同樣**解法不在這個系統裡**（MCP 連不上、repo 沒有 remote、token 過期）。
+   * 掛在 repo 上而不是群組上：那種問題會同時擋住該專案的所有群，
+   * 而先前它只會變成一行 warnOnce，畫面上那些群看起來就是「正常排隊」。
+   */
+  | 'env_blocked';
 
 /**
  * 群組「停手交人」時可能停在哪些狀態（failed 以外的）。

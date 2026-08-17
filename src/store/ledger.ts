@@ -146,13 +146,21 @@ export type HandoffKind =
   | 'merge_approval'  // 等人核准合併
   | 'stuck_group'     // 群組停手，等人決定要不要重試
   | 'review_feedback' // 審查意見回灌給實作者
-  | 'delivery';       // 交付說明（給下一棒的脈絡，通常 blocking=false）
+  | 'delivery'        // 交付說明（給下一棒的脈絡，通常 blocking=false）
+  /**
+   * 環境擋住（MCP 連不上、repo 沒有 remote、token 過期…）。
+   * **解法不在這個系統裡**，所以沒有按鈕——與 reclaim_blocked 同一個形狀。
+   * 掛在 repo 上而不是群組／任務上：那種問題會同時擋住該專案的所有群。
+   */
+  | 'env_blocked';
 
 export type HandoffRole = 'planner' | 'coder' | 'reviewer' | 'merger' | 'program' | 'human';
 
 export interface HandoffInput {
   groupId?: string;
   taskId?: string;
+  /** 掛在**專案**上（環境擋住）。與 groupId／taskId 互斥使用。 */
+  repo?: string;
   fromRole: HandoffRole;
   toRole: HandoffRole;
   kind: HandoffKind;
@@ -220,6 +228,7 @@ function toHandoff(r: Row): HandoffRow {
     id: r.id as string,
     ...((r.group_id as string) ? { groupId: r.group_id as string } : {}),
     ...((r.task_id as string) ? { taskId: r.task_id as string } : {}),
+    ...((r.repo as string) ? { repo: r.repo as string } : {}),
     fromRole: r.from_role as HandoffRole,
     toRole: r.to_role as HandoffRole,
     kind: r.kind as HandoffKind,
@@ -1437,17 +1446,17 @@ export class Ledger {
     const id =
       'h_' +
       createHash('sha1')
-        .update(`${input.groupId ?? ''}|${input.taskId ?? ''}|${input.kind}|${input.toRole}|${ts}|${body}`)
+        .update(`${input.repo ?? ''}|${input.groupId ?? ''}|${input.taskId ?? ''}|${input.kind}|${input.toRole}|${ts}|${body}`)
         .digest('hex')
         .slice(0, 16);
     this.db
       .prepare(
         `INSERT OR REPLACE INTO handoffs
-           (id, group_id, task_id, from_role, to_role, kind, verdict, blocking,
+           (id, group_id, task_id, repo, from_role, to_role, kind, verdict, blocking,
             title, body, options, if_ignored, blindspots, evidence, scope, session_id,
             created_at, consumed_at)
          VALUES
-           (@id, @groupId, @taskId, @fromRole, @toRole, @kind, @verdict, @blocking,
+           (@id, @groupId, @taskId, @repo, @fromRole, @toRole, @kind, @verdict, @blocking,
             @title, @body, @options, @ifIgnored, @blindspots, @evidence, @scope, @sessionId,
             @createdAt, NULL)`,
       )
@@ -1455,6 +1464,7 @@ export class Ledger {
         id,
         groupId: input.groupId ?? null,
         taskId: input.taskId ?? null,
+        repo: input.repo ?? null,
         fromRole: input.fromRole,
         toRole: input.toRole,
         kind: input.kind,
@@ -1481,13 +1491,14 @@ export class Ledger {
    * 漏一項就是一次靜默（實跑：群組停在 changes_requested，清單只掃 failed）。
    * 查詢不會漏。
    */
-  listHandoffs(q: { toRole?: string; kind?: string; groupId?: string; taskId?: string; unconsumedOnly?: boolean; limit?: number } = {}): HandoffRow[] {
+  listHandoffs(q: { toRole?: string; kind?: string; groupId?: string; taskId?: string; repo?: string; unconsumedOnly?: boolean; limit?: number } = {}): HandoffRow[] {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
     if (q.toRole) { where.push('to_role = @toRole'); params.toRole = q.toRole; }
     if (q.kind) { where.push('kind = @kind'); params.kind = q.kind; }
     if (q.groupId) { where.push('group_id = @groupId'); params.groupId = q.groupId; }
     if (q.taskId) { where.push('task_id = @taskId'); params.taskId = q.taskId; }
+    if (q.repo) { where.push('repo = @repo'); params.repo = q.repo; }
     if (q.unconsumedOnly) where.push('consumed_at IS NULL');
     const sql =
       `SELECT * FROM handoffs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}` +
