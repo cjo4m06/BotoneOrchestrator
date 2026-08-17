@@ -25,6 +25,11 @@ import type { Logger } from '../observability/logger.js';
 
 /** 開單需要的 ledger 子集（只宣告真正用到的，方便測試注入）。 */
 export interface HandoffLedger {
+  /**
+   * 查既有的單。**去重要靠它**：同一群重複開單會變成「兩張長得一樣、按鈕不同」，
+   * 人不知道該點哪個（2026-08-05 實跑）。未實作 → 退化成不去重（行為與加這個之前相同）。
+   */
+  listHandoffs?(q: { groupId?: string; kind?: string; toRole?: string; unconsumedOnly?: boolean; limit?: number }): unknown[];
   openHandoff(input: HandoffInput): string;
 }
 
@@ -150,6 +155,8 @@ export function openMergeApprovalHandoff(
   log: Logger,
   input: { groupId: string; title: string; why: string; taskIds: string[]; prUrl?: string },
 ): string | undefined {
+  // 已經有一張未消化的同類單就不再開（見 HandoffLedger.listHandoffs）
+  if (ledger.listHandoffs?.({ groupId: input.groupId, kind: 'merge_approval', toRole: 'human', unconsumedOnly: true, limit: 1 })?.length) return undefined;
   try {
     return ledger.openHandoff({
       groupId: input.groupId,
@@ -183,6 +190,8 @@ export function openStuckGroupHandoff(
   input: { groupId: string; repo: string; why: string; waitingGroups?: string[] },
 ): string | undefined {
   const waiting = input.waitingGroups ?? [];
+  // 已經有一張未消化的同類單就不再開（見 HandoffLedger.listHandoffs）
+  if (ledger.listHandoffs?.({ groupId: input.groupId, kind: 'stuck_group', toRole: 'human', unconsumedOnly: true, limit: 1 })?.length) return undefined;
   try {
     return ledger.openHandoff({
       groupId: input.groupId,

@@ -11,7 +11,7 @@ import {
 import { DEFAULT_QUIET_MINUTES, splitByQuietPeriod } from './quiet-period.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from './merge-credential.js';
 import { collectPending, type PendingItem } from './pending.js';
-import { openStuckGroupHandoff } from './handoff.js';
+import { openMergeApprovalHandoff, openStuckGroupHandoff } from './handoff.js';
 
 /**
  * 還有哪幾群在等這一群進 base。
@@ -368,7 +368,6 @@ export class Orchestrator {
    */
   private readonly planning = new Map<string, { promise: Promise<void>; startedAt: number }>();
   /** 已經問過人的群組（避免每輪都往 Slack 貼同一則核准請求）。 */
-  private readonly askedApproval = new Set<string>();
   /** 群組 → 已 requeue 次數（防空轉）。**只是 ledger 的快取**，首次使用時從事件回讀。 */
   private readonly requeueUsed = new Map<string, Record<RequeueKind, number>>();
   /** 群組 → 等上游的退避狀態（跨 tick 生效：退避期間連派都不派，不會重建 worktree）。 */
@@ -1131,7 +1130,6 @@ export class Orchestrator {
     const { ledger, log } = this.deps;
     // 之前的核准已失效——改完必須重新取得核准才可能合併
     this.clearApproval(e.group, 'changes_requested');
-    this.askedApproval.delete(e.group);
     this.feedback.save({ groupId: e.group, comments: e.comments, source: 'github_review' });
     this.notifyGroup(e.group, { type: 'changes_requested', count: e.comments.length });
     ledger.logEvent('group', e.group, 'feedback_ready', `${e.comments.length} 則審查意見待回灌`);
@@ -1159,7 +1157,6 @@ export class Orchestrator {
         return;
       }
       this.clearApproval(d.groupId, 'rejected');
-      this.askedApproval.delete(d.groupId);
       // **這裡不寫意見。**
       //
       // 先前這裡存一句程式編的罐頭話：「請依 PR 上的意見修正後重新送審」。
@@ -1204,10 +1201,14 @@ export class Orchestrator {
    */
   private recordApproval(groupId: string, approval: MergeApproval): void {
     this.approvals.set(groupId, approval);
-    // 新的核准 ⇒ 允許在必要時（例如上次合併失敗）再問一次人
-    this.askedApproval.delete(groupId);
     this.deps.ledger.logEvent('group', groupId, MERGE_CREDENTIAL_EVENT, JSON.stringify(approval));
     this.deps.ledger.logEvent('group', groupId, 'merge_approval', `${approval.source}｜${approval.approvedBy}`);
+    // **人表態了 ⇒ 那張核准單就結案。**
+    //
+    // 記在這裡而不是各個入口：核准有四條路進來（Slack 按鈕、控制台、CLI、GitHub 審查），
+    // 只有 Slack 那條原本會消化單。少消化的後果是合併佇列看到「還有未消化的核准單」
+    // 就跳過（那道守衛擋的是「拿舊憑證自己再合一次」），於是**按了核准反而不會合併**。
+    this.deps.ledger.consumeHandoffsFor({ groupId, toRole: 'human', kind: 'merge_approval' });
   }
 
   /**
@@ -1260,7 +1261,12 @@ export class Orchestrator {
   private clearApproval(groupId: string, why: string): void {
     const had = this.approvals.delete(groupId);
     const inLedger = this.deps.ledger.latestEvent('group', groupId, MERGE_CREDENTIAL_EVENT) !== undefined;
-    if (had || inLedger) this.deps.ledger.logEvent('group', groupId, MERGE_CREDENTIAL_CLEARED_EVENT, why);
+    if (had || inLedger) {
+      this.deps.ledger.logEvent('group', groupId, MERGE_CREDENTIAL_CLEARED_EVENT, why);
+      // **憑證作廢 ＝ 那張核准單過期。** 一個寫入點，飄不掉。
+      // 放在「合併失敗那一格」的話，下次多一條作廢路徑就又漏一次（這個 repo 的老毛病）。
+      this.deps.ledger.consumeHandoffsFor({ groupId, toRole: 'human', kind: 'merge_approval' });
+    }
   }
 
   // ── 6) 合併佇列 ───────────────────────────────────────────────────────
@@ -1273,11 +1279,24 @@ export class Orchestrator {
     const { ledger, dispatcher } = this.deps;
     for (const group of ledger.listGroupsByState('merge_guard')) {
       if (dispatcher.isRunning(group.id)) continue; // GroupRunner 就地跑守衛中 = 暫態，不是待合併
+      // **有一張還沒被消化的核准單 ⇒ 人還沒表態。**
+      // 既不重問（會變第二個入口），也**不可以拿舊憑證自己再合一次**——
+      // approvalOf 是記憶體優先的，別的路徑作廢不了它。場景：GitHub 審查通過 → 記憑證
+      // → 有人 revive → 重跑 → 自動合併失敗 → 推回 merge_guard ⇒ 舊憑證還在
+      // ⇒ 人還沒看到單，系統已經自己重跑 15-25 分鐘的守衛再合一次。
+      if (ledger.listHandoffs({
+        groupId: group.id, toRole: 'human', kind: 'merge_approval', unconsumedOnly: true, limit: 1,
+      }).length > 0) continue;
       const approval = this.approvalOf(group.id);
       if (!approval) {
         // 可能是 daemon 在 GroupRunner 跑守衛時崩潰留下的殘跡，也可能是別的程序寫的。
         // 無法證明有人核准 ⇒ 一律不合併，改成問人（只問一次）。
-        this.askForApproval(group, ['本機沒有這個群組的核准紀錄（可能是 daemon 重啟或流程中斷），需人工確認']);
+        // 理由要講準：憑證被作廢（合併失敗、守衛擋下）與「從來沒有過」是兩件事，
+        // 而人要據此決定「再按一次核准」還是「先去 GitHub 處理」。
+        const cleared = ledger.latestEvent('group', group.id, MERGE_CREDENTIAL_CLEARED_EVENT);
+        this.askForApproval(group, [cleared
+          ? `上一次的核准已作廢（${cleared.detail ?? '原因未記'}），群組停在 merge_guard 等新的核准`
+          : '本機沒有這個群組的核准紀錄（可能是 daemon 重啟或流程中斷），需人工確認']);
         continue;
       }
       try {
@@ -1480,7 +1499,6 @@ export class Orchestrator {
     for (const taskId of group.taskIds) {
       void Promise.resolve(this.deps.notifier?.updateTaskCard?.(taskId, 'merged')).catch(() => {});
     }
-    this.askedApproval.delete(group.id);
     ledger.updateGroupState(group.id, 'merged');
     ledger.logEvent('group', group.id, 'merged', `PR #${group.prNumber}｜核准者 ${approval.approvedBy}`);
     this.notifyGroup(group.id, { type: 'merged' });
@@ -1488,11 +1506,56 @@ export class Orchestrator {
   }
 
   /** 請人核准（每個群組只問一次，直到出現新的核准憑證為止）。 */
+  /**
+   * 守衛跑到一半停下、還沒開 PR 的 merge_guard 群。
+   *
+   * 這種群不能給核准鈕（按下去 failGroup 判死），也不該給重試鈕
+   *（重試會對已完成的任務重新 start_task，MCP 會拒絕）。系統目前沒有
+   * 「只重跑守衛」的入口，所以只能把事實講清楚交人——但**一定要講**，
+   * 否則它就停在 merge_guard 沒有任何人碰（實跑：多次重啟都是同一條）。
+   */
+  private escalateNoPr(group: Group): void {
+    const { ledger, log } = this.deps;
+    if (ledger.listHandoffs({ groupId: group.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) return;
+    const why =
+      `守衛跑到一半停下（daemon 重啟或收到停止訊號），還沒開 PR。成果在分支 ${group.branch} 上。\n`
+      + '系統沒有「只重跑守衛」的入口——按核准會被判 failed，按重試會對已完成的任務重新 start_task。\n'
+      + '請人工接手這條分支（確認內容後自己開 PR，或把這一群關掉）。';
+    ledger.logEvent('group', group.id, 'merge_guard_no_pr', why);
+    log.error({ group: group.id, branch: group.branch }, '守衛停在開 PR 之前，沒有自動入口');
+    openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why });
+  }
+
   private askForApproval(group: Group, reasons: string[]): void {
     const { gateway, ledger, log } = this.deps;
-    if (this.askedApproval.has(group.id)) return;
-    this.askedApproval.add(group.id);
+
+    // ── merge_guard 有兩張臉 ──
+    //
+    // group-runner 在**開 PR 之前**就把狀態設成 merge_guard；守衛中途被中止時
+    // 那條路刻意不覆寫群組狀態 ⇒ 會留下**沒有 prNumber 的 merge_guard 群**。
+    // 對它給「核准合併」，下一輪 mergeApprovedGroup 的 !prNumber 會走 failGroup——
+    // **按一下把還救得回來的成果判死**。那比「按了沒用」更糟。
+    if (!group.prNumber) {
+      this.escalateNoPr(group);
+      return;
+    }
+
+    // **去重改成「單還在不在」，不是行程記憶體。**
+    // 舊版用 askedApproval（Set），daemon 一重啟就再推一次 Slack，而且同一個生命週期內
+    // 只問一次——問過之後那張單被消化掉（人按了核准但合併失敗）就再也不會問。
+    // 任何一張未消化的 human 單都算「人還沒表態」：兩張長得不一樣的單只會讓人不知道點哪個。
+    if (ledger.listHandoffs({ groupId: group.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) return;
+
     ledger.logEvent('group', group.id, 'merge_needs_human', reasons.join('\n'));
+    // **先開單，再發訊息。** 訊息是通知，單才是那個「等你處理」的載體——
+    // 先前這裡只發訊息，於是核准請求在清單上完全不存在（對照組：group-runner 那次有開單）。
+    openMergeApprovalHandoff(ledger, log, {
+      groupId: group.id,
+      title: `群組 ${group.id}（${group.taskIds.length} 個任務）等你核准合併`,
+      why: reasons.join('；'),
+      taskIds: group.taskIds,
+      ...(group.prUrl ? { prUrl: group.prUrl } : {}),
+    });
     log.warn({ group: group.id, reasons }, '🔐 合併需人工核准，不自動合併');
     if (!gateway) return;
     const titles = group.taskIds.map((id) => ledger.getTask(id)?.title ?? id);

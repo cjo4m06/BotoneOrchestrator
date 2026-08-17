@@ -1463,6 +1463,27 @@ export class GroupRunner {
       log.error({ group: group.id, pr: prNumber, detail: res.detail }, '政策自動合併 PR 失敗');
       ledger.logEvent('group', group.id, 'merge_failed', res.detail);
       this.notify(details, { type: 'failed', detail: `自動合併 PR #${prNumber} 失敗：${res.detail}` });
+
+      // ── 失敗之後**不可以留在 pr_open** ──
+      //
+      // pr_open 沒有任何推進者：processMergeQueue 只吃 merge_guard，ReviewWatcher 只在
+      // GitHub 上有人留言時才會動它，而自動合併本來就是為「沒人會看這個 PR」而開的
+      // ⇒ 留在 pr_open 就是永久死，畫面還積極地顯示「PR 已開，等審查」。
+      //
+      // 推回 merge_guard：那是唯一同時在 reconciler 的 GROUP_ALIVE、STUCK_GROUP_STATES、
+      // 與待處理清單自檢三份清單裡的狀態——也就是唯一「卡住時看得見、也按得動」的狀態。
+      ledger.updateGroupState(group.id, 'merge_guard');
+      const prUrl = ledger.getGroup(group.id)?.prUrl;
+      openMergeApprovalHandoff(ledger, log, {
+        groupId: group.id,
+        title: `群組 ${group.id}：自動合併 PR #${prNumber} 失敗，要不要再試一次`,
+        why: `自動合併失敗：${res.detail}\n\n`
+          + '這批工作已通過合併守衛，成果都在分支與 PR 上。\n'
+          + '常見原因：分支保護要求人審／必要檢查未完成／token 沒有合併權限。\n'
+          + '在 GitHub 上處理完之後按「核准合併」會重跑守衛再合併。',
+        taskIds: group.taskIds,
+        ...(prUrl ? { prUrl } : {}),
+      });
       return false;
     }
     ledger.updateGroupState(group.id, 'merged');

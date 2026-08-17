@@ -1020,7 +1020,71 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
       '意見只能由「拿得到人打的字」的那一端寫；這裡編一句只會蓋掉真的那句',
     );
   });
-});
+
+  // ── 第 1 刀：合併路徑不再有無聲循環 ──
+  /**
+   * 沒有 prNumber 的 merge_guard 群是真實存在的：group-runner 在**開 PR 之前**就設了
+   * 那個狀態，而守衛被中止時刻意不覆寫狀態。對它給「核准合併」，下一輪
+   * mergeApprovedGroup 的 !prNumber 會走 failGroup——**按一下把還救得回來的成果判死**。
+   */
+  it('merge_guard 但沒有 PR → 不問核准，開一張講清楚的 stuck_group 單', async () => {
+    const g = seedReviewedGroup({ state: 'merge_guard' });
+    tmp.ledger.updateGroupState(g.id, 'merge_guard');
+    // 把 PR 編號拿掉（模擬守衛在開 PR 前被中止）
+    tmp.ledger.upsertGroup({ ...tmp.ledger.getGroup(g.id)!, prNumber: undefined });
+    const m = fakeMerge();
+    const gw = fakeGateway();
+    const { orch } = build({ merge: m.deps, gateway: gw.gateway });
+
+    await tickAndPlan(orch);
+
+    assert.deepEqual(gw.asks, [], '沒有 PR 就不該問核准——按下去會把群組判死');
+    const handoffs = tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true });
+    assert.equal(handoffs.length, 1, '不問也要留下人看得見的東西');
+    assert.equal(handoffs[0]!.kind, 'stuck_group');
+    assert.match(handoffs[0]!.body, /還沒開 PR/);
+    assert.notEqual(tmp.ledger.getGroup(g.id)?.state, 'failed', '不可以判死');
+  });
+
+  it('問核准 ＝ 開一張 merge_approval 單（先前只發訊息，清單上不存在）', async () => {
+    const g = seedReviewedGroup({ state: 'merge_guard' });
+    const m = fakeMerge();
+    const { orch } = build({ merge: m.deps, gateway: fakeGateway().gateway });
+
+    await tickAndPlan(orch);
+
+    const handoffs = tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', kind: 'merge_approval', unconsumedOnly: true });
+    assert.equal(handoffs.length, 1, '核准請求要在「等你處理」上看得到');
+  });
+
+  it('去重靠「單還在不在」，不是行程記憶體——連跑兩輪只會有一張', async () => {
+    const g = seedReviewedGroup({ state: 'merge_guard' });
+    const { orch } = build({ merge: fakeMerge().deps, gateway: fakeGateway().gateway });
+
+    await tickAndPlan(orch);
+    await tickAndPlan(orch);
+
+    assert.equal(
+      tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', kind: 'merge_approval', unconsumedOnly: true }).length,
+      1, '兩張長得一樣的單只會讓人不知道點哪個',
+    );
+  });
+
+  it('人核准 → 那張單被消化，合併真的送得出去（四條核准入口共用同一個寫入）', async () => {
+    const g = seedReviewedGroup({ state: 'merge_guard' });
+    const m = fakeMerge();
+    const { orch } = build({ merge: m.deps, gateway: fakeGateway().gateway });
+
+    await tickAndPlan(orch);                       // → 開單
+    orch.recordMergeApproval(g.id, 'cli:alice');   // 人表態
+    await tickAndPlan(orch);
+
+    assert.equal(
+      tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', kind: 'merge_approval', unconsumedOnly: true }).length,
+      0, '核准之後那張單要結案，否則合併佇列會一直跳過',
+    );
+    assert.equal(m.merges.length, 1, '按了核准就要真的合併');
+  });
 
 describe('Orchestrator — requeue 階段（離開 ready 之後還有回頭路）', () => {
   let tmp: TmpLedger;
@@ -2384,4 +2448,5 @@ describe('Orchestrator — 專案不可用時暫不派工', () => {
     await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g2']);
   });
+});
 });
