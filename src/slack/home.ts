@@ -240,6 +240,16 @@ function pendingActions(it: PendingItem): KnownBlock | undefined {
     };
   }
   if (it.kind === 'stuck_group') {
+    // **要看 actions**：後端算得出「這一項沒有可按的動作」（群組停在 forming／ready，
+    // 而 reviveGroup 只認 changes_requested/failed/merge_guard）。照 kind 硬畫的話，
+    // 按下去只會拿到「群組不在停手狀態，不需要復活」——那正是這一整串在修的
+    //「按了什麼都不會發生」（控制台端 2026-08-17 已修，這裡是同一個病的另一半）。
+    if (!(it.actions ?? []).includes('retry')) {
+      return {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '這一項現在沒有可按的動作——詳情見控制台或 `npm run ask`' }],
+      };
+    }
     return {
       type: 'actions',
       elements: [{

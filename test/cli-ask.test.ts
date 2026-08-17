@@ -979,3 +979,27 @@ describe('控制台的按鈕：由 actions 決定，不是照 kind 硬寫', () =
     }
   });
 });
+
+describe('三個介面都要看 actions（少一個就是同一個病的另一半）', () => {
+  const read = (f: string) => readFileSync(f, 'utf8');
+
+  it('Slack App Home 的 stuck_group 也要看 actions', () => {
+    const src = read('src/slack/home.ts');
+    assert.match(src, /it\.actions \?\? \[\]\)\.includes\('retry'\)/,
+      'App Home 照 kind 硬畫 ⇒ 後端算出沒動作也照樣出現「重新派工」');
+  });
+
+  it('options 存了空陣列就是「沒有動作」，不可以退回 kind 預設', () => {
+    const src = read('src/core/pending.ts')
+      .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.match(src, /h\.options \? \{ actions: h\.options \}/);
+    assert.doesNotMatch(src, /h\.options\?\.length \? \{ actions: h\.options \}/,
+      '用 length 判斷 ⇒ 空陣列退回預設 ⇒「不要給按鈕」在資料層做不到');
+  });
+
+  it('CLI／控制台／App Home 三邊都以 actions 為準', () => {
+    assert.match(read('src/cli/ask.ts'), /item\.actions/, 'CLI');
+    assert.match(read('src/console/ui.html'), /p\.actions \?\? \[\]/, '控制台');
+    assert.match(read('src/slack/home.ts'), /it\.actions/, 'App Home');
+  });
+});

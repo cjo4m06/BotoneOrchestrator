@@ -99,11 +99,22 @@ describe('App Home 版面', () => {
 
   it('卡住的群組給重新派工鈕，帶得回群組 id', () => {
     const btn = buttonWith(
-      homeViewBlocks(home({ pending: [item({ kind: 'stuck_group', id: 'g_abc' })] })),
+      homeViewBlocks(home({ pending: [item({ kind: 'stuck_group', id: 'g_abc', actions: ['retry'] })] })),
       HOME_ACTION_IDS.groupRetry,
     );
     assert.ok(btn, '應有重新派工鈕');
     assert.equal(decodeActionValue(btn.value)?.groupId, 'g_abc');
+  });
+
+  /**
+   * 後端算得出「這一項沒有可按的動作」（群組停在 forming／ready，而 reviveGroup
+   * 只認 changes_requested/failed/merge_guard）。照 kind 硬畫的話按下去只會拿到
+   * 「群組不在停手狀態，不需要復活」——控制台端 2026-08-17 已修，這裡是同一個病的另一半。
+   */
+  it('actions 沒有 retry → 不給按鈕，改講清楚去哪裡看', () => {
+    const blocks = homeViewBlocks(home({ pending: [item({ kind: 'stuck_group', id: 'g_x', actions: [] })] }));
+    assert.equal(buttonWith(blocks, HOME_ACTION_IDS.groupRetry), undefined, '按不動就不要畫');
+    assert.match(JSON.stringify(blocks), /沒有可按的動作/);
   });
 
   it('進度區顯示各狀態數量與執行中的任務', () => {

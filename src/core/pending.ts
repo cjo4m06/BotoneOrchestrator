@@ -121,7 +121,11 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
       repo: meta?.repo ?? group?.repo ?? '',
       // body 是 agent／程式自己寫的文字，**程式不解析它**
       detail: h.ifIgnored ? `${h.body}\n    ⛓ ${h.ifIgnored}` : h.body,
-      ...(h.options?.length ? { actions: h.options } : { actions: HANDOFF_ACTIONS[h.kind] ?? [] }),
+      // **`options` 有值就用它，即使是空陣列。**
+      // 先前寫的是 `h.options?.length ? …`，於是「這張單沒有可按的動作」（存 `[]`）
+      // 會退回 kind 的預設清單 ⇒ 用 options:[] 表達「不要給按鈕」在資料層根本做不到。
+      // 只有「完全沒給 options」才退回預設。
+      ...(h.options ? { actions: h.options } : { actions: HANDOFF_ACTIONS[h.kind] ?? [] }),
       ...(h.evidence?.length ? { evidence: h.evidence.join(' ') } : {}),
       // ── 細節補強 ──
       //
