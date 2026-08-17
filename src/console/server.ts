@@ -1,3 +1,4 @@
+import { upstreamSettled } from '../core/deps-release.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
@@ -361,10 +362,11 @@ export class ConsoleServer {
           }),
           waitingFor: (g.afterGroups ?? [])
             .map((id) => ({ id, state: ledger.getGroup(id)?.state }))
-            // **只濾掉 merged。** closed 與 failed 仍然在擋下游（Dispatcher 的「已結束」
-            // 只認 merged），把它們濾掉等於讓人看到「排隊中」卻不知道在等一個永遠不會動的東西
-            // ——實跑：五個 ready 群等兩個死掉的上游，畫面上完全看不出來。
-            .filter((x) => x.state !== undefined && x.state !== 'merged'),
+            // **只濾掉真的不再擋人的。** closed 與 failed 仍然在擋下游（Dispatcher 的
+            // 「已結束」只認 merged 或人放行過），把它們濾掉等於讓人看到「排隊中」卻不知道
+            // 在等一個永遠不會動的東西——實跑：五個 ready 群等兩個死掉的上游，畫面上完全看不出來。
+            // 判準與 Dispatcher／depsInBase 同一支函式，不在這裡自己再寫一次。
+            .filter((x) => x.state !== undefined && !upstreamSettled(ledger, ledger.getGroup(x.id))),
           sinceMs: now - g.updatedAt,
         })),
       ),
@@ -456,6 +458,17 @@ export class ConsoleServer {
         return landed
           ? { ok: true, detail: '已記錄理由，群組回到待派工' }
           : { ok: false, error: '無法落地這個群組（可能已被清掉）' };
+      }
+      case 'release_deps': {
+        // 「這個上游不會進 base 了，讓等它的群往前走」。理由選填——
+        // 這個決定本身就記得住是誰按的、放行了誰，不像 land-anyway 那樣沒理由就查不出憑什麼。
+        const reason = String(input.text ?? '').trim();
+        const released = await router.releaseDeps({
+          groupId: id, userId: 'console', ...(reason ? { reason } : {}),
+        });
+        return released
+          ? { ok: true, detail: '已放行，下一輪派工那幾群就不再等它' }
+          : { ok: false, error: '無法放行（群組不存在，或它本來就已經進 base 了）' };
       }
       case 'abort':
       case 'pause':

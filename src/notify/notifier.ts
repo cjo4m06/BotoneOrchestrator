@@ -16,6 +16,7 @@ import type { Logger } from '../observability/logger.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from '../core/merge-credential.js';
 import { STANDING_DECISION } from '../worker/human-reply.js';
 import { isStuckGroupState, openStuckGroupHandoff, type HandoffLedger } from '../core/handoff.js';
+import { releaseDeps } from '../core/deps-release.js';
 
 /** 心跳多新才算「正在跑」。 */
 const LIVE_ACTIVITY_MS = 5 * 60_000;
@@ -157,6 +158,8 @@ export interface InboundLedger {
    */
   openHandoff?(input: Parameters<HandoffLedger['openHandoff']>[0]): string;
   listHandoffs?(q: { groupId?: string; kind?: string; toRole?: string; unconsumedOnly?: boolean; limit?: number }): unknown[];
+  /** 可選：有哪些群在等這一群進 base（放行下游時要講得出放行了誰）。 */
+  listGroupsBlockedBy?(groupId: string): string[];
   getTask(id: string): Task | undefined;
   getGroup(id: string): Group | undefined;
   setBlock(id: string, reason: BlockReason, detail?: string): void;
@@ -409,6 +412,42 @@ export class InboundRouter {
     ledger.updateGroupState(input.groupId, 'ready');
     ledger.consumeHandoffsFor?.({ groupId: input.groupId, toRole: 'human', kind: 'stuck_group' });
     log.warn({ groupId: input.groupId, userId: input.userId, note }, '⚠️ 人已表態：帶著已知的紅落地（一次性，用掉就恢復把關）');
+    return true;
+  }
+
+  /**
+   * 人表態：**這個上游不會進 base 了，讓等它的群往前走。**
+   *
+   * `closed`（沒有東西要交付）是終態、永遠不會 merged，而兩個依賴判斷點都只認 merged
+   * ⇒ 等它的群會永遠排下去，畫面上還長得跟正常排隊一樣。這顆按鈕是唯一的出口。
+   *
+   * 為什麼不自動放行：`closed` 的意思是「群內任務都判定不需要改動」——agent 判的是
+   * **它自己那張卡**不用改，不是「下游的前提成立」。後者要看懂下游想做什麼再對照 base，
+   * 那是判斷不是資料。自動放行 ＝ 讓下游在沒人確認過的前提上開工，而它的 DoD 會全綠。
+   */
+  async releaseDeps(input: { groupId: string; userId?: string; reason?: string }): Promise<boolean> {
+    const { ledger, log } = this.deps;
+    const g = ledger.getGroup?.(input.groupId);
+    if (!g) {
+      log.warn({ groupId: input.groupId }, '要放行的群組不存在');
+      return false;
+    }
+    // merged 本來就通了；放行它只會讓事後查帳多一筆讀不懂的紀錄
+    if (g.state === 'merged') {
+      log.info({ groupId: input.groupId }, '這一群已經進 base，不需要放行');
+      return false;
+    }
+    const blocked = ledger.listGroupsBlockedBy?.(input.groupId) ?? [];
+    releaseDeps(ledger, {
+      groupId: input.groupId,
+      state: g.state,
+      blocked,
+      ...(input.userId ? { userId: input.userId } : {}),
+      ...(input.reason ? { reason: input.reason } : {}),
+    });
+    // 按過的東西要從清單上消失，否則人會一直看到它、一直再按一次
+    ledger.consumeHandoffsFor?.({ groupId: input.groupId, toRole: 'human', kind: 'stuck_group' });
+    log.warn({ groupId: input.groupId, state: g.state, blocked, userId: input.userId }, '⚠️ 人已放行：下游不再等這個上游');
     return true;
   }
 

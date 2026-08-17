@@ -28,6 +28,7 @@ import { Orchestrator, type MergePipelineDeps, type MergeGuardLike, type MergePr
 import { GroupRunner, prepareLocalConfig, type GroupRunnerDeps, type ProjectRuntime } from './core/group-runner.js';
 import { createMergeGuard } from './pr/merge-guard-factory.js';
 import type { BaseFreshness } from './git/base-freshness.js';
+import { upstreamSettled } from './core/deps-release.js';
 import { Reconciler, createFsProbe, createGitProbe, type ReconcilerDeps, type ReconcilerMcp } from './core/reconciler.js';
 import { AgentRuntime, agentAuthEnv } from './worker/agent-runtime.js';
 import { Verifier } from './worker/verifier.js';
@@ -1579,10 +1580,11 @@ export function buildPipeline(input: PipelineInput): Pipeline {
     // 等下去是**看得見的等**，不是靜默死鎖。把 A 修好，B 自然就動了。
     //
     // 群組記錄整個不見時仍視為結束——那是資料異常，不該讓後面的群陪葬。
-    (groupId) => {
-      const g = ledger.getGroup(groupId);
-      return g === undefined || g.state === 'merged';
-    },
+    //
+    // 例外只有一個，而且必須是**人**按的：`closed`（沒有東西要交付）永遠不會變 merged，
+    // 等它的群會排到天荒地老。人可以放行——那個決定記在 ledger（見 core/deps-release.ts），
+    // **這裡與 Orchestrator.depsInBase 讀同一支函式**，只接一邊就是「按了畫面還是不動」。
+    (groupId) => upstreamSettled(ledger, ledger.getGroup(groupId)),
   );
   const orchestrator = new Orchestrator(
     {
@@ -2000,6 +2002,10 @@ export async function main(): Promise<void> {
     async retryGroup(groupId) {
       const ok = await router.reviveGroup({ groupId });
       return ok ? `已把 ${groupId} 送回待派工` : `${groupId} 現在的狀態不能重新派工`;
+    },
+    async releaseDeps(groupId) {
+      const ok = await router.releaseDeps({ groupId, userId: 'slack' });
+      return ok ? `已放行，下一輪派工起等 ${groupId} 的那幾群不再等它` : `${groupId} 不需要放行（不存在，或它已經進 base 了）`;
     },
   });
 

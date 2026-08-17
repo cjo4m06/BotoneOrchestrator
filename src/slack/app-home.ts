@@ -31,6 +31,7 @@ export interface AppHomeDeps {
   actions?: {
     setProjectEnabled?: (projectId: string, enabled: boolean) => Promise<string>;
     retryGroup?: (groupId: string) => Promise<string>;
+    releaseDeps?: (groupId: string) => Promise<string>;
   };
 }
 
@@ -97,6 +98,13 @@ export class AppHome {
         const id = decodeActionValue(a.value)?.groupId;
         if (!id || !actions?.retryGroup) return void (await this.publish(a.userId));
         await this.run(a.userId, () => actions.retryGroup!(id), `重新派工 ${id}`);
+        return;
+      }
+
+      case HOME_ACTION_IDS.groupReleaseDeps: {
+        const id = decodeActionValue(a.value)?.groupId;
+        if (!id || !actions?.releaseDeps) return void (await this.publish(a.userId));
+        await this.run(a.userId, () => actions.releaseDeps!(id), `放行下游 ${id}`);
         return;
       }
 

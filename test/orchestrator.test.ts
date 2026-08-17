@@ -1,3 +1,4 @@
+import { releaseDeps } from '../src/core/deps-release.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { GROUP_RERUN_REQUESTED_EVENT } from '../src/core/group-runner.js';
 import assert from 'node:assert/strict';
@@ -2235,6 +2236,24 @@ describe('Orchestrator — 前置任務的成果進 base 了沒', () => {
     const { orch, dispatched } = build();
     await tickAndPlan(orch);
     assert.deepEqual(dispatched.map((g) => g.id), ['g-down']);
+  });
+
+  it('前置群組是 closed（永遠不會 merged）→ 下游死等，直到人放行', async () => {
+    seed('closed');
+    {
+      const { orch, dispatched } = build();
+      await tickAndPlan(orch);
+      assert.deepEqual(dispatched.map((g) => g.id), [], 'closed 永遠不會進 base，這時放行等於在假前提上開工');
+    }
+    // 人表態：那一群確實交不出東西，但下游不靠它也做得下去
+    releaseDeps(tmp.ledger, { groupId: 'g-up', state: 'closed', blocked: ['g-down'], userId: 'test' });
+    {
+      const { orch, dispatched } = build();
+      await tickAndPlan(orch);
+      // **任務層級的閘門也要一起放。** 只接群層級的話，人按了放行、畫面上還是不動——
+      // 而那個症狀完全看不出是哪一道在擋。
+      assert.deepEqual(dispatched.map((g) => g.id), ['g-down']);
+    }
   });
 
   it('同一群內部的先後不受影響（同一個工作區依序做，成果直接看得到）', async () => {

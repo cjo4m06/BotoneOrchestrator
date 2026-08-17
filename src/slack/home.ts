@@ -25,6 +25,8 @@ export const HOME_ACTION_IDS = {
   projectEnable: 'home_project_enable',
   /** 卡住的群組重新派工。 */
   groupRetry: 'home_group_retry',
+  /** 放行下游：這個上游永遠不會進 base，讓等它的群往前走。 */
+  groupReleaseDeps: 'home_group_release_deps',
 } as const;
 
 export interface HomeInput {
@@ -245,7 +247,32 @@ function pendingActions(it: PendingItem): KnownBlock | undefined {
     // 而 reviveGroup 只認 changes_requested/failed/merge_guard）。照 kind 硬畫的話，
     // 按下去只會拿到「群組不在停手狀態，不需要復活」——那正是這一整串在修的
     //「按了什麼都不會發生」（控制台端 2026-08-17 已修，這裡是同一個病的另一半）。
-    if (!(it.actions ?? []).includes('retry')) {
+    const acts = it.actions ?? [];
+    // 「上游永遠不會進 base」那一則：唯一的出口是放行，重試對它沒有意義
+    //（零 commit 再跑一次還是零 commit）。
+    if (acts.includes('release_deps')) {
+      return {
+        type: 'actions',
+        elements: [{
+          type: 'button',
+          text: { type: 'plain_text', text: '放行下游', emoji: false },
+          style: 'danger',
+          action_id: HOME_ACTION_IDS.groupReleaseDeps,
+          value: encodeActionValue({ groupId: it.id }),
+          confirm: {
+            title: { type: 'plain_text', text: '讓等它的群往前走？', emoji: false },
+            text: {
+              type: 'mrkdwn',
+              text: `*${escape(oneLine(it.title, 80))}*\n${escape(oneLine(it.detail, 150))}\n\n`
+                + '按下去等於你確認：那幾群不靠這一群的成果也做得下去。',
+            },
+            confirm: { type: 'plain_text', text: '放行', emoji: false },
+            deny: { type: 'plain_text', text: '取消', emoji: false },
+          },
+        }],
+      };
+    }
+    if (!acts.includes('retry')) {
       return {
         type: 'context',
         elements: [{ type: 'mrkdwn', text: '這一項現在沒有可按的動作——詳情見控制台或 `npm run ask`' }],

@@ -1,4 +1,5 @@
 
+import { upstreamSettled } from './deps-release.js';
 import { ReviewFeedbackStore } from '../pr/review-watcher.js';
 import {
   DISPATCHABLE_GROUP_STATE,
@@ -546,7 +547,11 @@ export class Orchestrator {
         // （它會擋，擋久了會升級成 needs_human，見 worker 的 handleDepsBlocked）
         if (!depTask) continue;
         const depGroup = depTask.groupId ? ledger.getGroup(depTask.groupId) : undefined;
-        if (depGroup?.state !== 'merged') waiting.push(dep);
+        // 前置任務不在任何群裡 → 這裡判斷不了，交給 MCP 的認領閘門（與上面同一個理由）
+        if (!depGroup) continue;
+        // **與 Dispatcher 的 isFinished 讀同一支函式**：人放行了上游，兩邊要一起放。
+        // 只接一邊的話，群層級放行了、任務層級照樣擋著——症狀是「按了放行，畫面還是不動」。
+        if (!upstreamSettled(ledger, depGroup)) waiting.push(dep);
       }
     }
     if (waiting.length === 0) return true;

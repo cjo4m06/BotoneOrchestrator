@@ -1,3 +1,4 @@
+import { isDepsReleased, upstreamSettled } from './deps-release.js';
 import { NO_CHANGE_BLOCK_PREFIX, RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 import type { NoChangeCategory } from '../worker/agent-runtime.js';
 import type { Group, Task } from '../types.js';
@@ -213,6 +214,9 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
   // （`failed` 不用在這裡處理——它自己就會開 stuck_group 單。）
   for (const g of ledger.listGroupsByState('closed')) {
     if (seen.has(g.id)) continue;
+    // 人已經放行過 → 這件事處理完了。不跳過的話，按過的東西還掛在清單上，
+    // 人會再按一次、再一次（同一個病在重試鈕上已經犯過一次）。
+    if (isDepsReleased(ledger, g.id)) continue;
     const blocked = ledger.listGroupsBlockedBy?.(g.id) ?? [];
     if (blocked.length === 0) continue; // 沒擋到人就沒事，不要多一則沒資訊的訊息
     if (ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) continue;
@@ -224,8 +228,12 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
       detail:
         `這一群沒有東西要交付（分支零 commit）所以結案了，但它永遠不會進 base，`
         + `而下面這 ${blocked.length} 群在等它：${blocked.join('、')}。`
-        + '它們會一直排下去——請解除那幾群的依賴，或確認那條線就到這裡為止。',
-      actions: [],
+        + '它們會一直排下去。按「放行下游」＝ 你確認那幾群不靠這一群的成果也做得下去；'
+        + '如果它們其實非等不可，那要處理的是這一群為什麼交不出東西（看它的結案說明）。',
+      // **列出來卻沒有可按的動作，就只是把死結講給人聽而已。**
+      // 放行是人的判斷（agent 只判過「我這張卡不用改」，沒判過「下游的前提成立」），
+      // 所以這裡給出口、但不自動走。兩個依賴判斷點都讀同一筆放行事件（core/deps-release.ts）。
+      actions: ['release_deps'],
     });
   }
 
@@ -235,12 +243,15 @@ export function collectPending(ledger: AskLedger, now: number = Date.now()): Pen
 /**
  * 這一群在等哪些還沒進 base 的上游。
  *
- * 「已結束」的判準與 Dispatcher 一致：**只有 merged 算進了 base**。
+ * 「已結束」的判準與 Dispatcher 一致：**成果真的進了 base（merged），或人放行過**。
  * closed / failed 的上游雖然是終態，但它們永遠不會 merged ⇒ 對下游而言仍然是「還在等」，
  * 而那正是死等的來源（所以那種情況要以**上游**的名義開一則，不是在下游身上開）。
  */
 function unfinishedUpstream(ledger: AskLedger, g: Group): string[] {
-  return (g.afterGroups ?? []).filter((id) => ledger.getGroup?.(id)?.state !== 'merged');
+  // 判準與 Dispatcher／depsInBase 同一支函式：人放行過的上游，對下游而言就是結束了。
+  // 各寫一份的話，放行之後下游會被這道網當成「還在排隊」而永遠不列——
+  // 而它其實已經在跑了，或卡在別的地方。
+  return (g.afterGroups ?? []).filter((id) => !upstreamSettled(ledger, ledger.getGroup?.(id)));
 }
 
 /**

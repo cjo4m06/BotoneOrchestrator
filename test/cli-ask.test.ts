@@ -407,7 +407,9 @@ describe('CLI ask — 本機互動入口', () => {
       const item = stuck.find((i) => i.id === up);
       assert.ok(item, 'closed 但擋著別人 → 必須看得見');
       assert.match(item.detail, new RegExp(down.id), '要說出擋住的是誰');
-      assert.deepEqual(item.actions, [], '沒有可按的動作就不要給按鈕');
+      // **列出來卻沒有可按的動作，就只是把死結講給人聽而已。**
+      // closed 永遠不會 merged，重試也只會再產一次零 commit ⇒ 唯一的出口是放行下游。
+      assert.deepEqual(item.actions, ['release_deps']);
       assert.equal(stuck.some((i) => i.id === down.id), false, '下游不列');
     });
 
@@ -959,10 +961,11 @@ describe('等你處理的清單：死掉的上游要看得見', () => {
    * 因為 console/server.ts 把 merged/failed/closed 三種上游一起濾掉了。
    * merged 該濾（真的進 base 了），另外兩種**還在擋人**，濾掉就是把死等偽裝成排隊。
    */
-  it('server 只濾掉 merged，closed／failed 的上游要留在 waitingFor 裡', () => {
+  it('waitingFor 的判準與 Dispatcher 同一支函式（closed／failed 的上游要留著）', () => {
     const src = readFileSync('src/console/server.ts', 'utf8')
       .split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
-    assert.match(src, /x\.state !== 'merged'/, 'waitingFor 的過濾條件變了');
+    // upstreamSettled ＝ merged 或人放行過。自己再寫一次判準的話，畫面與派工會各說各話。
+    assert.match(src, /!upstreamSettled\(ledger, ledger\.getGroup\(x\.id\)\)/, 'waitingFor 的過濾條件變了');
     assert.doesNotMatch(src, /\['merged', 'failed', 'closed'\]\.includes\(x\.state\)/,
       '把 closed/failed 濾掉 ⇒ 人看不出自己在等一個不會動的東西');
   });
@@ -1010,8 +1013,9 @@ describe('三個介面都要看 actions（少一個就是同一個病的另一�
 
   it('Slack App Home 的 stuck_group 也要看 actions', () => {
     const src = read('src/slack/home.ts');
-    assert.match(src, /it\.actions \?\? \[\]\)\.includes\('retry'\)/,
+    assert.match(src, /acts\.includes\('retry'\)/,
       'App Home 照 kind 硬畫 ⇒ 後端算出沒動作也照樣出現「重新派工」');
+    assert.match(src, /const acts = it\.actions \?\? \[\]/, 'actions 要真的從那一項讀出來');
   });
 
   it('options 存了空陣列就是「沒有動作」，不可以退回 kind 預設', () => {

@@ -111,7 +111,7 @@ function oneLine(s: string, max = 160): string {
 export interface AskAction {
   item: PendingItem;
   /** 標準化後的動作；freeText 代表「這是澄清的答案」。 */
-  verb: 'answer' | 'confirm' | 'reject' | 'approve' | 'deny' | 'retry' | 'abort' | 'pause' | 'land-anyway';
+  verb: 'answer' | 'confirm' | 'reject' | 'approve' | 'deny' | 'retry' | 'abort' | 'pause' | 'land-anyway' | 'release_deps';
   answer?: string;
   /**
    * `--always`：這個答覆掛到 repo 上，不是掛到這張卡上。
@@ -146,7 +146,7 @@ export function resolveAction(items: PendingItem[], target: string, rest: string
     return { item, verb: 'answer', answer: item.suggestion };
   }
 
-  const known = ['confirm', 'reject', 'approve', 'deny', 'retry', 'abort', 'pause', 'land-anyway'] as const;
+  const known = ['confirm', 'reject', 'approve', 'deny', 'retry', 'abort', 'pause', 'land-anyway', 'release_deps'] as const;
   const verb = known.find((k) => k === raw);
   if (verb) {
     if (!item.actions.includes(verb)) {
@@ -166,6 +166,11 @@ export function resolveAction(items: PendingItem[], target: string, rest: string
   // `land-anyway <為什麼這個紅不是這一群造成的>`。同樣只在支援時才攔截。
   if (head === 'land-anyway' && tail.length > 0 && item.actions.includes('land-anyway')) {
     return { item, verb: 'land-anyway', answer: tail.join(' ') };
+  }
+  // `release_deps <選填理由>`：放行下游。理由選填——這個決定本身就記得住是誰按的、
+  // 放行了誰，不像 land-anyway 那樣沒理由就查不出憑什麼。
+  if (head === 'release_deps' && tail.length > 0 && item.actions.includes('release_deps')) {
+    return { item, verb: 'release_deps', answer: tail.join(' ') };
   }
 
   // 其餘視為澄清答案
@@ -189,6 +194,8 @@ export interface ApplyDeps {
     reviveGroup?(input: { groupId: string; userId?: string }): Promise<boolean>;
     /** 定案③：帶著一個已知的、非本群造成的紅落地。 */
     landAnyway?(input: { groupId: string; userId?: string; note: string }): Promise<boolean>;
+    /** 放行下游：這個上游永遠不會進 base，讓等它的群往前走。 */
+    releaseDeps?(input: { groupId: string; userId?: string; reason?: string }): Promise<boolean>;
   };
   /**
    * 回報動作後的實際狀態。InboundRouter 吞掉自己的錯誤（Slack 回呼不能 throw），
@@ -265,6 +272,23 @@ export async function applyAction(action: AskAction, deps: ApplyDeps): Promise<s
         return ok
           ? `✅ 群組 ${item.id} 已標記「知道這個紅、照樣落地」，理由與實驗證據已記進 ledger 與 PR 內文`
           : `⚠️ 這個環境沒有接上「照樣落地」（需要 daemon 在同一行程）`;
+      }
+    case 'release_deps':
+      // 「這個上游不會進 base 了，讓等它的群往前走」。
+      //
+      // 為什麼要有這顆：closed（沒有東西要交付）是終態、永遠不會 merged，而兩個依賴
+      // 判斷點都只認 merged ⇒ 等它的群會永遠排下去，而且畫面上長得跟正常排隊一樣。
+      //
+      // 為什麼不自動放行：agent 只判過「我這張卡不用改」，沒判過「下游的前提成立」。
+      // 後者要看懂下游想做什麼再對照 base 現況——那是判斷，不是資料。
+      {
+        const ok = await router.releaseDeps?.({
+          groupId: item.id, userId: CLI_USER,
+          ...(action.answer ? { reason: action.answer } : {}),
+        });
+        return ok
+          ? `✅ 已放行，等 ${item.id} 的那幾群下一輪起就不再等它`
+          : `❌ 無法放行 ${item.id}（不存在、已經進 base，或這個環境沒接上 daemon）`;
       }
     case 'retry':
       // **群組層級的失敗要用群組層級的復活。**
