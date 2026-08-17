@@ -16,6 +16,9 @@ import type { Logger } from '../observability/logger.js';
 import { MERGE_CREDENTIAL_EVENT, MERGE_CREDENTIAL_CLEARED_EVENT } from '../core/merge-credential.js';
 import { STANDING_DECISION } from '../worker/human-reply.js';
 import { isStuckGroupState, openStuckGroupHandoff, type HandoffLedger } from '../core/handoff.js';
+
+/** 心跳多新才算「正在跑」。 */
+const LIVE_ACTIVITY_MS = 5 * 60_000;
 import type { FeedbackSource } from '../pr/review-watcher.js';
 
 /** 事件轉為簡短中文摘要（Slack 與 console 共用文案）。 */
@@ -143,6 +146,11 @@ const PARKED_STATE: GroupState = 'changes_requested';
  * 用結構介面而非直接相依 Ledger，測試才能塞假件。
  */
 export interface InboundLedger {
+  /**
+   * 現在有什麼在跑（心跳）。**跨行程唯一的「還活著」證據**——
+   * CLI 與獨立控制台都是別的行程，拿不到 dispatcher。未實作 → 退化成不檢查。
+   */
+  listActivities?(): { refId?: string | null; heartbeatAt: number }[];
   /**
    * 開交接單（停手與說話是同一個寫入動作）。
    * 可選：測試假件不必實作；缺了只是少一張單，會被 pending 的兜底自檢撈到。
@@ -325,6 +333,14 @@ export class InboundRouter {
    *
    * @returns 是否真的復活了（群組不存在或不是 failed 就不動，回 false）
    */
+  /** 這一群現在有沒有東西在跑（心跳還新的活動列）。 */
+  private liveNow(g: { id: string; taskIds: string[] }): boolean {
+    const acts = this.deps.ledger.listActivities?.() ?? [];
+    const now = Date.now();
+    return acts.some((a) => now - a.heartbeatAt < LIVE_ACTIVITY_MS
+      && (a.refId === g.id || g.taskIds.includes(a.refId ?? '')));
+  }
+
   async reviveGroup(input: { groupId: string; userId?: string }): Promise<boolean> {
     const { ledger, log } = this.deps;
     const g = ledger.getGroup?.(input.groupId);
@@ -337,6 +353,13 @@ export class InboundRouter {
     // 「無法復活這個群組」，而群組好端端地在那裡（實跑：使用者連按數次）。
     if (!isStuckGroupState(g.state)) {
       log.info({ groupId: input.groupId, state: g.state }, '群組不在停手狀態，不需要復活');
+      return false;
+    }
+    // **forming 有兩張臉**：真的在跑（agent 正在寫程式）／runner 死了。
+    // 對「真的在跑」的群改狀態會把它從 dispatcher 手上搶走，已寫好但還沒 commit 的成果就沒了，
+    // 而人只會看到「重試成功」。開機會清掉殘留的活動列，所以不會把死掉的誤判成活著。
+    if (this.liveNow(g)) {
+      log.warn({ groupId: g.id, state: g.state }, '這一群現在正在跑，不搶它的狀態（等它停下來再按）');
       return false;
     }
     ledger.updateGroupState(input.groupId, 'ready');

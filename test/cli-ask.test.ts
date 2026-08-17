@@ -212,6 +212,24 @@ describe('CLI ask — 本機互動入口', () => {
     });
   }
 
+  /**
+   * `forming` 有兩張臉：真的在跑（agent 正在寫程式）／runner 死了。
+   * 對「真的在跑」的那一群改狀態，等於把它從 dispatcher 手上搶走——已寫好但還沒 commit
+   * 的成果就沒了，而人只會看到「重試成功」。跨行程唯一的「還活著」證據是活動心跳。
+   */
+  it('forming 但現在真的有東西在跑 → 不搶它的狀態', async () => {
+    seedTask('T-live', '正在寫程式');
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b-live', taskIds: ['T-live'], footprint: [] });
+    tmp.ledger.updateGroupState(g.id, 'forming');
+    tmp.ledger.startActivity({ id: 'task:T-live', kind: 'code', repo: 'o/r', refId: 'T-live', title: '寫程式', detail: '跑測試中' });
+
+    const ok = await new InboundRouter({ ledger: tmp.ledger, log: createSilentLogger() })
+      .reviveGroup({ groupId: g.id, userId: 'test' });
+
+    assert.equal(ok, false, '正在跑還被改成 ready → dispatcher 會再派一次，未 commit 的成果沒了');
+    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'forming');
+  });
+
   it('已合併的群組不可以被「復活」（那是終態，復活會讓它再跑一次）', async () => {
     seedTask('T-MG', '某任務');
     const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-MG'], footprint: [] });
@@ -394,13 +412,20 @@ describe('CLI ask — 本機互動入口', () => {
     });
 
     it('按不動的狀態不給重試鈕（給了就是「按了什麼都不會發生」）', () => {
-      // reviveGroup 只認 changes_requested / failed / merge_guard；forming 按下去必定回
-      // 「無法復活這個群組」。沒有可按的動作就不要給按鈕。
+      // 動作要跟著 reviveGroup 認的狀態走（STUCK_GROUP_STATES）。ready 不在裡面，
+      // 按下去必定回「無法復活這個群組」。沒有可按的動作就不要給按鈕。
+      stoppedGroup('g-ready-alone', 'T-ra', 'ready');
+      const item = collectPending(tmp.ledger, Date.now() + STALE).find((i) => i.kind === 'stuck_group');
+      assert.ok(item, 'ready 卡住又沒在等人 → 要看得見');
+      assert.deepEqual(item.actions, [], 'ready 按不動重試');
+      assert.match(item.detail, /按不了重試/);
+    });
+
+    it('forming 給得出重試鈕——開機對帳就是靠這顆把停住的群救回來', () => {
+      // 對帳的三條無聲路會對 forming 開單並附「重試」。這顆按得動，是那條修正成立的前提。
       stoppedGroup('g-forming-alone', 'T-fa', 'forming');
       const item = collectPending(tmp.ledger, Date.now() + STALE).find((i) => i.kind === 'stuck_group');
-      assert.ok(item, 'forming 卡住又沒在等人 → 要看得見');
-      assert.deepEqual(item.actions, [], 'forming 按不動重試');
-      assert.match(item.detail, /按不了重試/);
+      assert.deepEqual(item?.actions, ['retry']);
     });
 
     it('停手中的狀態才給重試鈕', () => {

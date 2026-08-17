@@ -635,10 +635,10 @@ test('bootReconcileMode：合法例外的出口 —— 設定 full 或 ORCH_FORC
   );
 });
 
-test('reconcileOnBoot：保守模式一定用 dryRun 呼叫 Reconciler（不刪 worktree、不刪分支、不改狀態）', async (t) => {
+test('reconcileOnBoot：保守模式不動手，但**照樣開單**（dryRun 是純診斷，兩者不可混用）', async (t) => {
   const tmp = createTmpLedger();
   t.after(() => tmp.cleanup());
-  const seen: (boolean | undefined)[] = [];
+  const seen: { dryRun?: boolean; conservative?: boolean }[] = [];
   const rec = createRecordingLogger();
 
   await reconcileOnBoot({
@@ -647,12 +647,38 @@ test('reconcileOnBoot：保守模式一定用 dryRun 呼叫 Reconciler（不刪 
     registry: emptyLookup(),
     clients: [],
     mode: { conservative: true, reason: '上次收尾未完成' },
-    reconciler: { reconcile: async (o) => (seen.push(o.dryRun), { actions: [] }) },
+    reconciler: { reconcile: async (o) => (seen.push(o), { actions: [] }) },
   });
 
-  assert.deepEqual(seen, [true], '保守卻照樣動手 = 把使用者正在跑的 worktree 清掉');
+  // 保守卻照樣動手 ＝ 把使用者正在跑的 worktree 清掉；
+  // 保守卻用 dryRun ＝ 這一輪一張單都不開，而「上次收尾未完成」幾乎每次非正常重啟都成立
+  // ⇒ 最需要人接手的那一次，畫面上一個字都沒有。
+  assert.deepEqual(seen, [{ conservative: true, dryRun: false }]);
   assert.ok(tmp.ledger.hasEvent('system', null, 'reconcile_conservative'), '要留下紀錄，人才知道這輪沒有恢復狀態');
   assert.ok(rec.messages('error').some((m) => m.includes('保守開機對帳')));
+});
+
+test('reconcileOnBoot：ORCH_RECONCILE_DRY_RUN=1 才是純診斷（一個字都不寫）', async (t) => {
+  const tmp = createTmpLedger();
+  t.after(() => tmp.cleanup());
+  const seen: { dryRun?: boolean }[] = [];
+  const prev = process.env.ORCH_RECONCILE_DRY_RUN;
+  process.env.ORCH_RECONCILE_DRY_RUN = '1';
+  t.after(() => {
+    if (prev === undefined) delete process.env.ORCH_RECONCILE_DRY_RUN;
+    else process.env.ORCH_RECONCILE_DRY_RUN = prev;
+  });
+
+  await reconcileOnBoot({
+    ledger: tmp.ledger,
+    log: createSilentLogger(),
+    registry: emptyLookup(),
+    clients: [],
+    mode: { conservative: false },
+    reconciler: { reconcile: async (o) => (seen.push(o), { actions: [] }) },
+  });
+
+  assert.equal(seen[0]?.dryRun, true);
 });
 
 test('reconcileOnBoot：正常開機仍是完整對帳（保守不可變成新的預設，否則殘留狀態永遠收不回來）', async (t) => {

@@ -66,8 +66,12 @@ export function handoffKindOfBlock(reason: BlockReason | undefined, detail: stri
  *
  * 這是這個 repo 反覆踩到的形狀：**能力在一邊、判斷在另一邊，兩邊各寫一次**。
  * 共用之後，加狀態只改這裡，按鈕與處理端一起跟上。
+ *
+ * `forming` 有兩張臉：**真的在跑**（agent 正在寫程式）與 **runner 死了／對帳不敢動它**。
+ * 所以 reviveGroup 除了看狀態，還要先確認「現在沒有東西在跑它」——見那裡的心跳檢查。
+ * 不納入的話，開機對帳那幾條路開出來的單就是一顆按不動的鈕（實跑：停 55 小時、按不動）。
  */
-export const STUCK_GROUP_STATES = ['changes_requested', 'failed', 'merge_guard'] as const;
+export const STUCK_GROUP_STATES = ['forming', 'changes_requested', 'failed', 'merge_guard'] as const;
 export type StuckGroupState = (typeof STUCK_GROUP_STATES)[number];
 
 /** 這個群組是不是停在「等人動手」的狀態（＝重試按得動）。 */

@@ -2158,7 +2158,7 @@ export interface ReconcileBootInput {
   /** 上次沒收乾淨時的保守模式（bootReconcileMode 的結果）。 */
   mode?: BootReconcileMode;
   /** 測試注入：預設 new Reconciler(reconcilerDepsOf(...))。 */
-  reconciler?: { reconcile(opts: { dryRun?: boolean }): Promise<{ actions: unknown[] }> };
+  reconciler?: { reconcile(opts: { dryRun?: boolean; conservative?: boolean }): Promise<{ actions: unknown[] }> };
 }
 
 /** 開機對帳的模式。conservative ⇒ 只看不動手（dryRun），不刪任何 worktree／分支。 */
@@ -2243,7 +2243,14 @@ export async function reconcileOnBoot(deps: ReconcileBootInput): Promise<void> {
 
   const reconciler = deps.reconciler ?? new Reconciler(reconcilerDepsOf(deps));
   try {
-    const report = await reconciler.reconcile({ dryRun: conservative || process.env.ORCH_RECONCILE_DRY_RUN === '1' });
+    // **保守開機不等於閉嘴。** 先前兩者折在同一個 dryRun 旗標裡：不動手、也不開單，
+    // 於是「上次收尾未完成」（幾乎每次非正常重啟都成立）那一輪，畫面上一個字都沒有，
+    // 而群組就停在那裡。現在拆開：conservative ＝ 不動手但照樣把該給人的單開出來；
+    // ORCH_RECONCILE_DRY_RUN ＝ 純診斷，一個字都不寫。
+    const report = await reconciler.reconcile({
+      conservative,
+      dryRun: process.env.ORCH_RECONCILE_DRY_RUN === '1',
+    });
     if (report.actions.length > 0) {
       log.info({ actions: report.actions.length, conservative }, conservative ? '保守對帳只記錄了決策（未執行）' : '崩潰對帳有動作，詳見 events 表');
     }

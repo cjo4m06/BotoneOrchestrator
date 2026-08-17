@@ -56,6 +56,11 @@ class FakeLedger implements ReconcilerLedger {
     return `h_${this.handoffs.length}`;
   }
 
+  /** 給人看的單（畫面只讀這些；log 與事件都不算數）。 */
+  humanHandoffs(): HandoffInput[] {
+    return this.handoffs.filter((h) => h.toRole === 'human');
+  }
+
   constructor(tasks: Task[] = [], groups: Group[] = []) {
     for (const t of tasks) this.tasks.set(t.id, t);
     for (const g of groups) this.groups.set(g.id, g);
@@ -276,7 +281,11 @@ describe('群組恢復決策', () => {
     assert.equal(ledger.stateOf('t1'), 'queued');
   });
 
-  test('forming 但群內任務全部 done 且已 commit → 沒有自動續跑入口，交人工且不動現場', async () => {
+  test('forming 但群內任務全部 done 且已 commit → 送回待派工做收尾（不是丟給人）', async () => {
+    // GroupRunner 會跳過 state==='done' 的任務（skipped_already_done）直接進收尾，
+    // worktree 已存在時 WorktreeManager 沿用、openPr 冪等 ⇒ 送回 ready 是**推進**。
+    // 先前停在 forming：既按不動重試、也不在任何 requeue 規則裡（規則 B 要求群內有
+    // queued 任務，這裡全是 done）⇒ 每次重啟只是把同一筆事件再寫一遍。實跑停了 55 小時。
     const g = group('g5c', 'forming', ['t1', 't2']);
     const ledger = new FakeLedger([task('t1', 'done'), task('t2', 'done')], [g]);
     const fs = new FakeFs(new Set([wtPathOf(g)]));
@@ -284,11 +293,40 @@ describe('群組恢復決策', () => {
 
     const report = await new Reconciler(makeDeps({ ledger, fs, git })).reconcile();
 
-    assert.equal(report.groupsNeedsHuman, 1);
-    assert.equal(report.groupsResumed, 0, '退回 ready 會讓 GroupRunner 對已 done 任務重新 start_task');
-    assert.equal(ledger.groupStateOf('g5c'), 'forming');
-    assert.deepEqual(git.removedWorktrees, []);
+    assert.equal(report.groupsRestarted, 1);
+    assert.equal(report.groupsNeedsHuman, 0, '有自動續跑入口就不該丟給人');
+    assert.equal(ledger.groupStateOf('g5c'), 'ready');
+    assert.equal(ledger.stateOf('t1'), 'done', '已完成的任務不重排');
+    assert.equal(ledger.stateOf('t2'), 'done');
+    assert.deepEqual(git.removedWorktrees, [], '現場保留：崩潰點可能是「已過 DoD 但還沒 commit」');
     assert.deepEqual(fs.removed, []);
+  });
+
+  test('同一種局面在保守開機（不動手）仍要留下一張人看得見的單', async () => {
+    // 保守開機幾乎每次重啟都會發生。先前它與 dryRun 共用同一個旗標 ⇒ 最需要人接手的
+    // 那一次，畫面上一個字都沒有。不動手可以，不說話不行。
+    const g = group('g5d', 'forming', ['t1']);
+    const ledger = new FakeLedger([task('t1', 'done')], [g]);
+    const fs = new FakeFs(new Set([wtPathOf(g)]));
+    const git = new FakeGit(new Map([[g.branch, 2]]));
+
+    const report = await new Reconciler(makeDeps({ ledger, fs, git })).reconcile({ conservative: true });
+
+    assert.equal(ledger.groupStateOf('g5d'), 'forming', '保守＝不動手');
+    assert.equal(report.groupsDeferred, 1);
+    assert.equal(ledger.humanHandoffs().length, 1, '不動手，但一定要留下一張人看得見的單');
+  });
+
+  test('純診斷（dryRun）不留任何痕跡——連單都不開', async () => {
+    const g = group('g5e', 'forming', ['t1']);
+    const ledger = new FakeLedger([task('t1', 'done')], [g]);
+    const fs = new FakeFs(new Set([wtPathOf(g)]));
+    const git = new FakeGit(new Map([[g.branch, 2]]));
+
+    await new Reconciler(makeDeps({ ledger, fs, git })).reconcile({ dryRun: true });
+
+    assert.equal(ledger.groupStateOf('g5e'), 'forming');
+    assert.deepEqual(ledger.humanHandoffs(), []);
   });
 
   test('等待澄清的任務不被崩潰恢復掃掉', async () => {
@@ -622,10 +660,11 @@ describe('MCP 對帳', () => {
     assert.equal(report.tasksSyncedDone, 1);
     assert.equal(report.tasksRequeued, 0);
     assert.equal(ledger.stateOf('t1'), 'done');
-    // 補記後群內任務全部 done、成果也在分支上 → 不能退回 ready（GroupRunner 會對 done 任務再 start_task），
-    // 改為保留現場交人工；重點仍是「不重做」。
-    assert.equal(report.groupsNeedsHuman, 1);
-    assert.equal(ledger.groupStateOf('g11'), 'forming');
+    // 補記後群內任務全部 done、成果也在分支上 → 送回待派工做收尾。
+    // 已 done 的任務不會被重新 start_task（GroupRunner 會 skipped_already_done），
+    // 所以「不重做」與「往前推進」兩件事同時成立。
+    assert.equal(report.groupsRestarted, 1);
+    assert.equal(ledger.groupStateOf('g11'), 'ready');
     assert.deepEqual(git.removedWorktrees, []);
   });
 

@@ -48,6 +48,11 @@ export interface ReconcilerLedger {
    * 有未 commit 的工作，絕不可以走清理路徑。
    */
   latestEvent?(scope: 'task' | 'group' | 'system', refId: string | null, kind: string): { detail?: string } | undefined;
+  /**
+   * 可選：把某群未消化的單收掉。**推進了就要收單**，否則清單上會留著一張
+   * 「這群卡住了」，而它其實已經回到待派工——人會再按一次、再一次。
+   */
+  consumeHandoffsFor?(q: { groupId: string; toRole?: string; kind?: string }): number;
   /** 可選：刪除 created_at 早於 cutoffMs 的稽核事件，回傳刪除筆數。 */
   pruneEvents?(cutoffMs: number): number;
   /** 可選：刪除 at 早於 cutoffMs 的工具呼叫紀錄，回傳刪除筆數。 */
@@ -314,34 +319,49 @@ interface McpEvidence {
  */
 export class Reconciler {
   private readonly retention: RetentionPolicy;
+  /** 這一輪要不要留下人看得見的痕跡（只有純診斷的 dryRun 才閉嘴）。 */
+  private speak = true;
 
   constructor(private deps: ReconcilerDeps) {
     this.retention = { ...DEFAULT_RETENTION, ...deps.retention };
   }
 
-  async reconcile(opts: { dryRun?: boolean } = {}): Promise<ReconcileReport> {
+  /**
+   * `conservative` 與 `dryRun` 是**兩件事**，先前它們共用同一個旗標。
+   *
+   * 保守開機（上次收尾未完成、worktree 可能還有 agent 在寫）＝ 不動手；
+   * 但它幾乎每次非正常重啟都會發生，而折進 dryRun 之後那一輪連單都不開
+   * ⇒ 最需要人接手的那次，畫面上一個字都沒有，群組就這樣停著。
+   *
+   * 所以現在：conservative ＝ 不動手但照樣把該給人的單開出來；
+   * dryRun ＝ 純診斷（CLI／dashboard 用），一個字都不寫。
+   */
+  async reconcile(opts: { dryRun?: boolean; conservative?: boolean } = {}): Promise<ReconcileReport> {
     const dryRun = opts.dryRun === true;
+    // 傳給各分支的 `dryRun` 參數語意是「不要動手」——保守開機也不動手
+    const mutate = !dryRun && opts.conservative !== true;
+    this.speak = !dryRun;
     const report: ReconcileReport = {
       actions: [], groupsResumed: 0, groupsRestarted: 0, groupsFailed: 0,
       groupsNeedsHuman: 0, groupsDeferred: 0,
       tasksRequeued: 0, tasksSyncedDone: 0, orphanWorktreesRemoved: 0, worktreesRetained: 0,
       eventsPruned: 0, iterationsPruned: 0, screenshotDirsRemoved: 0,
     };
-    this.deps.log.info({ dryRun }, '崩潰恢復對帳開始');
+    this.deps.log.info({ dryRun, conservative: opts.conservative === true }, '崩潰恢復對帳開始');
 
-    const evidence = await this.syncWithMcp(report, dryRun);
+    const evidence = await this.syncWithMcp(report, !mutate);
     // 本輪動過（或刻意不動）的群組 worktree：不管最後狀態變成什麼，這一輪都不清，
     // 避免「剛標 failed → 同一輪就被孤兒清掃 rm -rf」把還沒 commit 的成果一起帶走。
     const touched = new Set<string>();
     for (const state of GROUP_LIMBO) {
       for (const group of this.deps.ledger.listGroupsByState(state)) {
         touched.add(this.worktreePath(group));
-        await this.reconcileGroup(group, evidence, report, dryRun);
+        await this.reconcileGroup(group, evidence, report, !mutate);
       }
     }
-    this.requeueStrayTasks(report, dryRun);
+    this.requeueStrayTasks(report, !mutate);
     await this.sweepOrphanWorktrees(report, dryRun, touched);
-    await this.applyRetention(report, dryRun);
+    await this.applyRetention(report, !mutate);
 
     this.deps.log.info(
       {
@@ -351,7 +371,7 @@ export class Reconciler {
       },
       '崩潰恢復對帳完成',
     );
-    if (!dryRun) this.deps.ledger.logEvent('system', null, 'reconcile', JSON.stringify(report.actions));
+    if (this.speak) this.deps.ledger.logEvent('system', null, 'reconcile', JSON.stringify(report.actions));
     return report;
   }
 
@@ -441,6 +461,23 @@ export class Reconciler {
     log.error({ group: group.id, state: group.state, branch: group.branch }, '群組需人工介入（成果保留，系統不動手）');
   }
 
+  /**
+   * **這一輪沒有推進這個群組 → 一定留下一張人看得見的單。**
+   *
+   * log.warn／logEvent 不算數：畫面只讀未消化的 human 單。先前對帳的三條路都只寫事件，
+   * 而它們落地的狀態（forming）既按不動重試、也不在任何 requeue 規則裡
+   * ⇒ 每次重啟只是把同一筆事件再寫一遍（實跑停了 55 小時）。
+   */
+  private stall(group: Group, why: string, eventKind: string, report: ReconcileReport): void {
+    const { ledger, log } = this.deps;
+    report.groupsDeferred += 1;
+    report.actions.push({ scope: 'group', ref: group.id, decision: 'deferred', detail: why });
+    if (!this.speak) return;
+    ledger.logEvent('group', group.id, eventKind, why);
+    // forming 現在按得動重試（見 handoff.ts 的 STUCK_GROUP_STATES），所以這顆鈕是實的
+    openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why, options: ['retry'] });
+  }
+
   /** forming 群組（崩潰時群內任務正在跑）的恢復決策。 */
   private async reconcileRunningGroup(group: Group, evidence: McpEvidence, report: ReconcileReport, dryRun: boolean): Promise<void> {
     const { ledger, fs, git, log } = this.deps;
@@ -450,10 +487,11 @@ export class Reconciler {
       // 兩種都代表「我們對這個群組一無所知」：不知道 repoPath 無法安全清理，
       // 更不能標 failed——failed 會讓孤兒清掃把 worktree（含未 commit 的成果）整個刪掉。
       // 因此維持原狀、只記事件，等專案回來或人來處理。
-      const detail = `找不到專案 runtime：${group.repo}（MCP 連不上或設定被移除）→ 保留現場，延後處理`;
-      if (!dryRun) ledger.logEvent('group', group.id, 'reconcile_deferred', detail);
-      report.groupsDeferred += 1;
-      report.actions.push({ scope: 'group', ref: group.id, decision: 'deferred', detail });
+      const detail = `找不到專案 runtime：${group.repo}（MCP 連不上／專案被停用／設定被移除）。`
+        + '不知道 repoPath，任何清理都可能誤刪成果，所以這次對帳完全沒有動這一群；'
+        + `它停在 ${group.state} 不會被派工，而**下一次對帳＝下一次重啟 daemon**。\n`
+        + `下一步：確認專案 ${group.repo} 還在、已啟用、MCP 連得上，然後按「重試」。`;
+      this.stall(group, detail, 'reconcile_deferred', report);
       log.warn({ group: group.id, repo: group.repo }, '專案 runtime 不可解析，群組延後處理（不做任何破壞性動作）');
       return;
     }
@@ -468,14 +506,35 @@ export class Reconciler {
     const hasCommits = branchAlive && ahead > 0;
 
     // 1) 全部任務都 done 且成果已 commit：崩潰在「最後一個 complete_task 之後、進 Merge Guard 之前」。
-    //    退回 ready 會讓 GroupRunner 對已 done 任務重新 start_task → 反而把群組推向 failed，
-    //    所以與 merge_guard 一致：保留全部現場，交人工。
     if (hasCommits && tasks.length > 0 && pendingTasks.length === 0) {
-      const detail = `群內 ${tasks.length} 個任務皆已完成、分支 ${group.branch} 領先 ${ahead} 個 commit，但沒有自動續跑入口，需人工接手`;
-      if (!dryRun) ledger.logEvent('group', group.id, 'reconcile_needs_human', detail);
-      report.groupsNeedsHuman += 1;
-      report.actions.push({ scope: 'group', ref: group.id, decision: 'needs_human', detail });
-      log.error({ group: group.id, ahead }, '群組成果完整但無自動入口，交人工');
+      // ── 這裡先前寫「沒有自動續跑入口，需人工接手」，那句話已經過期 ──
+      //
+      // GroupRunner 對 state==='done' 的任務會直接 skipped_already_done、不重新 start_task
+      //（group-runner.ts 的派工迴圈），worktree 已存在時 WorktreeManager 是沿用
+      //（不重設分支、不丟 commit），openPr 也是冪等的。
+      // 所以送回 ready 就會走完收尾——這是**推進**，不是丟給人。
+      //
+      // 而先前那條路的實際下場是：停在 forming，而 forming 既不在可復活狀態
+      //（重試鈕按不動）、也不在 requeue 的任何規則裡（那些規則要求群內有 queued 任務，
+      // 這裡全是 done）⇒ 每次重啟只是把同一筆事件再寫一遍。實跑停了 55 小時。
+      //
+      // **不刪 worktree**：崩潰點多半是「最後一個任務已 done、commitAll 還沒跑完」，
+      // 裡面可能有已過 DoD 卻還沒 commit 的成果。
+      const detail = `群內 ${tasks.length} 個任務皆已完成、分支 ${group.branch} 領先 ${ahead} 個 commit`
+        + ' → 送回待派工做收尾（開 PR／守衛；已完成的任務不會重跑）';
+      if (dryRun) {
+        // 不動手的那一輪（保守開機／純診斷）：至少要讓人看得見它停在哪裡
+        this.stall(group, `${detail}。這一輪沒有動手（保守開機），按「重試」就會續跑。`, 'reconcile_held', report);
+        log.warn({ group: group.id, ahead }, '群組成果完整，但這一輪不動手 → 交人');
+        return;
+      }
+      if (!wtAlive) await git.prune(proj.repoPath);
+      ledger.updateGroupState(group.id, 'ready');
+      ledger.consumeHandoffsFor?.({ groupId: group.id, toRole: 'human', kind: 'stuck_group' });
+      ledger.logEvent('group', group.id, 'reconcile_resumed', detail);
+      report.groupsRestarted += 1;
+      report.actions.push({ scope: 'group', ref: group.id, decision: 'restart', detail });
+      log.info({ group: group.id, ahead }, '群組成果完整 → 送回待派工做收尾');
       return;
     }
 
@@ -536,10 +595,10 @@ export class Reconciler {
     }
 
     if (evidence.degraded && wtAlive) {
-      const detail = `證據不完整（${evidence.detail}）：暫不清理 worktree，延後到下次對帳`;
-      if (!dryRun) ledger.logEvent('group', group.id, 'reconcile_deferred', detail);
-      report.groupsDeferred += 1;
-      report.actions.push({ scope: 'group', ref: group.id, decision: 'deferred', detail });
+      const detail = `證據不完整（${evidence.detail}）：不敢清理 worktree，這一群這一輪完全沒動。`
+        + '而「下次對帳」＝下次重啟 daemon，不是幾分鐘後。\n'
+        + '下一步：確認任務板（MCP）連得上，再按「重試」讓它重跑。';
+      this.stall(group, detail, 'reconcile_deferred', report);
       log.warn({ group: group.id }, 'MCP 證據不足，群組延後處理（保留 worktree）');
       return;
     }
