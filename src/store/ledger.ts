@@ -839,6 +839,22 @@ export class Ledger {
       const n = this.consumeHandoffsFor({ groupId: id, kind: 'merge_approval', toRole: 'human' });
       if (n > 0) this.log.info({ groupId: id, state, consumed: n }, '群組已離開等核准的狀態 → 核准單一併消化');
     }
+
+    // **進了終態就沒有什麼好給人決定的了。**
+    //
+    // `merge_approval` 先前有人收，`stuck_group` 沒有——於是群組正確結案之後，
+    // 那張「這一群卡住了」還掛在「等你處理」上，而且因為 closed／merged 不是可復活狀態，
+    // 畫面上連按鈕都不會給（見 pending 的 usableNow）：一則講著過期的事、又什麼都按不了的訊息。
+    //
+    // 實跑（2026-08-18，g_197cc7012ad3）：17:51 因「分支零 commit」正確結案，
+    // 17:53 一個拿著舊快照的迴圈替它開了張「請自己去開 PR」的單——而那條分支零 commit。
+    // 成因已在 orchestrator 修掉，這裡是兜底：不管誰開的，進終態就收掉。
+    //
+    // `failed` 不在這裡：它上面剛開了一張，而且那張是真的要人處理。
+    if (ok && (state === 'merged' || state === 'closed')) {
+      const n = this.consumeHandoffsFor({ groupId: id, kind: 'stuck_group', toRole: 'human' });
+      if (n > 0) this.log.info({ groupId: id, state, consumed: n }, '群組已進終態 → 卡住單一併消化');
+    }
     return ok;
   }
 

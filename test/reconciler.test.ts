@@ -61,6 +61,26 @@ class FakeLedger implements ReconcilerLedger {
     return this.handoffs.filter((h) => h.toRole === 'human');
   }
 
+  /** 已消化的單（用 index 標記，測開機兜底會用到）。 */
+  readonly consumed = new Set<number>();
+  listHandoffs(q: { groupId?: string; toRole?: string; kind?: string; unconsumedOnly?: boolean }): unknown[] {
+    return this.handoffs.filter((h, i) =>
+      (!q.groupId || h.groupId === q.groupId)
+      && (!q.toRole || h.toRole === q.toRole)
+      && (!q.kind || h.kind === q.kind)
+      && (!q.unconsumedOnly || !this.consumed.has(i)));
+  }
+  consumeHandoffsFor(q: { groupId: string; toRole?: string; kind?: string }): number {
+    let n = 0;
+    this.handoffs.forEach((h, i) => {
+      if (h.groupId !== q.groupId || this.consumed.has(i)) return;
+      if (q.toRole && h.toRole !== q.toRole) return;
+      if (q.kind && h.kind !== q.kind) return;
+      this.consumed.add(i); n += 1;
+    });
+    return n;
+  }
+
   constructor(tasks: Task[] = [], groups: Group[] = []) {
     for (const t of tasks) this.tasks.set(t.id, t);
     for (const g of groups) this.groups.set(g.id, g);
@@ -640,6 +660,41 @@ describe('保留策略（避免長期常駐磁碟無限成長）', () => {
     assert.equal(report.screenshotDirsRemoved, 0);
     assert.deepEqual(fs.removed, []);
     assert.equal(ledger.pruneArgs.events, undefined);
+  });
+});
+
+describe('進終態卻還掛著單的群（開機兜底）', () => {
+  /**
+   * 寫入端（Ledger.updateGroupState）只對**之後**的狀態變化有效——已經卡在庫裡的舊單
+   * 不會再有下一次狀態變更，沒有任何人會碰它。而它在畫面上是最糟的形狀：
+   * 講著已經不成立的事，又因為終態不是可復活狀態而連一顆按鈕都沒有。
+   */
+  for (const st of ['merged', 'closed'] as const) {
+    test(`${st} 的群還掛著 stuck_group → 開機時收掉`, async () => {
+      const g = group('gz', st, ['t1']);
+      const ledger = new FakeLedger([task('t1', 'done')], [g]);
+      ledger.openHandoff({
+        groupId: 'gz', fromRole: 'program', toRole: 'human', kind: 'stuck_group',
+        title: '卡住了', body: '守衛停在開 PR 之前', options: ['retry'],
+      });
+
+      await new Reconciler(makeDeps({ ledger, fs: new FakeFs(), git: new FakeGit() })).reconcile();
+
+      assert.deepEqual(ledger.listHandoffs({ groupId: 'gz', toRole: 'human', unconsumedOnly: true }), []);
+    });
+  }
+
+  test('純診斷不動手（dryRun 一個字都不寫）', async () => {
+    const g = group('gz2', 'closed', ['t1']);
+    const ledger = new FakeLedger([task('t1', 'done')], [g]);
+    ledger.openHandoff({
+      groupId: 'gz2', fromRole: 'program', toRole: 'human', kind: 'stuck_group',
+      title: '卡住了', body: 'x', options: ['retry'],
+    });
+
+    await new Reconciler(makeDeps({ ledger, fs: new FakeFs(), git: new FakeGit() })).reconcile({ dryRun: true });
+
+    assert.equal(ledger.listHandoffs({ groupId: 'gz2', toRole: 'human', unconsumedOnly: true }).length, 1);
   });
 });
 

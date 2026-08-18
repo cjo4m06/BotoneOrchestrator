@@ -53,6 +53,8 @@ export interface ReconcilerLedger {
    * 「這群卡住了」，而它其實已經回到待派工——人會再按一次、再一次。
    */
   consumeHandoffsFor?(q: { groupId: string; toRole?: string; kind?: string }): number;
+  /** 可選：查交接單（用來認出「已經進終態卻還掛著單」的群）。 */
+  listHandoffs?(q: { groupId?: string; toRole?: string; kind?: string; unconsumedOnly?: boolean; limit?: number }): unknown[];
   /** 可選：刪除 created_at 早於 cutoffMs 的稽核事件，回傳刪除筆數。 */
   pruneEvents?(cutoffMs: number): number;
   /** 可選：刪除 at 早於 cutoffMs 的工具呼叫紀錄，回傳刪除筆數。 */
@@ -359,6 +361,7 @@ export class Reconciler {
         await this.reconcileGroup(group, evidence, report, !mutate);
       }
     }
+    this.sweepTerminalHandoffs(!mutate);
     this.requeueStrayTasks(report, !mutate);
     await this.sweepOrphanWorktrees(report, dryRun, touched);
     await this.applyRetention(report, !mutate);
@@ -459,6 +462,28 @@ export class Reconciler {
     report.groupsNeedsHuman += 1;
     report.actions.push({ scope: 'group', ref: group.id, decision: 'needs_human', detail });
     log.error({ group: group.id, state: group.state, branch: group.branch }, '群組需人工介入（成果保留，系統不動手）');
+  }
+
+  /**
+   * 已經進終態、卻還掛著「這一群卡住了」的單 → 收掉。
+   *
+   * 寫入端（Ledger.updateGroupState）現在會在群組進 merged／closed 時收，但那只對
+   * **之後**的狀態變化有效——已經卡在庫裡的舊單沒有任何人會再碰它，因為那個群組
+   * 不會再有下一次狀態變更。而它在畫面上是最糟的形狀：講著已經不成立的事，
+   * 又因為終態不是可復活狀態而連一顆按鈕都沒有。
+   */
+  private sweepTerminalHandoffs(dryRun: boolean): void {
+    const { ledger, log } = this.deps;
+    if (!ledger.listHandoffs || !ledger.consumeHandoffsFor) return;
+    for (const st of ['merged', 'closed'] as const) {
+      for (const g of ledger.listGroupsByState(st)) {
+        if (ledger.listHandoffs({ groupId: g.id, toRole: 'human', kind: 'stuck_group', unconsumedOnly: true, limit: 1 }).length === 0) continue;
+        if (dryRun) continue;
+        const n = ledger.consumeHandoffsFor({ groupId: g.id, toRole: 'human', kind: 'stuck_group' });
+        ledger.logEvent('group', g.id, 'stale_handoff_consumed', `群組已是 ${st}，收掉 ${n} 張過期的「卡住」單`);
+        log.info({ group: g.id, state: st, consumed: n }, '群組已進終態，收掉過期的卡住單');
+      }
+    }
   }
 
   /**

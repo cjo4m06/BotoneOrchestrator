@@ -1093,6 +1093,48 @@ describe('Orchestrator — 審查通過後的合併把關（需求 7）', () => 
     assert.equal(handoffs[0]!.kind, 'stuck_group');
     assert.match(handoffs[0]!.body, /還沒開 PR/);
     assert.notEqual(tmp.ledger.getGroup(g.id)?.state, 'failed', '不可以判死');
+    // **這張單要按得動。** 舊文字寫「按重試會對已完成的任務重新 start_task」，那句已經過期：
+    // GroupRunner 對 done 的任務是 skipped_already_done，送回 ready ＝ 只重跑守衛與開 PR。
+    // 講「沒有入口」又不給按鈕，等於把做得到的事寫成做不到的。
+    assert.deepEqual(handoffs[0]!.options, ['retry']);
+    assert.doesNotMatch(handoffs[0]!.body, /重新 start_task/, '過期的說法會讓人不敢按');
+  });
+
+  /**
+   * 合併佇列的清單是迴圈開始時就固定的，而每一輪都 await（一次合併好幾分鐘）。
+   * 輪到後面的群時手上可能是舊快照。實跑（2026-08-18，g_197cc7012ad3）：
+   * 17:51 群組因「分支零 commit」正確結案成 closed，17:53 迴圈才輪到它，
+   * 拿著舊快照走進 escalateNoPr，對已結案的群開了張「請自己去開 PR」的單——
+   * 而那條分支領先 main 0 個 commit，PR 開不出來。
+   */
+  it('迴圈中途群組已被別人結案 → 重讀當下狀態，不對舊快照動手', async () => {
+    const g = seedReviewedGroup({ state: 'merge_guard' });
+    tmp.ledger.updateGroupState(g.id, 'merge_guard');
+    tmp.ledger.upsertGroup({ ...tmp.ledger.getGroup(g.id)!, prNumber: undefined });
+
+    // 清單取出後、輪到它之前，別的路徑把它正確結案了
+    const real = tmp.ledger.listGroupsByState.bind(tmp.ledger);
+    let served = false;
+    (tmp.ledger as { listGroupsByState: typeof real }).listGroupsByState = (st) => {
+      const out = real(st);
+      if (st === 'merge_guard' && !served) {
+        served = true;
+        tmp.ledger.updateGroupState(g.id, 'closed'); // ← 快照發出後才變的
+      }
+      return out;
+    };
+
+    const m = fakeMerge();
+    const gw = fakeGateway();
+    const { orch } = build({ merge: m.deps, gateway: gw.gateway });
+    await tickAndPlan(orch);
+
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true }),
+      [],
+      '已經結案的群不該再收到「請人工接手」——那張單講的事情不存在',
+    );
+    assert.equal(tmp.ledger.getGroup(g.id)?.state, 'closed');
   });
 
   it('問核准 ＝ 開一張 merge_approval 單（先前只發訊息，清單上不存在）', async () => {

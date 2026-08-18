@@ -258,6 +258,51 @@ test('listGroupsByState 依狀態過濾；updateGroupState 寫入 PR 資訊且 C
   assert.equal(reviewed?.prUrl, 'https://github.com/acme/web/pull/7');
 });
 
+/**
+ * 群組進終態就沒有什麼好給人決定的了。`merge_approval` 一直有人收，`stuck_group` 沒有——
+ * 於是正確結案之後那張「這一群卡住了」還掛在「等你處理」上，而終態不是可復活狀態
+ * ⇒ 連按鈕都不會有：一則講著過期的事、又什麼都按不了的訊息（實跑 g_197cc7012ad3）。
+ */
+for (const st of ['merged', 'closed'] as const) {
+  test(`群組進 ${st} → 過期的 stuck_group 單一併收掉`, (t) => {
+    const tmp = createTmpLedger();
+    t.after(() => tmp.cleanup());
+    tmp.ledger.upsertDiscoveredTask({
+      id: 'T-1', payloadHash: 'h1', repo: 'o/r', category: 'dev',
+      title: '某任務', description: '', dependencies: [], docRefs: [],
+    });
+    const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b', taskIds: ['T-1'], footprint: [] });
+    tmp.ledger.openHandoff({
+      groupId: g.id, fromRole: 'program', toRole: 'human', kind: 'stuck_group',
+      title: '卡住了', body: '守衛停在開 PR 之前', options: ['retry'],
+    });
+    assert.equal(tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true }).length, 1);
+
+    tmp.ledger.updateGroupState(g.id, st);
+
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', unconsumedOnly: true }),
+      [],
+      `${st} 之後那張單講的事情已經不存在，留著只會讓人點一個按不動的東西`,
+    );
+  });
+}
+
+test('但 failed 的單要留著——那是真的要人處理', (t) => {
+  const tmp = createTmpLedger();
+  t.after(() => tmp.cleanup());
+  tmp.ledger.upsertDiscoveredTask({
+    id: 'T-2', payloadHash: 'h2', repo: 'o/r', category: 'dev',
+    title: '某任務', description: '', dependencies: [], docRefs: [],
+  });
+  const g = tmp.ledger.createGroup({ repo: 'o/r', branch: 'b2', taskIds: ['T-2'], footprint: [] });
+  tmp.ledger.updateGroupState(g.id, 'failed', { reason: '壞了' });
+  assert.equal(
+    tmp.ledger.listHandoffs({ groupId: g.id, toRole: 'human', kind: 'stuck_group', unconsumedOnly: true }).length,
+    1,
+  );
+});
+
 test('getGroup 找不到回 undefined；新群沒有 PR 欄位', (t) => {
   const { ledger } = setup(t);
   assert.equal(ledger.getGroup('g_nope'), undefined);

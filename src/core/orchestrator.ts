@@ -1315,7 +1315,18 @@ export class Orchestrator {
    */
   private async processMergeQueue(): Promise<void> {
     const { ledger, dispatcher } = this.deps;
-    for (const group of ledger.listGroupsByState('merge_guard')) {
+    for (const snapshot of ledger.listGroupsByState('merge_guard')) {
+      // **清單是迴圈開始時就固定的，而每一輪都 await（一次合併要好幾分鐘）。**
+      //
+      // 輪到後面的群時，手上那份可能是幾分鐘前的舊資料。實跑（2026-08-18，
+      // g_197cc7012ad3）：17:51:38 群組因「分支零 commit」正確結案成 closed，
+      // 17:53:26 這個迴圈才輪到它，拿著舊快照（state=merge_guard、無 prNumber）
+      // 走進 escalateNoPr，對一個已經結案的群開了一張「請自己去開 PR」的單——
+      // 而那條分支領先 main 0 個 commit，PR 根本開不出來。
+      //
+      // 所以動手前一律重讀。狀態變了就代表別人已經處理完了，不干這裡的事。
+      const group = ledger.getGroup(snapshot.id);
+      if (!group || group.state !== 'merge_guard') continue;
       if (dispatcher.isRunning(group.id)) continue; // GroupRunner 就地跑守衛中 = 暫態，不是待合併
       // **有一張還沒被消化的核准單 ⇒ 人還沒表態。**
       // 既不重問（會變第二個入口），也**不可以拿舊憑證自己再合一次**——
@@ -1563,21 +1574,29 @@ export class Orchestrator {
   /**
    * 守衛跑到一半停下、還沒開 PR 的 merge_guard 群。
    *
-   * 這種群不能給核准鈕（按下去 failGroup 判死），也不該給重試鈕
-   *（重試會對已完成的任務重新 start_task，MCP 會拒絕）。系統目前沒有
-   * 「只重跑守衛」的入口，所以只能把事實講清楚交人——但**一定要講**，
-   * 否則它就停在 merge_guard 沒有任何人碰（實跑：多次重啟都是同一條）。
+   * 不能給核准鈕（按下去 !prNumber 會走 failGroup，把還救得回來的成果判死）。
+   *
+   * ── 但「重試」是實的，先前這裡寫反了 ──
+   *
+   * 舊文字寫「按重試會對已完成的任務重新 start_task」。那句話已經過期：
+   * GroupRunner 的派工迴圈對 state==='done' 的任務直接 skipped_already_done、
+   * 不會重新認領（group-runner.ts，註解寫明就是為了避開 MCP 拒絕認領）。
+   * 實跑可證（g_197cc7012ad3 17:43:58 就留下一筆 skipped_already_done）。
+   *
+   * 所以送回 ready 之後會直接進收尾＝**只重跑守衛**，正是這裡宣稱不存在的那個入口。
+   * 講「沒有入口」還不給按鈕，等於把一件做得到的事寫成做不到的。
    */
   private escalateNoPr(group: Group): void {
     const { ledger, log } = this.deps;
     if (ledger.listHandoffs({ groupId: group.id, toRole: 'human', unconsumedOnly: true, limit: 1 }).length > 0) return;
     const why =
       `守衛跑到一半停下（daemon 重啟或收到停止訊號），還沒開 PR。成果在分支 ${group.branch} 上。\n`
-      + '系統沒有「只重跑守衛」的入口——按核准會被判 failed，按重試會對已完成的任務重新 start_task。\n'
-      + '請人工接手這條分支（確認內容後自己開 PR，或把這一群關掉）。';
+      + '按「重試」會送回待派工重跑收尾——已完成的任務會被跳過，不會重做，'
+      + '所以實際效果就是只重跑守衛與開 PR。\n'
+      + '（不給核准鈕：這一群還沒有 PR，核准會把它判成失敗。）';
     ledger.logEvent('group', group.id, 'merge_guard_no_pr', why);
-    log.error({ group: group.id, branch: group.branch }, '守衛停在開 PR 之前，沒有自動入口');
-    openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why });
+    log.error({ group: group.id, branch: group.branch }, '守衛停在開 PR 之前 → 交人按重試重跑收尾');
+    openStuckGroupHandoff(ledger, log, { groupId: group.id, repo: group.repo, why, options: ['retry'] });
   }
 
   private askForApproval(group: Group, reasons: string[]): void {
