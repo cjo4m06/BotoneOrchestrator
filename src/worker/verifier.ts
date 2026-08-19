@@ -60,6 +60,33 @@ export interface VerifierDeps {
    * 沒有它就不知道這一列屬於誰，記了也查不出東西——所以缺它時視同沒接記帳。
    */
   checkContext?: CheckContext;
+  /**
+   * 「這個關卡安靜太久了」的回報出口。**只回報，不做任何處置。**
+   *
+   * 為什麼不是自動砍掉：從外面看，「等一個合法的東西」與「等一個永遠不會來的東西」
+   * 分不出來。agent 寫的腳本可能每 5 分鐘輪詢一次 API、期間什麼都不印——輸出 0、
+   * CPU 差值 0，但它在正常工作。同類還有等慢速外部服務、rate limit 的 sleep。
+   *
+   * 這不是訊號不足，是**這件事要有語意才判得出來**，而那是判斷不是資料
+   *（見 CLAUDE.md：所有「這代表什麼」的判斷都給 agent／人）。所以程式只把證據攤出來。
+   *
+   * 會被重複呼叫（每過一個閒置週期一次），呼叫端自己去重。
+   */
+  onStall?: (info: StallReport) => void;
+}
+
+/** 關卡安靜太久的事實。**只有量到的東西，沒有結論。** */
+export interface StallReport {
+  /** 哪一關（typecheck / lint / build / test）。 */
+  check: string;
+  command: string;
+  cwd: string;
+  /** 從開始跑到現在多久（毫秒）。 */
+  elapsedMs: number;
+  /** 距離最後一次有輸出多久（毫秒）。 */
+  quietMs: number;
+  /** 到目前為止收到幾個位元組的輸出（0 ＝ 從頭到尾一個字都沒有）。 */
+  bytes: number;
 }
 
 // 固定關卡順序：便宜/快的先跑（早失敗早回饋）。視覺關卡最貴，永遠排最後。
@@ -148,7 +175,17 @@ const ONLY_DIFF_DETAIL =
 export class Verifier {
   constructor(private log: Logger, private deps: VerifierDeps = {}) {}
 
-  async check(input: { cwd: string; config: VerifierConfig; signal?: AbortSignal }): Promise<GateReport> {
+  /**
+   * `onStall` 放在**入參**而不是 deps：Verifier 是整群建一次的，建的時候還不知道
+   * 這一輪掛在哪一列「現在在做什麼」上。呼叫端才有那個更新函式（Worker 的 onPhase、
+   * 合併把關的 onStage），所以由呼叫端逐次帶進來。
+   */
+  async check(input: {
+    cwd: string;
+    config: VerifierConfig;
+    signal?: AbortSignal;
+    onStall?: (info: StallReport) => void;
+  }): Promise<GateReport> {
     const checks: CheckResult[] = [];
     // 「有效關卡數」：真的驗到東西的關卡。說明性質的 check（視覺跳過、設定缺漏）不算數，
     // 否則「什麼都沒驗」會被當成綠燈（沿用原本「空驗證不算通過」的規則）。
@@ -177,6 +214,7 @@ export class Verifier {
         timeoutOf(input.config, this.deps),
         idleTimeoutOf(input.config, this.deps),
         input.signal,
+        input.onStall ?? this.deps.onStall,
       ));
       commandsRun += 1;
       effective += 1;
@@ -287,10 +325,11 @@ export class Verifier {
    */
 
   private async runCheck(
-    name: string, cmd: string, cwd: string, timeoutMs: number, idleMs: number, signal?: AbortSignal,
+    name: string, cmd: string, cwd: string, timeoutMs: number, idleMs: number,
+    signal?: AbortSignal, onStall?: (info: StallReport) => void,
   ): Promise<CheckResult> {
     const startedAt = Date.now();
-    const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, idleMs, signal);
+    const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, idleMs, signal, onStall);
     const ctx = this.deps.checkContext;
     if (this.deps.checkRecorder && ctx) {
       this.deps.checkRecorder.record({
@@ -318,6 +357,7 @@ export class Verifier {
     timeoutMs: number,
     idleMs: number,
     signal?: AbortSignal,
+    onStall?: (info: StallReport) => void,
   ): Promise<{ result: CheckResult; exitCode?: number; output: string }> {
     // 先過部署紅線：關卡指令是以 shell 實跑的，`npm run build` 可能一路展開到 `firebase deploy`。
     // 命中就**拒絕執行**並判紅（fail-closed）——寧可讓任務卡住等人看，也不能誤觸真實部署。
@@ -334,7 +374,7 @@ export class Verifier {
 
     let res: Awaited<ReturnType<typeof runShell>>;
     try {
-      res = await runShell(cmd, cwd, timeoutMs, signal, idleMs);
+      res = await runShell(cmd, cwd, timeoutMs, signal, idleMs, name, onStall);
     } catch (e) {
       // reject:false 之外仍可能丟（cwd 不存在、無法 spawn shell）。跑都跑不起來 = 沒驗到東西，
       // 絕不能當成通過。
@@ -345,22 +385,16 @@ export class Verifier {
     const output = res.all ?? `${res.stdout}\n${res.stderr}`;
 
     if (res.timedOut) {
-      // **兩種逾時要分開講。** 混在一起就會給錯的指示：
-      //  · idle（停止輸出）＝ 卡死。跟「跑太久」無關，調長時間上限沒有用。
-      //  · wall（總時長）  ＝ 真的跑很久。這種才有「要不要調設定」的討論。
-      // 先前只有一句「超過 Nms」，於是卡死的情況會讓 agent 去追一個時間問題、白改程式碼。
-      const idle = res.timeoutKind === 'idle';
-      this.log.error({ name, cmd, cwd, timeoutMs, kind: res.timeoutKind }, 'DoD 關卡逾時，已終止整棵行程樹');
-      const detail = idle
-        ? `卡住：指令連續 ${Math.round(idleMs / 60_000)} 分鐘沒有任何輸出，已被終止（整棵行程樹）。\n`
-          + '這不是「跑太久」——真的在跑的 build/test 會持續吐輸出。常見成因：'
-          + '測試等待輸入、watch 模式沒關、等一個永遠不會來的服務／連線、單一測試沒有逾時上限。\n'
-          + '調長時間上限對這種情況沒有用。\n'
-          + '被終止前的輸出沒有貼在這裡（全文在 check_runs）。自己跑一次看它停在哪一項。'
-        : `逾時：指令總時長超過 ${timeoutMs}ms 仍未結束，已被終止（整棵行程樹）。\n`
-          + '期間有持續輸出，所以它是在做事、只是太久——如果這個專案本來就需要更長時間，'
-          + '可調 projects.yaml 的驗證逾時設定。\n'
-          + '被終止前的輸出沒有貼在這裡（全文在 check_runs）。'
+      // **只有總時長會走到這裡。** 安靜太久不再自動終止（見 VerifierDeps.onStall 的說明：
+      // 「合法的等待」與「永遠不會來的等待」從外面分不出來，那是判斷不是資料）。
+      // 所以這裡的訊息不可以講成「卡住」——它只知道一件事：總時長超過了使用者設的上限。
+      this.log.error({ name, cmd, cwd, timeoutMs }, 'DoD 關卡超過總時長上限，已終止整棵行程樹');
+      const detail =
+        `逾時：指令總時長超過 ${timeoutMs}ms（使用者設定的上限）仍未結束，已被終止（整棵行程樹）。\n`
+        + '**這不代表它壞了**，只代表超過了設定的上限：可能真的需要更長時間（可調 '
+        + 'projects.yaml 的 commandTimeoutSec），也可能是卡住了（等待輸入、watch 模式沒關、'
+        + '等一個永遠不會來的服務／連線、單一測試沒有逾時上限）。\n'
+        + '兩者要看輸出才分得出來——全文在 check_runs，自己跑一次看它停在哪一項。'
       return {
         result: { name, ok: false, detail, failingIds: [ID_TIMEOUT] },
         ...(res.exitCode === undefined ? {} : { exitCode: res.exitCode }),
@@ -479,7 +513,7 @@ interface ShellOutcome {
   message?: string;
   timedOut: boolean;
   /** 逾時是哪一種：卡死（停止輸出）還是真的跑太久（總時長）。訊息要講得準。 */
-  timeoutKind?: 'idle' | 'wall';
+  timeoutKind?: 'wall';
 }
 
 async function runShell(
@@ -488,6 +522,8 @@ async function runShell(
   timeoutMs: number,
   signal?: AbortSignal,
   idleMs: number = DEFAULT_IDLE_TIMEOUT_MS,
+  name = 'check',
+  onStall?: (info: StallReport) => void,
 ): Promise<ShellOutcome> {
   const child = execa(cmd, {
     cwd,
@@ -504,30 +540,54 @@ async function runShell(
     ...(signal ? { cancelSignal: signal } : {}),
   });
 
-  let kind: 'idle' | 'wall' | undefined;
+  let kind: 'wall' | undefined;
   let idleTimer: NodeJS.Timeout | undefined;
+  const startedAt = Date.now();
+  let lastOutputAt = startedAt;
+  let bytes = 0;
 
-  const fire = (k: 'idle' | 'wall'): void => {
-    if (kind) return; // 已經在收了
-    kind = k;
-    killTree(child.pid, 'SIGTERM');
-    // TERM 之後還不死就 KILL 整組——卡在 syscall 裡的行程不理 TERM
-    setTimeout(() => killTree(child.pid, 'SIGKILL'), 5_000).unref?.();
+  // ── 安靜太久 → **只回報，不動手** ──
+  //
+  // 先前這裡是「安靜 N 分鐘就砍」。那是在猜：從外面看，「等一個合法的東西」與
+  // 「等一個永遠不會來的東西」分不出來——agent 寫的腳本可能每 5 分鐘輪詢一次 API、
+  // 期間什麼都不印，輸出 0、CPU 差值 0，但它在正常工作。猜錯的代價是把成果砍掉，
+  // 再回灌一句「卡住」讓 agent 去改一個沒壞的東西。
+  //
+  // 所以只把量到的事實交出去（見 VerifierDeps.onStall），要不要停由人／agent 決定。
+  const reportStall = (): void => {
+    onStall?.({
+      check: name, command: cmd, cwd,
+      elapsedMs: Date.now() - startedAt,
+      quietMs: Date.now() - lastOutputAt,
+      bytes,
+    });
   };
 
   const bumpIdle = (): void => {
     if (idleTimer) clearTimeout(idleTimer);
     if (idleMs <= 0) return;
-    idleTimer = setTimeout(() => fire('idle'), idleMs);
+    // 用 setInterval 而不是 setTimeout：安靜會持續，要持續講（呼叫端自己去重）
+    idleTimer = setInterval(reportStall, idleMs);
     idleTimer.unref?.();
   };
 
-  // **有輸出就重置計時器**：這是「有進展」的唯一機械證據
-  child.all?.on('data', bumpIdle);
+  child.all?.on('data', (chunk: Buffer | string) => {
+    bytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+    lastOutputAt = Date.now();
+    bumpIdle(); // 有輸出就重新起算
+  });
   bumpIdle();
 
-  // 總時長只當最後防線（真的跑 6 小時是另一種問題，訊息要跟「卡死」分開講）
-  const wall = timeoutMs > 0 ? setTimeout(() => fire('wall'), timeoutMs) : undefined;
+  // ── 唯一會動手的還是總時長 ──
+  //
+  // 它不是猜：那是使用者在 projects.yaml 明確設的值（commandTimeoutSec）。
+  // 而且如果連它也不砍，一次卡死就永久佔掉一個 worker 名額、群組永遠回不來
+  //（先前的凍住就是這樣，只是那時連砍都砍不掉——見 killTree）。
+  const wall = timeoutMs > 0 ? setTimeout(() => {
+    kind = 'wall';
+    killTree(child.pid, 'SIGTERM');
+    setTimeout(() => killTree(child.pid, 'SIGKILL'), 5_000).unref?.();
+  }, timeoutMs) : undefined;
   wall?.unref?.();
 
   try {
@@ -543,7 +603,7 @@ async function runShell(
       ...(kind ? { timeoutKind: kind } : {}),
     };
   } finally {
-    if (idleTimer) clearTimeout(idleTimer);
+    if (idleTimer) clearInterval(idleTimer);
     if (wall) clearTimeout(wall);
     // 走到這裡代表 promise 已經 settle；但被 TERM 殺掉的那棵樹裡可能還有殘留的孫行程
     // （它們不再握著我們的管線，所以 settle 得了）。收乾淨，不要留下孤兒。

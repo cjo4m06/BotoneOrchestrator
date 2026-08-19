@@ -191,7 +191,16 @@ export class MergeGuard {
     try {
       // 3) 在「合併後狀態」重跑關卡。
       this.opts.onStage?.('在合併後的狀態重跑關卡（build／test）');
-      const gate = await this.verifier.check({ cwd: tree.path, config: input.verifierConfig });
+      const gate = await this.verifier.check({
+        cwd: tree.path,
+        config: input.verifierConfig,
+        // 安靜太久 → 寫回「現在在做什麼」那一列（不終止，只講事實）
+        onStall: (i) => this.opts.onStage?.(
+          `在合併後的狀態重跑關卡（${i.check} 已 ${Math.round(i.elapsedMs / 60_000)} 分鐘`
+          + `，其中 ${Math.round(i.quietMs / 60_000)} 分鐘沒有輸出`
+          + `${i.bytes === 0 ? '，從頭到尾零輸出' : ''}）`,
+        ),
+      });
       if (!gate.green) {
         // **紅了不代表是這一群造成的。**
         //

@@ -419,6 +419,13 @@ export class Worker {
         cwd,
         config: gateConfig,
         ...(input.signal ? { signal: input.signal } : {}),
+        // **安靜太久要寫回人在看的那一列。** 不終止（見 VerifierDeps.onStall：
+        // 合法的等待與死掉的等待從外面分不出來），但先前唯一的症狀是畫面顯示
+        // 「跑驗收關卡」而心跳照跳，看不出它已經一小時沒動（實跑 PR #150）。
+        onStall: (i) => input.onPhase?.(
+          `第 ${round} 輪：跑驗收關卡（${i.check} 已 ${Math.round(i.elapsedMs / 60_000)} 分鐘`
+          + `，其中 ${Math.round(i.quietMs / 60_000)} 分鐘沒有輸出）`,
+        ),
       });
 
       // 3d) DoD 綠燈才輪到獨立 reviewer 對規格審查（§5）。

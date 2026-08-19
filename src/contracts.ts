@@ -42,7 +42,19 @@ export interface AgentLike {
 /** Verifier 的結構介面（供注入假件）。 */
 export interface VerifierLike {
   // task 為可選提示：視覺關卡靠它做類別篩選與截圖分目錄；不帶則視為「需要驗」。
-  check(input: { cwd: string; config: VerifierConfig; signal?: AbortSignal }): Promise<GateReport>;
+  check(input: {
+    cwd: string;
+    config: VerifierConfig;
+    signal?: AbortSignal;
+    /**
+     * 這一關安靜太久了（只回報事實，實作端不會因此終止指令）。
+     * 呼叫端拿它把事情寫回人在看的那一列——見 worker/verifier.ts 的 StallReport。
+     */
+    onStall?: (info: {
+      check: string; command: string; cwd: string;
+      elapsedMs: number; quietMs: number; bytes: number;
+    }) => void;
+  }): Promise<GateReport>;
 }
 
 /**
