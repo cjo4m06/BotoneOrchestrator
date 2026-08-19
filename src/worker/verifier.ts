@@ -37,11 +37,18 @@ export interface VerifierConfig {
   diff?: DiffGateConfig;
   /** 單一專案指令的執行逾時（毫秒）。未設／非正數 → 用 VerifierDeps.commandTimeoutMs 或內建預設。 */
   timeoutMs?: number;
+  /**
+   * 「連續多久沒有任何輸出」就當它卡死（毫秒）。未設／非正數 → 用 VerifierDeps.idleTimeoutMs 或內建預設。
+   * 設 0 ＝ 關閉閒置判定（只留總時長上限）——不建議，那等於回到卡死要等滿總時長。
+   */
+  idleTimeoutMs?: number;
 }
 
 export interface VerifierDeps {
   /** daemon 層的指令逾時預設（毫秒）；專案可用 VerifierConfig.timeoutMs 覆寫。 */
   commandTimeoutMs?: number;
+  /** daemon 層的「停止輸出」上限預設（毫秒）；專案可用 VerifierConfig.idleTimeoutMs 覆寫。 */
+  idleTimeoutMs?: number;
   /**
    * 關卡執行的記帳出口。未注入 → 不記（測試與還沒接線的呼叫端）。
    *
@@ -165,7 +172,12 @@ export class Verifier {
     for (const name of ORDER) {
       const cmd = input.config[name];
       if (!cmd) continue;
-      checks.push(await this.runCheck(name, cmd, input.cwd, timeoutOf(input.config, this.deps), input.signal));
+      checks.push(await this.runCheck(
+        name, cmd, input.cwd,
+        timeoutOf(input.config, this.deps),
+        idleTimeoutOf(input.config, this.deps),
+        input.signal,
+      ));
       commandsRun += 1;
       effective += 1;
     }
@@ -274,9 +286,11 @@ export class Verifier {
    * 畫面現在由審查者自己找、自己導頁；它有瀏覽器、有 repo、看得到 diff。
    */
 
-  private async runCheck(name: string, cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<CheckResult> {
+  private async runCheck(
+    name: string, cmd: string, cwd: string, timeoutMs: number, idleMs: number, signal?: AbortSignal,
+  ): Promise<CheckResult> {
     const startedAt = Date.now();
-    const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, signal);
+    const inner = await this.runCheckInner(name, cmd, cwd, timeoutMs, idleMs, signal);
     const ctx = this.deps.checkContext;
     if (this.deps.checkRecorder && ctx) {
       this.deps.checkRecorder.record({
@@ -302,6 +316,7 @@ export class Verifier {
     cmd: string,
     cwd: string,
     timeoutMs: number,
+    idleMs: number,
     signal?: AbortSignal,
   ): Promise<{ result: CheckResult; exitCode?: number; output: string }> {
     // 先過部署紅線：關卡指令是以 shell 實跑的，`npm run build` 可能一路展開到 `firebase deploy`。
@@ -319,7 +334,7 @@ export class Verifier {
 
     let res: Awaited<ReturnType<typeof runShell>>;
     try {
-      res = await runShell(cmd, cwd, timeoutMs, signal);
+      res = await runShell(cmd, cwd, timeoutMs, signal, idleMs);
     } catch (e) {
       // reject:false 之外仍可能丟（cwd 不存在、無法 spawn shell）。跑都跑不起來 = 沒驗到東西，
       // 絕不能當成通過。
@@ -330,13 +345,22 @@ export class Verifier {
     const output = res.all ?? `${res.stdout}\n${res.stderr}`;
 
     if (res.timedOut) {
-      this.log.error({ name, cmd, cwd, timeoutMs }, 'DoD 關卡逾時，已終止該指令');
-      const detail =
-        `逾時：指令超過 ${timeoutMs}ms 仍未結束，已被終止。` +
-        `\n可能是測試/建置卡住（等待輸入、watch 模式、等不到的服務），或這個專案本來就需要更長時間` +
-        '（可調 projects.yaml 的驗證逾時設定）。\n' +
-        // 逾時也一樣不貼輸出——它自己跑一次就看得到，而且能自己決定要不要縮小範圍。
-        '被終止前的輸出沒有貼在這裡（全文在 check_runs）。自己跑一次看它卡在哪。';
+      // **兩種逾時要分開講。** 混在一起就會給錯的指示：
+      //  · idle（停止輸出）＝ 卡死。跟「跑太久」無關，調長時間上限沒有用。
+      //  · wall（總時長）  ＝ 真的跑很久。這種才有「要不要調設定」的討論。
+      // 先前只有一句「超過 Nms」，於是卡死的情況會讓 agent 去追一個時間問題、白改程式碼。
+      const idle = res.timeoutKind === 'idle';
+      this.log.error({ name, cmd, cwd, timeoutMs, kind: res.timeoutKind }, 'DoD 關卡逾時，已終止整棵行程樹');
+      const detail = idle
+        ? `卡住：指令連續 ${Math.round(idleMs / 60_000)} 分鐘沒有任何輸出，已被終止（整棵行程樹）。\n`
+          + '這不是「跑太久」——真的在跑的 build/test 會持續吐輸出。常見成因：'
+          + '測試等待輸入、watch 模式沒關、等一個永遠不會來的服務／連線、單一測試沒有逾時上限。\n'
+          + '調長時間上限對這種情況沒有用。\n'
+          + '被終止前的輸出沒有貼在這裡（全文在 check_runs）。自己跑一次看它停在哪一項。'
+        : `逾時：指令總時長超過 ${timeoutMs}ms 仍未結束，已被終止（整棵行程樹）。\n`
+          + '期間有持續輸出，所以它是在做事、只是太久——如果這個專案本來就需要更長時間，'
+          + '可調 projects.yaml 的驗證逾時設定。\n'
+          + '被終止前的輸出沒有貼在這裡（全文在 check_runs）。'
       return {
         result: { name, ok: false, detail, failingIds: [ID_TIMEOUT] },
         ...(res.exitCode === undefined ? {} : { exitCode: res.exitCode }),
@@ -392,20 +416,139 @@ export class Verifier {
  * 只改了 agent 那條路（buildAgentEnv），這條漏了——症狀是 agent 在同一棵樹裡手動跑
  * `npm ci && npm run build` 全綠、關卡照樣紅 127，而兩邊差的就是這個變數。
  */
-function runShell(cmd: string, cwd: string, timeoutMs: number, signal?: AbortSignal) {
-  return execa(cmd, {
+/**
+ * 「多久沒有任何輸出」就當它卡死。**不是**總時長上限。
+ *
+ * ── 為什麼不能只用總時長 ──
+ *
+ * 總時長分不出「卡死」與「這個套件本來就要跑這麼久」，而那個數字沒人知道、
+ * 又會隨測試變多而變。調大 → 卡死的要等更久；調小 → 正常的套件被砍，
+ * 而回灌給 agent 的訊息是「逾時」，它只會白改程式碼去追一個時間問題。
+ *
+ * 但「有沒有進展」是機械事實：真的在跑的 build/test 會持續吐輸出。
+ * 實跑（2026-08-19，PR #150）：`npm test` 卡在單一測試檔 **104 分鐘、
+ * 只用掉 1.5 秒 CPU、105 分鐘零輸出**。用「停止輸出」判，20 分鐘就抓到了；
+ * 用總時長判，得等到 60 分鐘，而且真的需要 90 分鐘的套件會被誤殺。
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * 為什麼預設是 30 分鐘、而且**一定要可以改**：
+ *
+ * 這個數字要大於「合法的安靜」。`npm ci` 會持續吐進度，但 `vite build`／`tsc`
+ * 可能整段跑完才印東西——真的有 25 分鐘不吭聲的建置階段時，太短就會誤殺。
+ * 而它又要小到能及時抓到卡死（實跑那次是 104 分鐘）。
+ * 兩邊都跟專案有關，所以寫死在程式裡就是錯的：走設定（見 config 的 idleTimeoutSec）。
+ */
+
+/**
+ * 把整個 process group 砍掉。
+ *
+ * ── 為什麼不能只殺 execa 的那個子行程 ──
+ *
+ * 關卡是 `sh -c "npm ci && npm test"`。殺 shell 之後 `npm test` 與它底下的 node
+ * 會被 init 收養**繼續活著**，而且它們繼承了 stdout/stderr 的管線 ⇒ execa 要等
+ * 「行程結束 **且** 串流關閉」才 resolve，串流永遠不會 EOF ⇒ **promise 永遠不 settle**。
+ *
+ * 後果不是「這一關紅了」，是整條路凍住：withActivity 的 finally 跑不到、心跳一直跳、
+ * 畫面永遠顯示「正在把關」、群組永遠停在 merge_guard。
+ * 實跑（2026-08-19）：手動 kill 那棵樹之後 promise 立刻 settle，把關繼續往下走。
+ *
+ * `detached: true` 讓 shell 自己當 group leader，這裡才殺得掉整組（負號 ＝ 整個 group）。
+ * 機器上撈到 6 個 8～15 天的孤兒 vitest，就是這個洞累積出來的。
+ */
+function killTree(pid: number | undefined, sig: NodeJS.Signals): void {
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, sig); // 負號 = 整個 process group
+  } catch {
+    // group 不存在（已經自己結束）就退回只殺那一個，再失敗就是真的沒了
+    try {
+      process.kill(pid, sig);
+    } catch { /* 已經死了 */ }
+  }
+}
+
+interface ShellOutcome {
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  all?: string;
+  /** spawn 不起來時 execa 給的說明（cwd 不存在、沒有 /bin/sh）。 */
+  shortMessage?: string;
+  message?: string;
+  timedOut: boolean;
+  /** 逾時是哪一種：卡死（停止輸出）還是真的跑太久（總時長）。訊息要講得準。 */
+  timeoutKind?: 'idle' | 'wall';
+}
+
+async function runShell(
+  cmd: string,
+  cwd: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  idleMs: number = DEFAULT_IDLE_TIMEOUT_MS,
+): Promise<ShellOutcome> {
+  const child = execa(cmd, {
     cwd,
     shell: true,
     env: sanitizedChildEnv(),
     extendEnv: false,
     reject: false,
     all: true,
-    timeout: timeoutMs,
-    // 中止時 execa 會殺掉子行程；沒有這個的話 daemon 收到 SIGTERM，
-    // 一個跑了半小時的 `npm test` 照樣會撐到寬限逾時、然後變成孤兒。
+    // **自己當 process group leader**，才殺得掉整棵樹（見 killTree）。
+    // 注意：這不會讓孤兒問題變嚴重——實測 daemon 被 launchd 換掉時，子行程本來就
+    // 被 init 收養活下來（機器上那 6 個 8～15 天的孤兒就是證據）。有了 group 才殺得乾淨。
+    detached: true,
+    // execa 內建的 timeout 只殺直接子行程，解不開上面說的管線問題，所以不用它，改自己管。
     ...(signal ? { cancelSignal: signal } : {}),
-    forceKillAfterDelay: 5_000, // SIGTERM 後還不死就 SIGKILL
   });
+
+  let kind: 'idle' | 'wall' | undefined;
+  let idleTimer: NodeJS.Timeout | undefined;
+
+  const fire = (k: 'idle' | 'wall'): void => {
+    if (kind) return; // 已經在收了
+    kind = k;
+    killTree(child.pid, 'SIGTERM');
+    // TERM 之後還不死就 KILL 整組——卡在 syscall 裡的行程不理 TERM
+    setTimeout(() => killTree(child.pid, 'SIGKILL'), 5_000).unref?.();
+  };
+
+  const bumpIdle = (): void => {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (idleMs <= 0) return;
+    idleTimer = setTimeout(() => fire('idle'), idleMs);
+    idleTimer.unref?.();
+  };
+
+  // **有輸出就重置計時器**：這是「有進展」的唯一機械證據
+  child.all?.on('data', bumpIdle);
+  bumpIdle();
+
+  // 總時長只當最後防線（真的跑 6 小時是另一種問題，訊息要跟「卡死」分開講）
+  const wall = timeoutMs > 0 ? setTimeout(() => fire('wall'), timeoutMs) : undefined;
+  wall?.unref?.();
+
+  try {
+    const r = await child;
+    return {
+      exitCode: r.exitCode ?? undefined,
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      ...(r.all === undefined ? {} : { all: r.all }),
+      ...(r.shortMessage === undefined ? {} : { shortMessage: r.shortMessage }),
+      ...(r.message === undefined ? {} : { message: r.message }),
+      timedOut: kind !== undefined,
+      ...(kind ? { timeoutKind: kind } : {}),
+    };
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (wall) clearTimeout(wall);
+    // 走到這裡代表 promise 已經 settle；但被 TERM 殺掉的那棵樹裡可能還有殘留的孫行程
+    // （它們不再握著我們的管線，所以 settle 得了）。收乾淨，不要留下孤兒。
+    if (kind) killTree(child.pid, 'SIGKILL');
+  }
 }
 
 // ── 關卡指令的部署紅線（工具層擋不到的那一半） ──
@@ -518,6 +661,15 @@ async function readPackageScripts(cwd: string): Promise<Record<string, string>> 
     if (typeof v === 'string') out[k] = v;
   }
   return out;
+}
+
+/**
+ * 「停止輸出」上限：專案設定 > daemon 預設 > 內建 30 分鐘。
+ * **0 是有意義的值**（明示關閉閒置判定），所以這裡不像 timeoutOf 把非正數當未設。
+ */
+function idleTimeoutOf(config: VerifierConfig, deps: VerifierDeps): number {
+  const candidate = config.idleTimeoutMs ?? deps.idleTimeoutMs;
+  return candidate !== undefined && candidate >= 0 ? candidate : DEFAULT_IDLE_TIMEOUT_MS;
 }
 
 /** 指令逾時：專案設定 > daemon 預設 > 內建 10 分鐘。非正數視為未設（不接受「關閉逾時」）。 */

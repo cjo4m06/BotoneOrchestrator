@@ -88,6 +88,11 @@ export function verifierConfigOf(p: ProjectConfig): VerifierConfig {
     ...(p.commandTimeoutSec !== undefined && p.commandTimeoutSec > 0
       ? { timeoutMs: p.commandTimeoutSec * 1000 }
       : {}),
+    // 每專案的「停止輸出」覆寫。**0 是有意義的值**（明示關閉閒置判定），
+    // 所以這裡不能像上面那樣用 > 0 過濾掉——那會讓「我要關掉」變成「我沒設定」。
+    ...(p.idleCommandTimeoutSec !== undefined && p.idleCommandTimeoutSec >= 0
+      ? { idleTimeoutMs: p.idleCommandTimeoutSec * 1000 }
+      : {}),
   };
 }
 
@@ -142,7 +147,7 @@ export function clearVerifyTrees(dataRoot: string, log: Logger): void {
 }
 
 export function verifierDepsOf(
-  orch: Pick<OrchestratorConfig, 'commandTimeoutSec' | 'agent'>,
+  orch: Pick<OrchestratorConfig, 'commandTimeoutSec' | 'idleCommandTimeoutSec' | 'agent'>,
   log?: Logger,
   browserOutputRoot?: string,
   frictionSink?: { logEvent(scope: 'task', refId: string, kind: string, detail?: string): void },
@@ -152,8 +157,11 @@ export function verifierDepsOf(
   // 介面判斷者（UiJudge）與整套截圖量測堆疊已於第 15 片退場——畫面由審查者
   // 自己開瀏覽器看，放行時必須填 uiChecked。驗證器現在只剩「跑指令、記帳」。
   const sec = orch.commandTimeoutSec;
+  const idle = orch.idleCommandTimeoutSec;
   return {
     ...(sec > 0 ? { commandTimeoutMs: sec * 1000 } : {}),
+    // 0 ＝ 明示關閉閒置判定，要傳下去；只有 undefined 才算「沒設定」
+    ...(idle !== undefined && idle >= 0 ? { idleTimeoutMs: idle * 1000 } : {}),
   };
 }
 

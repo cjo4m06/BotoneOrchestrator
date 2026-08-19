@@ -708,8 +708,30 @@ test('verifierConfigOf：專案的 commandTimeoutSec 會變成 VerifierConfig.ti
 });
 
 test('verifierDepsOf：全域 commandTimeoutSec 會變成 Verifier 的 commandTimeoutMs', () => {
-  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 600, agent: { models: {} } }), { commandTimeoutMs: 600_000 });
-  assert.deepEqual(verifierDepsOf({ commandTimeoutSec: 0, agent: { models: {} } }), {}, '非正數 → 用 verifier 內建預設，絕不變成「無逾時」');
+  const orch = (o: Record<string, unknown>) => ({ idleCommandTimeoutSec: 1800, agent: { models: {} }, ...o }) as never;
+  assert.deepEqual(
+    verifierDepsOf(orch({ commandTimeoutSec: 600 })),
+    { commandTimeoutMs: 600_000, idleTimeoutMs: 1_800_000 },
+  );
+  assert.deepEqual(
+    verifierDepsOf(orch({ commandTimeoutSec: 0 })),
+    { idleTimeoutMs: 1_800_000 },
+    '總時長非正數 → 用 verifier 內建預設，絕不變成「無逾時」',
+  );
+});
+
+/**
+ * 「停止輸出」上限與總時長是兩件事，兩條路都要接得到——只接一邊的話設定會顯示成功、
+ * 實際上沒有生效（這個 repo 反覆踩到的形狀）。
+ */
+test('idleCommandTimeoutSec 一路接到 Verifier（全域與專案覆寫都要）', () => {
+  const orch = (o: Record<string, unknown>) => ({ commandTimeoutSec: 600, agent: { models: {} }, ...o }) as never;
+  assert.equal(verifierDepsOf(orch({ idleCommandTimeoutSec: 1200 })).idleTimeoutMs, 1_200_000, '全域');
+  // **0 是有意義的值**（明示關閉閒置判定）。用 > 0 過濾會把「我要關掉」變成「我沒設定」。
+  assert.equal(verifierDepsOf(orch({ idleCommandTimeoutSec: 0 })).idleTimeoutMs, 0, '0 ＝ 明示關閉，不可當成未設');
+  assert.equal(verifierConfigOf(proj({ idleCommandTimeoutSec: 900 })).idleTimeoutMs, 900_000, '專案覆寫');
+  assert.equal(verifierConfigOf(proj({ idleCommandTimeoutSec: 0 })).idleTimeoutMs, 0, '專案層的 0 同理');
+  assert.equal(verifierConfigOf(proj()).idleTimeoutMs, undefined, '未設 → 交給全域，不在這裡硬填');
 });
 
 // ── 截圖保留策略的根目錄（沒接 = 截圖永不清理，磁碟無限成長） ──

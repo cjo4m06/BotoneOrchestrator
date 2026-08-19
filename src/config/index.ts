@@ -68,6 +68,12 @@ export const ProjectSchema = z.object({
    */
   commandTimeoutSec: z.number().optional(),
   /**
+   * 覆寫 orchestrator.idleCommandTimeoutSec：關卡指令連續多久「沒有任何輸出」就當它卡死。
+   * 這與 commandTimeoutSec（總時長）是兩件事：總時長分不出「卡死」與「本來就要跑這麼久」，
+   * 而「有沒有輸出」是機械事實。設 0 ＝ 明示關閉閒置判定（只留總時長）。
+   */
+  idleCommandTimeoutSec: z.number().optional(),
+  /**
    * 靜置期分鐘數：這個專案的任務板要多久沒有新增/編輯任務，才開始分群開工。
    * 未設 → 15 分鐘（DEFAULT_QUIET_MINUTES）。設 0 → 關閉（抓到就做）。
    *
@@ -123,6 +129,18 @@ export const OrchestratorSchema = z.object({
    * 會永遠凍住監督迴圈，而且沒有任何人會來救它。每專案可用 commandTimeoutSec 覆寫。
    */
   commandTimeoutSec: z.number().default(600),
+  /**
+   * 關卡指令連續多久沒有輸出就當它卡死（秒）。預設 1800（30 分）。
+   *
+   * 為什麼需要它：總時長上限分不出「卡死」與「這個套件本來就要跑這麼久」——調大則卡死的
+   * 要等更久，調小則正常套件被誤殺，而回灌給 agent 的訊息是「逾時」，它只會白改程式碼去追
+   * 一個時間問題。實跑（2026-08-19，PR #150）：`npm test` 卡在單一測試檔 104 分鐘、
+   * 只用掉 1.5 秒 CPU、105 分鐘零輸出——用「停止輸出」判就抓得到。
+   *
+   * 這個值要**大於「合法的安靜」**：`vite build`／`tsc` 可能整段跑完才印東西。
+   * 設 0 ＝ 關閉（不建議：等於回到卡死要等滿總時長）。
+   */
+  idleCommandTimeoutSec: z.number().default(1800),
   /** 輪詢行為。mine 預設 true：撿到別人的任務會因為認領不到而拖垮整群。 */
   poll: z.object({ mine: z.boolean().default(true) }).prefault({}),
   /**
