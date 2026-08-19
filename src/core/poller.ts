@@ -3,6 +3,7 @@ import type { McpReadClient } from '../contracts.js';
 import type { Ledger } from '../store/ledger.js';
 import type { Logger } from '../observability/logger.js';
 import type { Task, TaskDetail } from '../types.js';
+import { RECLAIM_BLOCK_PREFIX } from '../notify/notifier.js';
 
 export interface PollSource {
   client: McpReadClient;
@@ -103,6 +104,27 @@ export class Poller {
           // 靜置期看的是「MCP 端最後有動作是什麼時候」：建立與更新取大者。
           ...(sourceUpdatedAt(detail) !== undefined ? { sourceUpdatedAt: sourceUpdatedAt(detail)! } : {}),
         });
+        // ── 卡片回到「待辦」，而本機還停在「認領不回來」⇒ 人已經去任務板改好了 ──
+        //
+        // 這條路先前是死的：worker 認領被拒時會 setBlock('needs_human') 並開一張
+        // reclaim_blocked 單，而那張單的動作是**空的**（`HANDOFF_ACTIONS.reclaim_blocked = []`）
+        // ——因為卡片還停在「進行中」時按重試確實永遠沒用（實跑：使用者按了 4 次）。
+        //
+        // 但單子的內文寫著「改完再按重試」，而畫面上沒有那顆按鈕。於是人做完唯一能做的事
+        //（去任務板改回待辦）之後，**沒有任何介面可以告訴系統**：任務停在 blocked、
+        // 那張單永遠掛著、群組等一個不會來的推進（實跑 2026-08-19，maFet_gXpQVJ）。
+        //
+        // 這裡不需要人再按什麼：`listTasks` 抓的就是 `status:'todo'`，卡片出現在這份清單裡
+        // 就等於「任務板說它可以被認領了」——那是機械事實，不是判斷。所以自己接回去。
+        // clearBlock 會順手把那張單標成已處理（見 Ledger.clearBlock）。
+        const local = this.ledger.getTask(detail.id);
+        if (local?.state === 'blocked' && (local.block?.detail ?? '').startsWith(RECLAIM_BLOCK_PREFIX)) {
+          this.ledger.clearBlock(detail.id, 'queued');
+          this.ledger.logEvent('task', detail.id, 'reclaim_unblocked',
+            '任務板上的卡片已回到「待辦」→ 解除受阻、重新排隊（不需要人再按什麼）');
+          this.log.info({ taskId: detail.id }, '卡片已回到待辦 → 自動解除「認領不回來」');
+        }
+
         if (res === 'inserted') {
           const task = this.ledger.getTask(detail.id);
           if (task) {

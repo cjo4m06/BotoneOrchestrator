@@ -317,7 +317,11 @@ describe('Worker — 單任務監督迴圈', () => {
 
     const detail = tmp.ledger.getTask(task.id)?.block?.detail ?? '';
     assert.match(detail, /請到任務板把這張卡改回「待辦」/);
-    assert.match(detail, /在這裡按重試不會有用/, '不講的話人會一直按（實跑按了 4 次）');
+    // **不可以叫人回來按按鈕。** 這種單的動作是空的（解法不在這個系統裡），
+    // 先前寫「改完再按重試」，於是人做完唯一能做的事之後在畫面上找不到那顆按鈕，
+    // 任務就停在這裡（實跑 2026-08-19，maFet_gXpQVJ）。
+    assert.match(detail, /改完就會自己接回去/, '要講清楚改完之後會自動恢復');
+    assert.doesNotMatch(detail, /再按重試|按一下重試/, '畫面上沒有那顆按鈕，叫人去按就是死路');
   });
 
   it('回報現在在哪一步（給控制台的「現在在做什麼」）', async () => {

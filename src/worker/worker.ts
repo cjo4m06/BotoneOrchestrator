@@ -645,8 +645,12 @@ export class Worker {
     const { ledger, log } = this.deps;
     const detail =
       `${RECLAIM_BLOCK_PREFIX}：${task.id} 認領被拒（${claimDetail}）。${reason.why}。`
-      + '**請到任務板把這張卡改回「待辦」**，改完再按重試——'
-      + '在這裡按重試不會有用，因為任務板沒有取消認領的工具。';
+      + '**請到任務板把這張卡改回「待辦」**，改完就會自己接回去（下一輪輪詢，最多幾分鐘），'
+      + '不需要回來按任何按鈕。\n'
+      // 先前這裡寫「改完再按重試」，而這種單的動作是空的（解法不在這個系統裡，
+      // 卡片還停在「進行中」時按重試確實沒用）——於是人做完唯一能做的事之後，
+      // 畫面上找不到那顆被指定要按的按鈕，任務就停在這裡（實跑 2026-08-19，maFet_gXpQVJ）。
+      + '（這裡沒有可按的動作是刻意的：任務板沒有取消認領的工具，解法只在任務板那一邊。）';
 
     ledger.setBlock(task.id, 'needs_human', detail);
     ledger.logEvent('task', task.id, 'reclaim_blocked', detail);

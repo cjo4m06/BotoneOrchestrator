@@ -58,6 +58,58 @@ describe('Poller — 輪詢與去重', () => {
     assert.deepEqual(client.queries[0], { repo: 'acme/web', status: 'todo', mine: true });
   });
 
+  /**
+   * ── 「認領不回來」唯一的出路 ──
+   *
+   * worker 認領被拒（卡片在任務板上已經是「進行中／完成」）時會 setBlock('needs_human')
+   * 並開一張 reclaim_blocked 單，而那種單的動作是**空的**——因為卡片還沒被改回來時，
+   * 在這邊按重試確實永遠沒用（MCP 沒有取消認領的工具，實跑使用者按了 4 次）。
+   *
+   * 但這代表：人去任務板把卡改回「待辦」之後，**沒有任何介面可以告訴系統**。
+   * 實跑（2026-08-19，maFet_gXpQVJ）：使用者改好了，任務照樣停在 blocked、
+   * 那張單永遠掛著、群組等一個不會來的推進。
+   *
+   * `listTasks` 抓的就是 `status:'todo'`——卡片出現在這份清單裡，就等於任務板說它
+   * 可以被認領了。那是機械事實，不是判斷，所以輪詢要自己接回去。
+   */
+  it('卡片被改回待辦 → 輪詢自己解除「認領不回來」，不必人再按什麼', async () => {
+    const client = fakeClient([detail({ id: 'T-9' })]);
+    const poller = new Poller([src(client)], tmp.ledger, createSilentLogger());
+    await poller.pollOnce();
+
+    // 模擬 worker 認領被拒的落地狀態（前綴是判別依據，見 notifier 的 RECLAIM_BLOCK_PREFIX）
+    // setBlock 自己就會開單（停手與說話是同一個寫入動作），不必也不該再手動開一張
+    tmp.ledger.setBlock('T-9', 'needs_human', '認領不回來：T-9 認領被拒（任務狀態是「完成」）。');
+    assert.equal(tmp.ledger.getTask('T-9')?.state, 'blocked');
+    const opened = tmp.ledger.listHandoffs({ taskId: 'T-9', toRole: 'human', unconsumedOnly: true });
+    assert.ok(opened.length > 0, '受阻就該有一張人看得見的單');
+    assert.ok(opened.some((h) => h.kind === 'reclaim_blocked'), '而且要被判成「認領不回來」那一類');
+
+    // 人去任務板改回待辦 ⇒ 它又出現在 todo 清單裡
+    await poller.pollOnce();
+
+    assert.equal(tmp.ledger.getTask('T-9')?.state, 'queued', '卡片可認領了就該重新排隊');
+    assert.equal(tmp.ledger.getTask('T-9')?.block, undefined, 'block 要清掉，否則派工會跳過它');
+    assert.deepEqual(
+      tmp.ledger.listHandoffs({ taskId: 'T-9', toRole: 'human', unconsumedOnly: true }),
+      [],
+      '事情處理完了，那張單不可以留在「等你處理」上',
+    );
+  });
+
+  it('本機 blocked 但不是「認領不回來」→ 輪詢不要亂動它', async () => {
+    const client = fakeClient([detail({ id: 'T-8' })]);
+    const poller = new Poller([src(client)], tmp.ledger, createSilentLogger());
+    await poller.pollOnce();
+
+    // 等人回答澄清問題的任務：那是另一條路的受阻，輪詢無權解除
+    tmp.ledger.setBlock('T-8', 'needs_clarification', '規格沒寫清楚，等人回答');
+    await poller.pollOnce();
+
+    assert.equal(tmp.ledger.getTask('T-8')?.state, 'blocked', '解錯了會讓 agent 在沒有答案的情況下開工');
+    assert.equal(tmp.ledger.getTask('T-8')?.block?.reason, 'needs_clarification');
+  });
+
   it('次輪：MCP 重派同樣任務 → 全部去重，不回報為新任務', async () => {
     const client = fakeClient([detail({ id: 'T-1' })]);
     const poller = new Poller([src(client)], tmp.ledger, createSilentLogger());
