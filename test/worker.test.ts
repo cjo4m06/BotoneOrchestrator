@@ -306,6 +306,59 @@ describe('Worker — 單任務監督迴圈', () => {
     assert.deepEqual(mcp.getCalls, [], '沒認領過就不必去查任務板');
   });
 
+  /**
+   * ── 人把卡片改回「待辦」之後，完成動作要能再做一次 ──
+   *
+   * `complete_task` 有一把永久的冪等鍵，用來擋「daemon 崩在 MCP 已送出、ledger 還沒寫
+   * 之間，重啟後重放」。那個保護是必要的，但它假設「卡片一旦完成就不會再變回來」——
+   * 而人可以手動改回待辦。
+   *
+   * 實跑（2026-08-19，maFet_gXpQVJ）：第一輪已 complete → 卡片變完成 → 群組因別的原因
+   * 重跑 → 認領被拒 → 使用者把卡改回待辦 → 重新認領成功、程式碼也合併了，
+   * 但收尾時鍵還在 ⇒ 走「重放」分支、沒有再呼叫 complete_task
+   * ⇒ **卡片永遠停在「進行中」，而且再也沒有人會去改它**。
+   */
+  it('重新認領成功 → 上一次的完成憑據作廢，收尾會真的再呼叫一次 complete_task', async () => {
+    const task = makeTask();
+    seed(task);
+    // 模擬「第一輪已經完成過」：鍵被佔用
+    assert.equal(tmp.ledger.claimIrreversible(`complete:${task.id}`, 'complete_task', task.id), true);
+
+    const mcp = fakeMcp();
+    const { worker } = build({ mcp });
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.equal(out.status, 'done');
+    assert.deepEqual(
+      mcp.completeCalls.map((c) => c.id),
+      [task.id],
+      '認領成功就代表卡片不是「已結案」⇒ 舊憑據不算數，這次必須真的送出 complete_task',
+    );
+  });
+
+  /**
+   * **只有認領成功才作廢。** 作廢的正當性完全來自「任務板剛剛讓我們認領」——
+   * 那證明卡片不是已結案。認領失敗卻照樣清掉，就是把擋重放的保護拆了：
+   * daemon 崩在「complete 已送出、ledger 還沒寫」之間，重啟後會再送一次，
+   * 而任務板拒絕已結案的卡，那個拒絕看起來與「卡不存在」一樣 ⇒ 整群被判 failed。
+   */
+  it('認領失敗時不可以作廢憑據（那個保護不能被順手拆掉）', async () => {
+    const task = makeTask();
+    seed(task);
+    tmp.ledger.claimIrreversible(`complete:${task.id}`, 'complete_task', task.id);
+
+    // 沒有本機認領紀錄 ＋ 認領被拒 ⇒ 一般永久性錯誤，根本沒走到認領成功那一步
+    const { worker } = build({ mcp: fakeMcp({ start: CLAIM_REJECTED }) });
+    const out = await worker.runTask({ task, ...cfg });
+
+    assert.equal(out.status, 'error');
+    assert.equal(
+      tmp.ledger.claimIrreversible(`complete:${task.id}`, 'complete_task', task.id),
+      false,
+      '鍵被清掉了 ⇒ 下一次重放會真的再送一次 complete_task',
+    );
+  });
+
   /** 卡住的訊息必須講出「去哪裡做什麼」——按這邊的重試永遠沒用。 */
   it('認領不回來的說明要指出解法在任務板', async () => {
     const task = makeTask();

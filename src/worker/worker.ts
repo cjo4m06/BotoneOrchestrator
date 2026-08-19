@@ -246,6 +246,21 @@ export class Worker {
     } else {
       detail = claim.value;
     }
+    // ── 重新認領成功 ⇒ 上一次的 complete_task 已經不算數了 ──
+    //
+    // `complete_task` 有一把永久的冪等鍵（`complete:<id>`），用來擋「daemon 崩在
+    // MCP 已送出、ledger 還沒寫之間，重啟後對帳重放」——那個保護是必要的：
+    // 任務板拒絕一張已結案的卡，而那個拒絕看起來與「卡不存在」一樣，會讓整群被判 failed。
+    //
+    // 但它假設了「卡片一旦完成就不會再變回來」，而**人可以手動把它改回待辦**。
+    // 實跑（2026-08-19，maFet_gXpQVJ）：第一輪已 complete → 卡片變完成 → 群組因別的原因
+    // 重跑 → 認領被拒 → 使用者把卡改回待辦 → 重新認領成功、程式碼跑完也合併了，
+    // 但收尾時 claimIrreversible 回 false（鍵還在），於是走「重放」分支、**沒有再呼叫
+    // complete_task** ⇒ 卡片永遠停在「進行中」，而且再也沒有人會去改它。
+    //
+    // 走到這裡代表任務板剛剛讓我們認領成功（或確認這張卡還在我們手上），
+    // 兩者都證明它不是「已結案」的狀態 ⇒ 舊的完成憑據作廢。
+    ledger.releaseIrreversible(`complete:${task.id}`);
     // 認領成功 = 依賴已滿足 → 之前累積的「連續受阻」歸零（見 depsBlockStreak）
     ledger.logEvent('task', task.id, CLAIM_EVENT, detail.title);
     // 用 clearBlock 而非 updateTaskState：先前受阻留下的 block:deps 不會自己消失，
